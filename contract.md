@@ -1193,3 +1193,1681 @@ it with the section 3 helper `read_json` and wraps `json.JSONDecodeError` in
 `ManifestError`.
 
 ---
+
+## 10. `auth.py`
+
+### 10.1 The comment block at the top of the module
+
+Spec section 4.1 requires the client-id decision to be written down where the
+implementer of the module reads it. The module begins with this comment, in these
+words:
+
+> **Path A (correct).** You register your own Microsoft Entra application:
+> Azure portal → App registrations → New registration → "Mobile and desktop
+> applications" as the platform, "Allow public client flows" = Yes, then apply for
+> Minecraft API access through Microsoft's third-party launcher form. Put the
+> application (client) id into `config.json` as `client_id`. This mode talks to
+> `https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode` and
+> `.../token` with the scope `XboxLive.signin offline_access`.
+>
+> **Path B (what most hobby launchers actually do).** The legacy Minecraft client
+> id `00000000402b5328`. It is a **Live** app registration, not an Entra app, and
+> it does **not** work against `login.microsoftonline.com/consumers/v2.0`. It has
+> to be used with the Live endpoints `https://login.live.com/oauth20_connect.srf`
+> and `https://login.live.com/oauth20_token.srf`, with the scope
+> `service::user.auth.xboxlive.com::MBI_SSL`.
+>
+> Both are implemented. `config.json`'s `auth_mode` picks one, defaulting to
+> `"entra"`. **The two endpoint families are never mixed**: no function in this
+> module takes a bare URL, scope or ticket prefix. Every request resolves its
+> endpoints through `endpoints_for(mode)` and uses the `AuthEndpoints` record it
+> returns, so a Live client id can never reach an Entra URL.
+>
+> There is no usable constant fallback for Entra (see the section 0 amendment):
+> `ENTRA_DEFAULT_CLIENT_ID` is `""`, because a valid Entra client id only exists
+> once the user has registered their own app. An empty effective client id is a
+> `ConfigError`, and the Account screen offers a one-click switch to `"live"`.
+
+### 10.2 Endpoint constants — two families, kept apart
+
+```python
+# --- Entra (auth_mode == "entra"), Path A ---------------------------------
+ENTRA_DEVICE_CODE_URL: Final[str] = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+ENTRA_TOKEN_URL: Final[str] = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+ENTRA_SCOPE: Final[str] = "XboxLive.signin offline_access"
+ENTRA_RPS_PREFIX: Final[str] = "d="
+
+# --- Live (auth_mode == "live"), Path B -----------------------------------
+LIVE_DEVICE_CODE_URL: Final[str] = "https://login.live.com/oauth20_connect.srf"
+LIVE_TOKEN_URL: Final[str] = "https://login.live.com/oauth20_token.srf"
+LIVE_SCOPE: Final[str] = "service::user.auth.xboxlive.com::MBI_SSL"
+LIVE_RPS_PREFIX: Final[str] = "t="
+
+# Re-exported from core.config so there is exactly one literal for each (section 8.2)
+from core.config import ENTRA_DEFAULT_CLIENT_ID, LIVE_CLIENT_ID
+
+# --- Shared OAuth values ---------------------------------------------------
+DEVICE_CODE_GRANT: Final[str] = "urn:ietf:params:oauth:grant-type:device_code"
+REFRESH_GRANT: Final[str] = "refresh_token"
+
+# --- Xbox and Mojang (identical in both modes) -----------------------------
+XBL_AUTH_URL: Final[str] = "https://user.auth.xboxlive.com/user/authenticate"
+XBL_RELYING_PARTY: Final[str] = "http://auth.xboxlive.com"
+XSTS_AUTH_URL: Final[str] = "https://xsts.auth.xboxlive.com/xsts/authorize"
+XSTS_RELYING_PARTY: Final[str] = "rp://api.minecraftservices.com/"
+XSTS_SANDBOX_ID: Final[str] = "RETAIL"
+MOJANG_LOGIN_URL: Final[str] = "https://api.minecraftservices.com/authentication/login_with_xbox"
+MOJANG_PROFILE_URL: Final[str] = "https://api.minecraftservices.com/minecraft/profile"
+
+# --- Polling and freshness -------------------------------------------------
+DEFAULT_POLL_INTERVAL: Final[int] = 5          # seconds, when the server sends none
+SLOW_DOWN_INCREMENT: Final[int] = 5            # spec section 4.2: slow_down adds 5 s
+MAX_POLL_NETWORK_FAILURES: Final[int] = 3      # consecutive transport failures tolerated
+REFRESH_MARGIN_SECONDS: Final[float] = 300.0   # refresh 5 minutes before expiry
+ACCOUNTS_FILE_VERSION: Final[int] = 1
+DPAPI_DESCRIPTION: Final[str] = "MaestroLauncher accounts"
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class AuthEndpoints:
+    """One coherent OAuth endpoint family. The only way a URL enters this module."""
+    mode: str
+    device_code_url: str
+    token_url: str
+    scope: str
+    rps_prefix: str
+    default_client_id: str
+
+ENTRA_ENDPOINTS: Final[AuthEndpoints] = AuthEndpoints(
+    "entra", ENTRA_DEVICE_CODE_URL, ENTRA_TOKEN_URL, ENTRA_SCOPE,
+    ENTRA_RPS_PREFIX, ENTRA_DEFAULT_CLIENT_ID,
+)
+LIVE_ENDPOINTS: Final[AuthEndpoints] = AuthEndpoints(
+    "live", LIVE_DEVICE_CODE_URL, LIVE_TOKEN_URL, LIVE_SCOPE,
+    LIVE_RPS_PREFIX, LIVE_CLIENT_ID,
+)
+
+def endpoints_for(mode: str) -> AuthEndpoints:
+    """The endpoint family for an `auth_mode` value.
+
+    Raises:
+        ConfigError: `mode` is neither "entra" nor "live".
+    """
+```
+
+The `rps_prefix` is the RpsTicket prefix used in step 2 of the chain: `"d="` for an
+Entra-issued token, `"t="` for a Live (MBI_SSL) token. This is the documented
+community convention and cannot be verified without a real interactive sign-in,
+which is exactly why it lives in one named constant per mode: correcting it is a
+one-line change, not a hunt.
+
+Request bodies, per mode. These are `application/x-www-form-urlencoded` fields
+posted with `Http.post_form`:
+
+| Call | Entra fields | Live fields |
+|---|---|---|
+| Device code | `client_id`, `scope=XboxLive.signin offline_access` | `client_id`, `scope=service::user.auth.xboxlive.com::MBI_SSL`, `response_type=device_code` |
+| Token poll | `grant_type=urn:ietf:params:oauth:grant-type:device_code`, `client_id`, `device_code` | `client_id`, `device_code`, `grant_type=urn:ietf:params:oauth:grant-type:device_code` |
+| Refresh | `grant_type=refresh_token`, `refresh_token`, `client_id`, `scope=XboxLive.signin offline_access` | `grant_type=refresh_token`, `refresh_token`, `client_id`, `scope=service::user.auth.xboxlive.com::MBI_SSL` |
+
+### 10.3 Dataclasses
+
+```python
+@dataclass(frozen=True, slots=True)
+class DeviceCode:
+    """What the device-code endpoint returned: what to show the user, and how to poll."""
+    user_code: str
+    verification_uri: str
+    device_code: str
+    interval: int
+    expires_in: int
+    expires_at: float          # absolute epoch seconds, clock() + expires_in
+    message: str = ""          # Entra sends a ready-made sentence; Live does not
+
+@dataclass(frozen=True, slots=True)
+class MsaTokens:
+    """Microsoft tokens from the device-code or refresh grant."""
+    access_token: str
+    refresh_token: str
+    expires_at: float                    # absolute epoch seconds
+    refresh_expires_at: float | None = None
+
+@dataclass(frozen=True, slots=True)
+class XblToken:
+    """Xbox Live user token and its user hash."""
+    token: str
+    uhs: str
+
+@dataclass(frozen=True, slots=True)
+class XstsToken:
+    """XSTS token, user hash and the XUID that ${auth_xuid} needs at launch."""
+    token: str
+    uhs: str
+    xuid: str
+
+    @property
+    def identity_token(self) -> str:
+        """`XBL3.0 x={uhs};{token}` — the body of the Mojang login request."""
+
+@dataclass(frozen=True, slots=True)
+class MojangToken:
+    """The Minecraft services bearer token."""
+    access_token: str
+    expires_at: float                    # absolute epoch seconds
+
+@dataclass(frozen=True, slots=True)
+class Profile:
+    """The Minecraft: Java Edition profile."""
+    uuid: str                            # 32 hex characters, no dashes, exactly as returned
+    name: str
+```
+
+```python
+@dataclass(slots=True)
+class Account:
+    """A signed-in account as it is stored on disk and used at launch."""
+    name: str = ""
+    uuid: str = ""
+    xuid: str = ""
+    access_token: str = ""
+    access_expires_at: float = 0.0
+    refresh_token: str = ""
+    refresh_expires_at: float | None = None
+    auth_mode: str = "entra"
+
+    def is_expired(self, *, now: float | None = None, within_seconds: float = 0.0) -> bool:
+        """True when the Mojang token expires within `within_seconds` of `now`."""
+
+    @property
+    def uuid_dashed(self) -> str:
+        """The uuid in 8-4-4-4-12 form. For display only — never for ${auth_uuid}."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """The account's accounts.json object."""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "Account":
+        """Build an Account from a stored object, defaulting every missing or mistyped field."""
+```
+
+Every field has a default and nothing is validated in the constructor: an
+end-to-end test tool builds an offline placeholder with `Account(name="Player",
+uuid="0" * 32, access_token="0")`, and that must work. `sign_in` and `refresh`
+always populate every field.
+
+`${auth_uuid}` is `Account.uuid` verbatim — 32 hex characters with no dashes, as
+the profile endpoint returns it. `uuid_dashed` exists for the Account screen only.
+
+### 10.4 `accounts.json`
+
+Written at `paths.accounts_json`, `0o600` on POSIX. The file is always a JSON
+object whose `encryption` key says how to read the rest. Plaintext form:
+
+```json
+{
+  "version": 1,
+  "encryption": "none",
+  "accounts": [
+    {
+      "name": "Player",
+      "uuid": "00000000000000000000000000000000",
+      "xuid": "",
+      "access_token": "",
+      "access_expires_at": 0.0,
+      "refresh_token": "",
+      "refresh_expires_at": null,
+      "auth_mode": "entra"
+    }
+  ]
+}
+```
+
+DPAPI form — used whenever `dpapi_available()` is true, i.e. on Windows with
+`pywin32` importable:
+
+```json
+{
+  "version": 1,
+  "encryption": "dpapi",
+  "payload": "AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAA...="
+}
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `version` | integer | `1` | `ACCOUNTS_FILE_VERSION`. A higher value is treated as unreadable and the file is replaced on the next save. |
+| `encryption` | string | `"none"` | `"none"` or `"dpapi"`. Any other value is treated as unreadable. |
+| `accounts` | array of objects | `[]` | Present only when `encryption` is `"none"`. |
+| `payload` | string | absent | Present only when `encryption` is `"dpapi"`: base64 (standard alphabet, with padding) of `CryptProtectData(json.dumps({"accounts": [...]}).encode("utf-8"))`. |
+
+Account object fields — the same set in both forms:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | `""` | Profile name shown in the UI. |
+| `uuid` | string | `""` | 32 hex characters, no dashes. The account's identity key in this file. |
+| `xuid` | string | `""` | The XSTS `DisplayClaims.xui[0].xid`; becomes `${auth_xuid}`. |
+| `access_token` | string | `""` | Mojang bearer token. |
+| `access_expires_at` | number | `0.0` | Absolute epoch seconds, `clock() + expires_in` at receipt. |
+| `refresh_token` | string | `""` | Microsoft refresh token. |
+| `refresh_expires_at` | number \| null | `null` | Absolute epoch seconds, or `null` when the endpoint gave no `refresh_token_expires_in`. |
+| `auth_mode` | string | `"entra"` | Which endpoint family issued these tokens; refresh must use the same one. |
+
+Timestamps are absolute epoch seconds as floats, computed from `expires_in` at the
+moment of receipt with an injectable clock — never a duration stored as-is.
+
+### 10.5 `AccountStore`
+
+```python
+def dpapi_available() -> bool:
+    """True on Windows when `win32crypt` imports. Evaluated at call time, never cached."""
+
+def dpapi_protect(data: bytes) -> bytes:
+    """`win32crypt.CryptProtectData(data, DPAPI_DESCRIPTION, None, None, None, 0)`.
+
+    Raises:
+        AuthError: pywin32 is unavailable or the call failed.
+    """
+
+def dpapi_unprotect(blob: bytes) -> bytes:
+    """`win32crypt.CryptUnprotectData(blob, None, None, None, 0)[1]`.
+
+    Raises:
+        AuthError: pywin32 is unavailable or the blob cannot be decrypted.
+    """
+
+class AccountStore:
+    """Reads and writes accounts.json, encrypting with DPAPI when it is available."""
+
+    def __init__(
+        self,
+        paths: Paths,
+        *,
+        protect: Callable[[bytes], bytes] | None = None,
+        unprotect: Callable[[bytes], bytes] | None = None,
+    ) -> None:
+        """`protect`/`unprotect` default to the DPAPI pair when available, else to None
+        (plaintext). Tests inject a reversible pair to exercise the encrypted path
+        on any platform."""
+
+    @property
+    def path(self) -> Path:
+        """`paths.accounts_json`."""
+
+    def load(self) -> list[Account]:
+        """Every stored account, in file order. Never raises."""
+
+    def save(self, accounts: Sequence[Account]) -> None:
+        """Replace the file with these accounts, atomically, 0600 on POSIX.
+
+        Raises:
+            ConfigError: the file cannot be written.
+        """
+
+    def get(self, uuid: str) -> Account | None:
+        """The stored account with this uuid, or None."""
+
+    def upsert(self, account: Account) -> None:
+        """Load, replace the entry with the same uuid (or append), save.
+
+        Raises:
+            ConfigError: the file cannot be written.
+        """
+
+    def remove(self, uuid: str) -> None:
+        """Load, drop the entry with this uuid, save.
+
+        Raises:
+            ConfigError: the file cannot be written.
+        """
+```
+
+`load`, normative — it has no failure path, because a launcher that cannot read
+its token cache should ask the user to sign in again, not refuse to start:
+
+1. Missing file, unreadable file, invalid JSON, a non-object top level, an
+   unknown `version`, or an unknown `encryption` value → `[]` (logged at WARNING).
+2. `encryption == "none"` → each object in `accounts` through `Account.from_dict`;
+   entries that are not objects are skipped.
+3. `encryption == "dpapi"` → base64-decode `payload`, `unprotect` it, parse the
+   result as JSON and read its `accounts` array. A missing `unprotect` (the file
+   was written on another machine, or `pywin32` is gone), a `binascii.Error`, an
+   `AuthError` from DPAPI, or an undecodable inner document → `[]` (logged at
+   WARNING, with no token material in the message).
+4. Every non-empty `access_token` and `refresh_token` read is passed to
+   `logsetup.REDACTOR.register` before the function returns.
+
+`save`, normative: builds `{"version": ACCOUNTS_FILE_VERSION, "encryption": ...}`;
+uses `"dpapi"` with a base64 `payload` when a `protect` callable is available,
+otherwise `"none"` with an inline `accounts` array; writes it with
+`atomic_write_json`; then calls `posix_chmod_600` on the file. Every token it
+writes is registered with `REDACTOR` first.
+
+### 10.6 Device-code flow
+
+```python
+class DeviceCodeSession:
+    """One device-code sign-in attempt: request a code, then poll until it is used."""
+
+    def __init__(
+        self,
+        mode: str,
+        client_id: str,
+        http: Http,
+        *,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Resolve `mode` to an AuthEndpoints and keep it for every call.
+
+        Raises:
+            ConfigError: unknown `mode`, or `client_id` is empty.
+        """
+
+    @property
+    def endpoints(self) -> AuthEndpoints:
+        """The endpoint family this session is locked to."""
+
+    def start(self, *, cancel: CancelToken | None = None) -> DeviceCode:
+        """Ask the device-code endpoint for a user code.
+
+        Raises:
+            AuthError: the response is not a usable device-code document.
+            NetworkError, HttpStatusError, CancelledError.
+        """
+
+    def poll_once(self, code: DeviceCode) -> MsaTokens | None:
+        """One token-endpoint poll: tokens on success, None while the user hasn't finished.
+
+        Raises:
+            AuthSlowDownError: the server asked for a longer interval.
+            AuthExpiredError: the code expired before it was used.
+            AuthDeclinedError: the user declined in the browser.
+            AuthError: any other OAuth error, or an unreadable response.
+            NetworkError: transport failure that survived the retry policy.
+        """
+
+    def wait_for_token(
+        self,
+        *,
+        on_code: Callable[[DeviceCode], None] | None = None,
+        cancel: CancelToken | None = None,
+    ) -> MsaTokens:
+        """Start a flow, hand the code to `on_code`, then poll until tokens arrive.
+
+        Raises:
+            AuthExpiredError, AuthDeclinedError, AuthError, NetworkError,
+            HttpStatusError, CancelledError.
+        """
+```
+
+`start`, normative: posts the mode's device-code body (table in 10.2) to
+`endpoints.device_code_url` with `raise_for_status=True`. It reads `device_code`,
+`user_code`, `verification_uri`, `interval` (default `DEFAULT_POLL_INTERVAL` when
+absent or not a positive integer), `expires_in` (default 900) and the optional
+`message`; sets `expires_at = clock() + expires_in`; registers `device_code` with
+`REDACTOR`; returns the `DeviceCode`. A missing `device_code` or `user_code` is an
+`AuthError`. Note that Entra's `verification_uri` is
+`https://microsoft.com/devicelogin` and Live's is
+`https://www.microsoft.com/link` — the value is always taken from the response,
+never assumed.
+
+`poll_once`, normative. The poll uses `http.post_form(..., raise_for_status=False,
+retry=False)`: a pending poll answers **HTTP 400**, which is a normal state of this
+protocol and not a transport failure, and the loop owns its own pacing so the retry
+helper must stay out of it. The response body is decoded as JSON; a body that is
+not JSON is an `AuthError` naming the status.
+
+| HTTP status | body `error` | Result |
+|---|---|---|
+| 200 | — | `MsaTokens(access_token, refresh_token, expires_at=clock() + expires_in, refresh_expires_at=clock() + refresh_token_expires_in when present else None)`; both tokens registered with `REDACTOR` |
+| 400 or 401 | `authorization_pending` | returns `None` |
+| 400 or 401 | `slow_down` | raises `AuthSlowDownError(code.interval + SLOW_DOWN_INCREMENT)` |
+| 400 or 401 | `expired_token` | raises `AuthExpiredError` |
+| 400 or 401 | `authorization_declined` | raises `AuthDeclinedError` |
+| 400 or 401 | `bad_verification_code` | raises `AuthError` ("the device code was rejected; start sign-in again") |
+| 400 or 401 | anything else, or absent | raises `AuthError` with `error` and `error_description` in `technical` |
+| 408, 425, 429, or any 5xx | — | raises `NetworkError` — a transient server failure, which `wait_for_token` tolerates up to `MAX_POLL_NETWORK_FAILURES` times |
+| any other status | — | raises `AuthError` naming the status; the body is included in `technical` only after `REDACTOR.redact` |
+
+A 200 response missing `access_token` is an `AuthError`. A missing `refresh_token`
+in a 200 response is stored as `""` and is not an error — the account simply cannot
+be refreshed silently and will need a fresh sign-in.
+
+`wait_for_token`, normative — the state machine:
+
+1. `code = self.start(cancel=cancel)`; call `on_code(code)` exactly once,
+   immediately, so the UI can show the code before any waiting happens.
+2. `interval = max(code.interval, 1)`; `failures = 0`.
+3. Loop:
+   a. `check_cancel(cancel)`.
+   b. Wait `interval` seconds using `cancel.wait(interval)` when a token was given
+      (so Cancel is immediate) and `self.sleep(interval)` otherwise; then
+      `check_cancel(cancel)` again. **The wait happens before the first poll** —
+      the user cannot possibly have finished signing in yet.
+   c. If `clock() >= code.expires_at`, raise `AuthExpiredError`.
+   d. `tokens = self.poll_once(code)`; return them when they are not `None`,
+      and reset `failures = 0`.
+   e. `AuthSlowDownError` → `interval = err.interval`, continue.
+   f. `NetworkError` → `failures += 1`; re-raise once `failures` reaches
+      `MAX_POLL_NETWORK_FAILURES` (3), otherwise continue. This is the "network
+      failure" case of spec section 4.2, distinct from every OAuth error because
+      it surfaces `NetworkError`'s own message.
+   g. `AuthExpiredError`, `AuthDeclinedError` and `AuthError` propagate immediately.
+4. `CancelledError` propagates and ends the polling thread — the Account screen's
+   Cancel button really does stop it.
+
+### 10.7 The Xbox and Mojang chain
+
+```python
+def xbl_authenticate(
+    http: Http, endpoints: AuthEndpoints, msa_access_token: str, *,
+    cancel: CancelToken | None = None,
+) -> XblToken:
+    """Step 2: exchange a Microsoft token for an Xbox Live user token.
+
+    Raises:
+        AuthError: the response has no `Token` or no `DisplayClaims.xui[0].uhs`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def xsts_authorize(http: Http, xbl: XblToken, *, cancel: CancelToken | None = None) -> XstsToken:
+    """Step 3: authorise the Xbox token for Minecraft services and read the XUID.
+
+    Raises:
+        XboxAccountError: HTTP 401 carrying an XErr code.
+        AuthError: HTTP 401 with no XErr, or a response with no `Token`/`xid`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def login_with_xbox(
+    http: Http, xsts: XstsToken, *, clock: Callable[[], float] = time.time,
+    cancel: CancelToken | None = None,
+) -> MojangToken:
+    """Step 4: exchange the XSTS token for a Minecraft services bearer token.
+
+    Raises:
+        AuthError: the response has no `access_token`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def fetch_profile(http: Http, mojang: MojangToken, *, cancel: CancelToken | None = None) -> Profile:
+    """Step 5: read the Minecraft: Java Edition profile.
+
+    Raises:
+        NoJavaEditionError: HTTP 404 — the account does not own Java Edition.
+        TokenExpiredError: HTTP 401 — the bearer token has expired.
+        AuthError: HTTP 403, or a 200 with no `id`/`name`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+`xbl_authenticate` posts to `XBL_AUTH_URL`:
+
+```json
+{
+  "Properties": {
+    "AuthMethod": "RPS",
+    "SiteName": "user.auth.xboxlive.com",
+    "RpsTicket": "<endpoints.rps_prefix><msa_access_token>"
+  },
+  "RelyingParty": "http://auth.xboxlive.com",
+  "TokenType": "JWT"
+}
+```
+
+and reads `Token` and `DisplayClaims.xui[0].uhs`. The prefix comes from
+`endpoints`, never from a literal at the call site.
+
+`xsts_authorize` posts to `XSTS_AUTH_URL`:
+
+```json
+{
+  "Properties": {"SandboxId": "RETAIL", "UserTokens": ["<xbl.token>"]},
+  "RelyingParty": "rp://api.minecraftservices.com/",
+  "TokenType": "JWT"
+}
+```
+
+with `raise_for_status=False`, because the 401 body is the whole point. On a 401
+the body is decoded and `XErr` is read (coerced with `int()` — it can arrive as a
+string) together with `Redirect` (default `""`), and
+`XboxAccountError(xerr, redirect)` is raised. Section 2's `XERR_MESSAGES` supplies
+the user-facing sentence for every mapped code, and `XERR_FALLBACK` covers the
+rest; this module maps **only** by constructing that exception and never writes an
+XErr sentence of its own. A 401 whose body has no readable `XErr` is an
+`AuthError`. Any other non-2xx status raises `HttpStatusError`. On success it reads
+`Token`, `DisplayClaims.xui[0].uhs` and `DisplayClaims.xui[0].xid`; a missing `xid`
+is an `AuthError`, because `${auth_xuid}` cannot be filled in without it.
+
+| XErr | Meaning (message text lives in section 2's `XERR_MESSAGES`) |
+|---|---|
+| `2148916233` | The account has no Xbox profile yet. |
+| `2148916235` | Xbox Live is unavailable in the account's country. |
+| `2148916236` | Adult verification required. |
+| `2148916237` | Adult verification required. |
+| `2148916238` | The account is a child and needs a Family group. |
+| anything else | `XERR_FALLBACK`, formatted with the raw code and the Redirect URL. |
+
+`login_with_xbox` posts `{"identityToken": xsts.identity_token}` — that is
+`XBL3.0 x={uhs};{token}` — to `MOJANG_LOGIN_URL`, reads `access_token` and
+`expires_in` (86400 in practice), sets `expires_at = clock() + expires_in`, and
+registers the token with `REDACTOR`.
+
+`fetch_profile` sends `Authorization: Bearer {mojang.access_token}` to
+`MOJANG_PROFILE_URL` with `raise_for_status=False` and dispatches on the status:
+
+| Status | Result |
+|---|---|
+| 200 | `Profile(uuid=data["id"], name=data["name"])` |
+| 401 | `TokenExpiredError` |
+| 403 | `AuthError` |
+| 404 | `NoJavaEditionError` |
+| anything else | `HttpStatusError` |
+
+**404 is not an authentication failure.** It means the Microsoft account does not
+own Minecraft: Java Edition, or is a Game Pass account that has never opened the
+official launcher once. It has its own error class with its own sentence
+(section 2) and is never collapsed into the `AuthError` handler.
+
+### 10.8 Top-level operations
+
+```python
+def sign_in(
+    mode: str,
+    client_id: str,
+    http: Http,
+    *,
+    on_code: Callable[[DeviceCode], None] | None = None,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+    clock: Callable[[], float] = time.time,
+) -> Account:
+    """Run the whole device-code → XBL → XSTS → Mojang → profile chain.
+
+    Raises:
+        ConfigError: unknown mode, or an empty client id.
+        AuthExpiredError, AuthDeclinedError, XboxAccountError, NoJavaEditionError,
+        TokenExpiredError, AuthError, NetworkError, HttpStatusError, CancelledError.
+    """
+
+def refresh_msa(
+    http: Http, endpoints: AuthEndpoints, client_id: str, refresh_token: str, *,
+    clock: Callable[[], float] = time.time, cancel: CancelToken | None = None,
+) -> MsaTokens:
+    """Exchange a Microsoft refresh token for a new one.
+
+    Raises:
+        TokenExpiredError: the endpoint answered `invalid_grant`.
+        AuthError: any other OAuth error.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def refresh(
+    account: Account,
+    client_id: str,
+    http: Http,
+    *,
+    clock: Callable[[], float] = time.time,
+    cancel: CancelToken | None = None,
+) -> Account:
+    """Renew an account silently with its Microsoft refresh token, re-running steps 2-5.
+
+    Raises:
+        ConfigError: empty client id, or an account with an unknown `auth_mode`.
+        TokenExpiredError: the refresh token is empty, expired or rejected.
+        XboxAccountError, NoJavaEditionError, AuthError, NetworkError,
+        HttpStatusError, CancelledError.
+    """
+
+def ensure_fresh(
+    account: Account,
+    client_id: str,
+    http: Http,
+    *,
+    within_seconds: float = REFRESH_MARGIN_SECONDS,
+    store: AccountStore | None = None,
+    clock: Callable[[], float] = time.time,
+    cancel: CancelToken | None = None,
+) -> Account:
+    """Return the account, refreshing it first if its token expires within `within_seconds`.
+
+    Raises:
+        ConfigError, TokenExpiredError, XboxAccountError, NoJavaEditionError,
+        AuthError, NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+`sign_in`, normative. `client_id` is checked first: an empty string raises
+`ConfigError` (`require_client_id` in section 8 is what callers use to produce it
+from a `Config`). Step 1 is
+`DeviceCodeSession(mode, client_id, http, clock=clock).wait_for_token(on_code=on_code,
+cancel=cancel)`; steps 2 to 5 are `xbl_authenticate`, `xsts_authorize`,
+`login_with_xbox` and `fetch_profile`, each given the endpoints or token the previous
+step produced. The five steps report through `progress` as
+`(label, step, 5)`, with these exact labels:
+
+| Step | Label |
+|---|---|
+| 1 | `"Waiting for you to sign in"` |
+| 2 | `"Signing in to Xbox Live"` |
+| 3 | `"Checking your Xbox profile"` |
+| 4 | `"Signing in to Minecraft"` |
+| 5 | `"Loading your profile"` |
+
+The returned `Account` carries `auth_mode=mode`, `xuid` from the XSTS `xid`,
+`access_expires_at` from the Mojang token, and `refresh_token` /
+`refresh_expires_at` from the Microsoft tokens. `sign_in` does **not** write to
+`accounts.json`; the caller decides when to persist (the Account screen does it on
+`TaskFinished`).
+
+`refresh`, normative: `endpoints_for(account.auth_mode)` — the same family that
+issued the tokens, never `config.auth_mode`, because switching modes in the config
+must not silently reinterpret a stored refresh token. An empty `account.refresh_token`,
+or a `refresh_expires_at` already in the past, raises `TokenExpiredError` without a
+request. Otherwise: `refresh_msa`, then steps 2–5 again (a new XSTS token is needed
+for a new XUID and a new Mojang token), and a new `Account` is returned with the
+same `uuid` and the refreshed fields. The profile is re-fetched so a renamed
+account shows its new name.
+
+`ensure_fresh`, normative: returns `account` unchanged when
+`not account.is_expired(now=clock(), within_seconds=within_seconds)`. Otherwise it
+calls `refresh` and, when `store` is given, `store.upsert(refreshed)` before
+returning. This is the proactive path from spec section 4.3 — the launcher refreshes
+five minutes early rather than waiting for a 401 round-trip. The reactive path still
+exists: a `TokenExpiredError` from `fetch_profile` or from the game-launch path is
+handled by calling `refresh` once and retrying, and only then surfacing to the user.
+
+### 10.9 Redaction
+
+Every token this module handles is passed to `logsetup.REDACTOR.register` the
+moment it is received or read from disk: the device code, both Microsoft tokens,
+the XBL token, the XSTS token and the Mojang access token. No function in this
+module logs a request or response body that has not been through
+`REDACTOR.redact`. `Account.__repr__` is not customised — the dataclass repr does
+contain tokens, so an account is never logged with `%r`; log `account.name` and
+`account.uuid` instead.
+
+---
+
+## 11. `core/runtime.py`
+
+The launcher installs its own JRE, so the whole thing runs on a clean machine with
+no Java and no environment variables. The Java major version is a **parameter**,
+taken from `core.versions.java_major(version_json)`; this module never decides it.
+
+```python
+ADOPTIUM_URL: Final[str] = "https://api.adoptium.net/v3/assets/feature_releases/{major}/ga"
+ADOPTIUM_FIXED_QUERY: Final[dict[str, str]] = {
+    "image_type": "jre",       # there is no "headless" image type; Minecraft needs AWT
+    "vendor": "eclipse",
+    "jvm_impl": "hotspot",
+    "heap_size": "normal",
+    "page_size": "1",
+}
+OS_MAP: Final[dict[str, str]] = {"win32": "windows", "linux": "linux", "darwin": "mac"}
+ARCH_MAP: Final[dict[str, str]] = {
+    "amd64": "x64", "x86_64": "x64", "x64": "x64",
+    "arm64": "aarch64", "aarch64": "aarch64",
+}
+JAVA_VERSION_TIMEOUT: Final[float] = 15.0     # seconds for the `java -version` probe
+```
+
+All **seven** query parameters are sent on every call — `architecture`,
+`image_type`, `os`, `vendor`, `jvm_impl`, `heap_size`, `page_size`. Omitting any of
+them returns a huge paginated blob instead of the single binary this module wants.
+
+```python
+def adoptium_os(platform_name: str | None = None) -> str:
+    """"windows" | "linux" | "mac" for the `os` query parameter.
+
+    Raises:
+        RuntimeProvisionError: the platform has no Adoptium name.
+    """
+
+def adoptium_arch(machine: str | None = None) -> str:
+    """"x64" | "aarch64" for the `architecture` query parameter.
+
+    Raises:
+        RuntimeProvisionError: `platform.machine()` maps to no Adoptium architecture.
+    """
+
+def runtime_dir(paths: Paths, major: int) -> Path:
+    """`runtimes/java-{major}/` — the same value as `paths.runtime_dir(major)`."""
+
+def java_executable(paths: Paths, major: int) -> Path:
+    """`runtimes/java-{major}/bin/java.exe` on Windows, `.../bin/java` elsewhere."""
+
+def runtime_is_valid(
+    paths: Paths, major: int, *,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    timeout: float = JAVA_VERSION_TIMEOUT,
+) -> bool:
+    """True when the cached JRE exists and `java -version` exits 0. Never raises."""
+```
+
+`adoptium_os` uses `sys.platform` when `platform_name` is `None`; `adoptium_arch`
+uses `platform.machine()` when `machine` is `None` and lower-cases it before the
+lookup (`"AMD64"` on the dev machine → `"x64"`).
+
+`runtime_is_valid`, normative: `java_executable(...)` must exist, then
+`run([str(exe), "-version"], capture_output=True, text=True, timeout=timeout)` must
+return code 0. Every exception (`OSError`, `subprocess.SubprocessError`,
+`subprocess.TimeoutExpired`) is caught and returns `False`, because "the cached JRE
+is unusable" is a normal outcome that triggers a reinstall, not an error to show.
+`run` is injected so the check is testable without a JRE.
+
+```python
+@dataclass(frozen=True, slots=True)
+class AdoptiumBinary:
+    """The one JRE package the query selected."""
+    name: str            # "OpenJDK25U-jre_x64_windows_hotspot_25.0.4.1_1.zip"
+    link: str            # absolute download URL
+    checksum: str        # 64 hex characters — SHA-256, not SHA-1
+    size: int            # bytes
+    release_name: str    # "jdk-25.0.4.1+1"
+
+def query_adoptium(
+    http: Http, major: int, *, os_name: str | None = None, arch: str | None = None,
+    cancel: CancelToken | None = None,
+) -> AdoptiumBinary:
+    """Ask Adoptium for the current GA JRE for this Java major, OS and architecture.
+
+    Raises:
+        RuntimeProvisionError: no release, no matching binary, or a malformed response.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def install_runtime(
+    http: Http, paths: Paths, major: int, binary: AdoptiumBinary, *,
+    progress: ProgressFn = null_progress, cancel: CancelToken | None = None,
+) -> Path:
+    """Download, verify, extract and atomically install a JRE into `runtimes/java-{major}/`.
+
+    Raises:
+        ChecksumError: the archive's SHA-256 does not match `binary.checksum`.
+        RuntimeProvisionError: extraction failed, or the archive has no `bin/java`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def ensure_runtime(
+    http: Http, paths: Paths, major: int, *,
+    progress: ProgressFn = null_progress, cancel: CancelToken | None = None,
+) -> Path:
+    """The path to a working `java` for this major version, installing it if needed.
+
+    Raises:
+        RuntimeProvisionError, ChecksumError, NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+`query_adoptium`, normative: `http.get_json(ADOPTIUM_URL.format(major=major),
+params={**ADOPTIUM_FIXED_QUERY, "os": os_name or adoptium_os(), "architecture":
+arch or adoptium_arch()})`. The response is a JSON **list**; an empty list raises
+`RuntimeProvisionError` naming the major, OS and architecture. From element 0 it
+takes `release_name` and scans `binaries` for the first entry whose `image_type`,
+`os` and `architecture` all match the query, then reads that entry's `package`
+object for `name`, `link`, `checksum` and `size`. A missing `package`, `link` or
+`checksum` raises `RuntimeProvisionError`. **The `checksum` field is SHA-256**
+(64 hex characters), not the SHA-1 used everywhere else in the launcher.
+
+`install_runtime`, normative — every step of the atomicity requirement:
+
+1. Progress is split with a `Reporter`: download `0.00–0.85`, extract `0.85–0.97`,
+   install `0.97–1.00`.
+2. Download the archive to `paths.runtimes / binary.name` (streamed through the
+   usual `.part` file) via `http.download(binary.link, archive,
+   expected_hash=binary.checksum, algorithm="sha256", expected_size=binary.size,
+   progress=..., cancel=...)`. Verification therefore happens **before** anything
+   is extracted, and a re-run reuses an already-downloaded archive.
+3. Extract into a fresh temporary directory `paths.runtimes / f".java-{major}.tmp"`,
+   deleting it first if a previous run left it behind. The extractor is chosen by
+   the archive name: `.zip` → `zipfile.ZipFile`; `.tar.gz` or `.tgz` →
+   `tarfile.open(mode="r:gz")`; anything else raises `RuntimeProvisionError`.
+   Windows ships `.zip` and Linux/macOS ship `.tar.gz`, so both paths are real.
+4. Every member name is checked before it is written: a member whose resolved
+   destination is not inside the temporary directory (absolute paths, `..`
+   segments, symlinks pointing outside) is skipped and logged at WARNING.
+5. Flatten. Archives contain exactly one top-level directory (for example
+   `jdk-25.0.4.1+1-jre/`). If the temporary directory has exactly one entry and it
+   is a directory, that becomes the install root. Then, if
+   `root / "Contents" / "Home"` exists, **that** becomes the install root — this is
+   the macOS layout, where the real `bin/java` is at
+   `<top>/Contents/Home/bin/java`.
+6. Verify `root / "bin" / ("java.exe" if Windows else "java")` exists; if not,
+   raise `RuntimeProvisionError`.
+7. On POSIX, call `posix_chmod_755` on **every file in `root/"bin"`**. `zipfile`
+   does not preserve the executable bit, so a JRE extracted from a `.zip` on Linux
+   or macOS is unusable without this; the chmod runs for both archive kinds so
+   there is one code path.
+8. Install atomically: if `runtime_dir(paths, major)` exists, `os.replace` it to
+   `paths.runtimes / f".java-{major}.old"` and delete that afterwards; then
+   `os.replace(root, runtime_dir(paths, major))`. A half-extracted tree is never
+   visible under the real name, so the next launch can never mistake one for a
+   working JRE.
+9. Clean up the temporary directory and the archive. A cleanup failure is logged
+   at WARNING and ignored.
+10. `OSError`, `zipfile.BadZipFile`, `tarfile.TarError` and `shutil.Error` are
+    wrapped in `RuntimeProvisionError`. `ChecksumError` and `CancelledError`
+    propagate unwrapped.
+
+`ensure_runtime`, normative: when `runtime_is_valid(paths, major)` it reports
+`progress(f"Java {major} is ready", 1, 1)` and returns `java_executable(...)`
+without any network call. Otherwise it runs `query_adoptium` then `install_runtime`,
+re-checks `runtime_is_valid`, and raises `RuntimeProvisionError` if the freshly
+installed runtime still does not answer `java -version`.
+
+---
+
+## 12. `core/libraries.py`
+
+```python
+MAX_WORKERS: Final[int] = 16
+LIBRARY_BASE_URL: Final[str] = "https://libraries.minecraft.net/"
+NATIVE_CLASSIFIER_PREFIX: Final[str] = "natives-"
+```
+
+### 12.1 Platform and rules
+
+```python
+def current_os_name() -> str:
+    """Mojang's OS name for this machine: "windows" | "linux" | "osx"."""
+
+def current_arch() -> str:
+    """Mojang's architecture name for this machine: "x64" | "x86" | "arm64"."""
+
+def os_version_string() -> str:
+    """The string an `os.version` rule regex is matched against (`platform.release()`)."""
+
+def rules_allow(
+    rules: Sequence[Mapping[str, Any]] | None,
+    os_name: str,
+    arch: str,
+    os_version: str,
+    features: Mapping[str, bool],
+) -> bool:
+    """Evaluate a Mojang `rules` array for this OS, architecture, OS version and feature set."""
+```
+
+`current_os_name` maps `sys.platform`: `"win32"` → `"windows"`, `"darwin"` →
+`"osx"`, everything else → `"linux"`. `current_arch` maps a lower-cased
+`platform.machine()`: `"amd64"`/`"x86_64"` → `"x64"`, `"arm64"`/`"aarch64"` →
+`"arm64"`, `"i386"`/`"i686"`/`"x86"` → `"x86"`, anything else → `"x64"`.
+
+`rules_allow`, normative — this is the algorithm, and getting it wrong either drops
+LWJGL or leaks `--quickPlayPath ${quickPlayPath}` into argv:
+
+1. `rules` that is `None` or empty → **allow**. This is the common case: most
+   libraries and most argument strings have no rules at all.
+2. Otherwise start from **deny** and walk the rules in order. Each rule that
+   *applies* sets the result to `rule["action"] == "allow"`. The last applying rule
+   wins. Rules present and none applying → **deny**.
+3. A rule applies when every condition it carries matches:
+   - `os.name` — equal to `os_name`.
+   - `os.arch` — equal to `arch`.
+   - `os.version` — `re.search(pattern, os_version)` finds a match.
+   - `features` — for every key in the mapping, `features.get(key, False)` equals
+     the rule's value. A feature the launcher does not know about is `False`, so a
+     rule requiring it does not apply.
+4. A rule carrying a condition key this function does not understand does **not**
+   apply (fail closed).
+5. A rule with no conditions at all applies unconditionally — this is how the
+   `{"action": "allow"}` + `{"action": "disallow", "os": {...}}` pattern works.
+
+`features` is always supplied; section 15's `Features` dataclass is the source, and
+all six flags default to `False`.
+
+### 12.2 Maven coordinates
+
+```python
+def maven_path(gav: str) -> str:
+    """Repository-relative path for a Maven GAV, using "/" separators.
+
+    Raises:
+        ManifestError: `gav` has fewer than three colon-separated components.
+    """
+
+def maven_url(base: str, gav: str) -> str:
+    """`base` (with a trailing "/" ensured) joined to `maven_path(gav)`."""
+
+def is_native_classifier(name: str) -> bool:
+    """True when a Maven GAV's classifier starts with "natives-"."""
+```
+
+`maven_path` normative: split `gav` on `":"`. The first three components are
+group, artifact and version; a fourth, when present, is the classifier. If the last
+component contains `"@"`, the text after it is the file extension and the text
+before it stays part of that component; the extension defaults to `"jar"`. The
+result is
+`group.replace(".", "/") + "/" + artifact + "/" + version + "/" + artifact + "-" + version + ("-" + classifier if classifier else "") + "." + extension`.
+So `org.ow2.asm:asm:9.10.1` → `org/ow2/asm/asm/9.10.1/asm-9.10.1.jar`, and
+`com.mojang:jtracy:1.0.37:natives-linux` →
+`com/mojang/jtracy/1.0.37/jtracy-1.0.37-natives-linux.jar`.
+
+`is_native_classifier("com.mojang:jtracy:1.0.37:natives-linux")` is `True`;
+`is_native_classifier("org.ow2.asm:asm:9.10.1")` is `False`.
+
+### 12.3 `Library`
+
+```python
+@dataclass(frozen=True, slots=True)
+class Library:
+    """One resolved library: where it comes from, where it goes, and what it is for."""
+    name: str                                   # the Maven GAV as written in the JSON
+    path: str                                   # repository-relative, "/" separated
+    url: str                                    # absolute download URL ("" when unknown)
+    sha1: str = ""                              # "" means "hash not known yet"
+    size: int = 0                               # 0 means "size not known"
+    on_classpath: bool = True
+    extract_to_natives: bool = False
+    extract_exclude: tuple[str, ...] = ()
+
+    @property
+    def group_artifact(self) -> str:
+        """"group:artifact" — the de-duplication key used by `core.fabric.merge_profile`."""
+```
+
+### 12.4 Selection
+
+```python
+def select_libraries(
+    version_json: Mapping[str, Any],
+    *,
+    os_name: str | None = None,
+    arch: str | None = None,
+    os_version: str | None = None,
+    features: Mapping[str, bool] | None = None,
+) -> list[Library]:
+    """Every library this machine needs, in version-JSON order.
+
+    Raises:
+        ManifestError: `libraries` is missing, or an entry has neither `downloads`
+            nor a usable `name`.
+    """
+
+def library_local_path(paths: Paths, library: Library) -> Path:
+    """`libraries/` joined with the library's repository-relative path."""
+```
+
+`select_libraries`, normative. Defaults: `os_name = current_os_name()`,
+`arch = current_arch()`, `os_version = os_version_string()`, `features = {}`.
+Entries are walked in order and each produces zero, one or two `Library` objects:
+
+1. `rules_allow(entry.get("rules"), ...)` is `False` → the entry is skipped entirely.
+2. **Legacy natives model.** The entry has both `downloads.classifiers` and a
+   `natives` map, and `natives` has a key equal to `os_name`. The classifier key is
+   `natives[os_name]` with `${arch}` replaced by `"32"` when `arch == "x86"` and
+   `"64"` otherwise. `downloads.classifiers[key]` yields a `Library` with
+   `on_classpath=False`, `extract_to_natives=True` and
+   `extract_exclude=tuple(entry.get("extract", {}).get("exclude", []))`. If the
+   same entry also has `downloads.artifact`, that artifact is emitted as well, as
+   an ordinary classpath library.
+3. **Modern model.** The entry has `downloads.artifact` → one ordinary
+   `Library(on_classpath=True)` built from `path`, `url`, `sha1` and `size`.
+   This is the branch that handles `natives-*` Maven classifiers on 1.19+ and every
+   26.x version: they are ordinary libraries with a normal `downloads.artifact`,
+   gated by an OS rule, and **they belong on the classpath**. There is no
+   extraction and no `natives` map anywhere in a modern version JSON — 26.2 has
+   131 libraries and zero `downloads.classifiers`.
+4. **Fabric-style entry.** The entry has no `downloads` block at all, only `name`
+   and (usually) `url`. The path is `maven_path(name)`, the URL is
+   `maven_url(entry.get("url") or LIBRARY_BASE_URL, name)`, `sha1` is
+   `entry.get("sha1", "")` and `size` is `entry.get("size", 0)`. Writing
+   `entry["downloads"]["artifact"]["url"]` here raises `KeyError` on every Fabric
+   library; this branch is why `fabric-merged.json` can be handed straight to
+   `select_libraries`.
+
+A `Library` whose `sha1` is `""` is legal and means "hash not known from the
+metadata"; `download_libraries` resolves it through `sha1_lookup`.
+
+### 12.5 Downloading
+
+```python
+def download_libraries(
+    http: Http,
+    paths: Paths,
+    libraries: Sequence[Library],
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+    max_workers: int = MAX_WORKERS,
+    executor_factory: Callable[[int], concurrent.futures.Executor] | None = None,
+    sha1_lookup: Callable[[Library], str] | None = None,
+) -> list[Path]:
+    """Fetch every library that is missing or whose SHA-1 does not match, in parallel.
+
+    Raises:
+        ChecksumError: a downloaded library does not match its published SHA-1.
+        NetworkError, HttpStatusError, CancelledError, OSError.
+    """
+
+def download_client_jar(
+    http: Http, paths: Paths, version_json: Mapping[str, Any], version_id: str, *,
+    progress: ProgressFn = null_progress, cancel: CancelToken | None = None,
+) -> Path:
+    """Fetch (or reuse) `versions/{id}/client.jar`, verified against `downloads.client.sha1`.
+
+    Raises:
+        ManifestError: the version JSON has no `downloads.client`.
+        ChecksumError, NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+`download_libraries`, normative:
+
+- The pool is a `concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers,
+  MAX_WORKERS))`. `executor_factory(workers)` overrides construction so a test can
+  assert the cap without spawning threads. The cap is 16 and pairs with the
+  session's `pool_maxsize=32` (section 7): the default urllib3 pool of 10 would
+  throttle 16 workers and emit warnings.
+- Each job downloads one library to `library_local_path(paths, library)` with
+  `http.download(library.url, dest, expected_hash=<sha1>, algorithm="sha1",
+  expected_size=library.size or None, label=Path(library.path).name)`. Because
+  `Http.download` skips a file whose hash already matches, a second launch does no
+  network I/O at all.
+- When `library.sha1` is `""` and `sha1_lookup` is given, the worker calls
+  `sha1_lookup(library)` first and uses whatever it returns; `""` means "verify
+  nothing", and then existence alone is the skip test. `core/pipeline.py` passes
+  `core.fabric.library_sha1_lookup(http)` so Fabric's `.sha1` sidecars are fetched
+  lazily and only for the libraries that actually need them.
+- `progress` is called **only from the thread that called `download_libraries`**,
+  as futures complete, never from a worker: `progress(name, completed, total)`
+  where `total` is `len(libraries)`. `ProgressFn` implementations are not required
+  to be thread-safe.
+- `check_cancel(cancel)` runs before each submission and after each completion. On
+  cancellation, pending futures are cancelled, the executor is shut down, and
+  `CancelledError` propagates.
+- The first worker exception is re-raised after the executor has been shut down;
+  remaining futures are cancelled. Nothing is swallowed.
+- Returns the local paths of every library in `libraries`, in input order,
+  including the ones that were already present.
+
+### 12.6 Natives and the classpath
+
+```python
+def extract_natives(
+    paths: Paths,
+    libraries: Sequence[Library],
+    natives_dir: Path,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> Path:
+    """Unpack every legacy natives jar into the instance's natives directory.
+
+    Raises:
+        LaunchError: a natives jar is missing or is not a readable zip.
+        CancelledError, OSError.
+    """
+
+def build_classpath(
+    paths: Paths,
+    libraries: Sequence[Library],
+    client_jar: Path,
+    *,
+    separator: str | None = None,
+) -> str:
+    """The `-cp` value: every classpath library in order, then the client jar last."""
+```
+
+`extract_natives`, normative:
+
+1. `natives_dir.mkdir(parents=True, exist_ok=True)` runs **first and always**, even
+   when no library needs extracting. Modern versions extract nothing, but the
+   directory is still passed as `-Djava.library.path`, and a missing directory
+   there is a launch failure.
+2. For each library with `extract_to_natives=True`, open
+   `library_local_path(paths, library)` with `zipfile.ZipFile` and write out every
+   member except: directory entries; members whose name starts with any string in
+   `library.extract_exclude` (this is the `extract.exclude` list, almost always
+   `["META-INF/"]`); and members whose resolved destination would fall outside
+   `natives_dir`, which are skipped and logged at WARNING.
+3. Existing files are overwritten — a natives directory is disposable.
+4. `progress(library name, completed, total)` per jar, from the calling thread.
+5. `zipfile.BadZipFile` and a missing jar are wrapped in `LaunchError`.
+
+`build_classpath`, normative: the entries are `library_local_path(paths, lib)` for
+every library with `on_classpath=True`, in the order `select_libraries` produced
+them — which, for a Fabric launch, is Fabric's libraries first and Mojang's after
+(section 13). Duplicate paths are dropped, keeping the first occurrence. The client
+jar is appended **last**. `separator` defaults to `";"` on Windows
+(`sys.platform == "win32"`) and `":"` everywhere else, matching
+`${classpath_separator}` in section 15.
+
+---
+
+## 13. `core/fabric.py`
+
+```python
+FABRIC_META: Final[str] = "https://meta.fabricmc.net/v2"
+FABRIC_LOADER_URL: Final[str] = "https://meta.fabricmc.net/v2/versions/loader/{game_version}"
+FABRIC_PROFILE_URL: Final[str] = (
+    "https://meta.fabricmc.net/v2/versions/loader/{game_version}/{loader_version}/profile/json"
+)
+FABRIC_MAVEN: Final[str] = "https://maven.fabricmc.net/"
+FABRIC_EXPECTED_MAIN_CLASS: Final[str] = "net.fabricmc.loader.impl.launch.knot.KnotClient"
+FABRIC_MERGED_NAME: Final[str] = "fabric-merged.json"
+```
+
+### 13.1 Loader selection
+
+```python
+@dataclass(frozen=True, slots=True)
+class LoaderEntry:
+    """One entry of the Fabric loader list for a game version."""
+    version: str                 # loader.version, e.g. "0.19.5"
+    build: int                   # loader.build
+    maven: str                   # loader.maven, e.g. "net.fabricmc:fabric-loader:0.19.5"
+    stable: bool                 # loader.stable
+    intermediary_version: str    # intermediary.version, "" when absent
+
+def fetch_loader_versions(
+    http: Http, game_version: str, *, cancel: CancelToken | None = None
+) -> list[LoaderEntry]:
+    """The Fabric loader list for a Minecraft version, newest first.
+
+    Raises:
+        ManifestError: the response is not a non-empty list of loader entries.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+
+def choose_loader(entries: Sequence[LoaderEntry]) -> LoaderEntry:
+    """The first entry with `stable` true, falling back to entry 0.
+
+    Raises:
+        ManifestError: `entries` is empty.
+    """
+
+def fetch_profile(
+    http: Http, game_version: str, loader_version: str, *, cancel: CancelToken | None = None
+) -> dict[str, Any]:
+    """The Fabric launcher profile JSON for one game/loader pair.
+
+    Raises:
+        ManifestError: the response is not a JSON object with `libraries` and `mainClass`.
+        NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+An empty loader list means Fabric has nothing for this Minecraft version;
+`fetch_loader_versions` raises `ManifestError` with the user message
+"Fabric doesn't support Minecraft {game_version} yet. Pick another version."
+
+### 13.2 Fabric libraries have no `downloads` block
+
+This is the single most common way a launcher crashes on Fabric. A profile library
+entry looks like this — `name`, `url`, and inline hashes, with no `downloads`
+anywhere:
+
+```json
+{
+  "name": "org.ow2.asm:asm:9.10.1",
+  "url": "https://maven.fabricmc.net/",
+  "md5": "…",
+  "sha1": "ada2141c0cc52ee8f5c48cd5fa4ce0e794f22236",
+  "sha256": "…",
+  "sha512": "…",
+  "size": 126151
+}
+```
+
+```python
+def fabric_library_url(lib: Mapping[str, Any]) -> tuple[str, str]:
+    """(jar URL, jar URL + ".sha1") built from the entry's `name` and `url`.
+
+    Raises:
+        ManifestError: the entry has no usable `name`.
+    """
+
+def fetch_sha1_sidecar(http: Http, jar_url: str, *, cancel: CancelToken | None = None) -> str:
+    """GET `{jar_url}.sha1` and return the 40-character digest it contains, or "" on 404."""
+
+def fabric_library_sha1(
+    http: Http, lib: Mapping[str, Any], *, cancel: CancelToken | None = None
+) -> str:
+    """The entry's inline `sha1` when it has one, otherwise the `.sha1` sidecar."""
+
+def library_sha1_lookup(http: Http) -> Callable[[Library], str]:
+    """The `sha1_lookup` callable `core.libraries.download_libraries` expects."""
+```
+
+`fabric_library_url` builds the jar URL as
+`maven_url(lib.get("url") or FABRIC_MAVEN, lib["name"])` — that is,
+`{url}{group.replace('.', '/')}/{artifact}/{version}/{artifact}-{version}.jar` —
+and appends `".sha1"` for the sidecar. `fetch_sha1_sidecar` requests the sidecar with
+`raise_for_status=False`, strips the response text and takes its first
+whitespace-separated field (some Maven repositories append a filename); a non-200
+response or a value that is not 40 hex characters returns
+`""` rather than raising, because an unverifiable library is still installable and
+the failure mode of refusing to launch is worse. The returned callable from
+`library_sha1_lookup` fetches `library.url + ".sha1"` and is called only for
+libraries whose `sha1` is `""`.
+
+### 13.3 Version comparison — libraries only
+
+```python
+def compare_versions(a: str, b: str) -> int:
+    """-1, 0 or 1 comparing two Maven library versions (dotted-numeric, non-numeric fallback)."""
+```
+
+Normative: split each string on the regex `[._+\-]`. Compare component by
+component; a component that is all digits compares as an integer, and a numeric
+component sorts **above** a non-numeric one at the same position; two non-numeric
+components compare as strings. A missing component (one version is shorter) is
+treated as `0`. `9.10.1` > `9.7.1`; `0.19.5` > `0.19.5-beta.1`.
+
+> **This function is for `group:artifact` de-duplication and nothing else.**
+> Minecraft game versions are ordered by manifest index in `core/versions.py`
+> (section 9). `26.2` is newer than `1.21.11`, and no dotted-numeric comparator
+> gets that right. Never call `compare_versions` on a game version.
+
+### 13.4 Merging
+
+```python
+def merge_profile(
+    vanilla_json: Mapping[str, Any], fabric_json: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Combine a Mojang version JSON and a Fabric profile into one launchable document.
+
+    Raises:
+        ManifestError: `vanilla_json` has no `arguments` block, or the profile has no
+            `mainClass`.
+    """
+
+def write_merged_profile(paths: Paths, version_id: str, merged: Mapping[str, Any]) -> Path:
+    """Write `versions/{version_id}/fabric-merged.json` atomically and return its path.
+
+    Raises:
+        ConfigError: the file cannot be written.
+    """
+```
+
+`merge_profile`, normative:
+
+1. The result starts as a deep copy of `vanilla_json`, so `assetIndex`, `assets`,
+   `downloads`, `javaVersion`, `type` and `releaseTime` all come from Mojang.
+   `inheritsFrom` is removed from the result — the merge has resolved it. The
+   `logging` block is copied but never used (section 0 amendment).
+2. `id` becomes `fabric_json["id"]` (for example `fabric-loader-0.19.5-26.2`).
+   This is what `${version_name}` gets at launch.
+3. `mainClass` comes from `fabric_json["mainClass"]`. When it differs from
+   `FABRIC_EXPECTED_MAIN_CLASS` a warning is logged and **the profile's value is
+   still used**. It is never hardcoded.
+4. Libraries: the merged list is `fabric_json["libraries"]` first, then
+   `vanilla_json["libraries"]`, de-duplicated by `group:artifact` — the first two
+   colon-separated components of `name`. When both lists contain the same
+   `group:artifact`, the entry whose version is higher per `compare_versions` wins;
+   ties keep the Fabric entry, because Fabric intentionally overrides some Mojang
+   libraries. The winner keeps the position of the first occurrence, so Fabric's
+   libraries stay ahead of Mojang's and therefore come first on the classpath. An
+   entry whose `name` has fewer than two components is keyed by the whole name.
+5. `arguments`: `game` is vanilla's game list followed by the profile's, and `jvm`
+   is vanilla's jvm list followed by the profile's. The profile's
+   `"-DFabricMcEmu= net.minecraft.client.main.Main "` is **one argv element** and
+   its unusual internal spacing is preserved verbatim — it is not split, stripped
+   or normalised.
+6. A `vanilla_json` with no `arguments` block (pre-1.13 versions, which carry a
+   `minecraftArguments` string instead) raises `ManifestError` with the user
+   message "Fabric doesn't support Minecraft {id}. Pick 1.14 or newer.", as the
+   section 0 amendment requires. The version dropdown lists every release, so this
+   is a real path and it must fail clearly rather than crash.
+
+`write_merged_profile` writes to `paths.fabric_merged_json(version_id)`, where
+`version_id` is the **vanilla** id (`26.2`), so the file lands at
+`versions/26.2/fabric-merged.json` as spec section 10 requires. The merged document
+is what `core.libraries.select_libraries` is then given, and its Fabric-style
+entries are handled by branch 4 of section 12.4.
+
+---
+
+## 14. `core/assets.py`
+
+```python
+RESOURCES_BASE_URL: Final[str] = "https://resources.download.minecraft.net/"
+MAX_WORKERS: Final[int] = 16
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class AssetObject:
+    """One entry of an asset index."""
+    name: str          # the index key, e.g. "icons/icon_128x128.png"
+    hash: str          # 40-character SHA-1
+    size: int
+
+    @property
+    def sub_path(self) -> str:
+        """`{hash[:2]}/{hash}` — the layout under both `assets/objects/` and the CDN."""
+
+    @property
+    def url(self) -> str:
+        """`RESOURCES_BASE_URL + sub_path`."""
+
+def fetch_asset_index(
+    http: Http, paths: Paths, version_json: Mapping[str, Any], *,
+    progress: ProgressFn = null_progress, cancel: CancelToken | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Fetch (or reuse) `assets/indexes/{id}.json` and return (index id, decoded index).
+
+    Raises:
+        ManifestError: `assetIndex` is missing, or the index is not a JSON object.
+        ChecksumError, NetworkError, HttpStatusError, CancelledError.
+    """
+
+def parse_asset_index(index_json: Mapping[str, Any]) -> list[AssetObject]:
+    """Every object in an asset index, sorted by name for a stable progress order.
+
+    Raises:
+        ManifestError: `objects` is missing or an entry has no `hash`.
+    """
+
+def asset_object_path(paths: Paths, obj: AssetObject) -> Path:
+    """`assets/objects/{hash[:2]}/{hash}` — the same value as `paths.asset_object_path`."""
+
+def download_assets(
+    http: Http,
+    paths: Paths,
+    objects: Sequence[AssetObject],
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+    max_workers: int = MAX_WORKERS,
+    executor_factory: Callable[[int], concurrent.futures.Executor] | None = None,
+) -> int:
+    """Fetch every missing or mismatched asset object in parallel; returns bytes downloaded.
+
+    Raises:
+        ChecksumError, NetworkError, HttpStatusError, CancelledError, OSError.
+    """
+
+def is_virtual(index_json: Mapping[str, Any]) -> bool:
+    """The index's `virtual` flag (absent means False)."""
+
+def maps_to_resources(index_json: Mapping[str, Any]) -> bool:
+    """The index's `map_to_resources` flag (absent means False)."""
+
+def materialise_assets(
+    paths: Paths,
+    objects: Sequence[AssetObject],
+    target_dir: Path,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> Path:
+    """Copy hashed objects to their human names under `target_dir`, for virtual indexes.
+
+    Raises:
+        CancelledError, OSError.
+    """
+
+def game_assets_dir(
+    paths: Paths,
+    index_id: str,
+    index_json: Mapping[str, Any],
+    instance: InstancePaths,
+) -> Path:
+    """The directory `${game_assets}` points at for this index."""
+```
+
+`fetch_asset_index`, normative: reads `version_json["assetIndex"]` for `id`, `url`,
+`sha1` and `size` (26.2: id `"32"`, 5,057 objects, `totalSize` 480 MB), downloads
+it to `paths.asset_index_path(id)` with `http.download(..., expected_hash=sha1,
+algorithm="sha1", expected_size=size)`, then reads it. The index id is a string —
+`"32"` — and is never coerced to an integer; it becomes `${assets_index_name}`.
+
+`download_assets`, normative:
+
+- Same pool discipline as `download_libraries`: `ThreadPoolExecutor` capped at
+  `MAX_WORKERS` (16), an injectable `executor_factory`, `check_cancel(cancel)`
+  before each submission and after each completion, the first worker exception
+  re-raised after shutdown, and `progress` called only from the calling thread.
+- Skip test per object: the file exists **and** `st_size == obj.size` **and** its
+  SHA-1 equals `obj.hash`. A size mismatch short-circuits to "re-download" without
+  hashing. With ~5,000 objects this is the difference between three seconds and
+  three minutes on every relaunch.
+- Progress counts objects and bytes at once: `progress(label, completed_objects,
+  len(objects))` where `label` is
+  `f"Assets — {format_bytes(bytes_done)} of {format_bytes(total_bytes)}"` and
+  `total_bytes` is the sum of the sizes of the objects that actually need
+  downloading. The determinate bar therefore tracks files while the label stays
+  honest about the ~400 MB first launch.
+- Returns the number of bytes actually downloaded (0 on a warm cache).
+
+`materialise_assets` and `game_assets_dir` handle the `virtual` and
+`map_to_resources` flags. Current indexes set neither — 26.2's index has only
+`objects` — but the flags are honoured anyway, per spec section 6.4:
+
+| Index flags | `${game_assets}` | Extra work |
+|---|---|---|
+| neither | `paths.assets` (the assets root) | none |
+| `virtual` true | `paths.virtual_assets_dir(index_id)` | `materialise_assets` into that directory |
+| `map_to_resources` true | `instance.resources` | `materialise_assets` into that directory |
+
+`materialise_assets` copies `assets/objects/{h[:2]}/{h}` to `target_dir / obj.name`,
+creating parent directories, skipping any destination that already exists with the
+same size, and writing through a `.part` file followed by `os.replace` so an
+interrupted copy never leaves a truncated resource. `check_cancel(cancel)` runs once
+per object and `progress(obj.name, completed, total)` is reported per object.
+When both flags are set, `map_to_resources` wins.
+
+---
+
+## 15. `core/launch.py`
+
+### 15.1 Features
+
+```python
+@dataclass(frozen=True, slots=True)
+class Features:
+    """The six feature flags a Mojang `features` rule can test. All default to False."""
+    is_demo_user: bool = False
+    has_custom_resolution: bool = False
+    has_quick_plays_support: bool = False
+    is_quick_play_singleplayer: bool = False
+    is_quick_play_multiplayer: bool = False
+    is_quick_play_realms: bool = False
+
+    def as_mapping(self) -> dict[str, bool]:
+        """The six flags as the mapping `rules_allow` expects."""
+
+DEFAULT_FEATURES: Final[Features] = Features()
+USER_TYPE: Final[str] = "msa"
+PLACEHOLDER_PATTERN: Final[re.Pattern[str]] = re.compile(r"\$\{([^}]*)\}")
+LEGACY_JVM_ARGS: Final[tuple[str, ...]] = (
+    "-Djava.library.path=${natives_directory}",
+    "-Dminecraft.launcher.brand=${launcher_name}",
+    "-Dminecraft.launcher.version=${launcher_version}",
+    "-cp",
+    "${classpath}",
+)
+```
+
+Feature rules must be evaluated, not skipped. `arguments.game` contains entries
+like `{"rules": [{"action": "allow", "features": {"has_quick_plays_support": true}}],
+"value": ["--quickPlayPath", "${quickPlayPath}"]}`. A launcher that ignores
+`features` rules puts `--quickPlayPath ${quickPlayPath}` on the command line and
+the game fails to start. With all six flags `False`, every such entry is dropped
+and no quick-play variable is ever needed.
+
+### 15.2 Argument evaluation and substitution
+
+```python
+def evaluate_arguments(
+    arguments: Sequence[Any],
+    os_name: str,
+    arch: str,
+    os_version: str,
+    features: Mapping[str, bool],
+) -> list[str]:
+    """Flatten one `arguments.jvm` or `arguments.game` array, keeping only allowed entries.
+
+    Raises:
+        ManifestError: an element is neither a string nor an object with a `value`.
+    """
+
+def substitute(args: Sequence[str], variables: Mapping[str, str]) -> list[str]:
+    """Replace every `${name}` with its value.
+
+    Raises:
+        UnresolvedPlaceholderError: any `${…}` survives substitution.
+    """
+```
+
+`evaluate_arguments`, normative: a `str` element is kept verbatim. An object
+element is kept when `rules_allow(element.get("rules"), os_name, arch, os_version,
+features)` is true, and its `value` is appended — a string as one element, a list
+flattened in order. A rejected element contributes nothing. Any other element type
+raises `ManifestError`.
+
+`substitute`, normative: each argument has every `${name}` occurrence replaced by
+`variables[name]`. A name that is **not** in `variables` is left in place, exactly
+so the next step catches it. After all replacements, the result is scanned with
+`PLACEHOLDER_PATTERN`; if any argument still contains a `${…}`, the distinct names
+are collected, sorted, and `UnresolvedPlaceholderError(tuple(names))` is raised.
+An unresolved placeholder is a guaranteed confusing crash several seconds later,
+so the launcher refuses to spawn the process instead.
+
+### 15.3 Variables
+
+```python
+def build_variables(
+    *,
+    account: Account,
+    version_name: str,
+    version_type: str,
+    asset_index_id: str,
+    game_dir: Path,
+    assets_root: Path,
+    game_assets: Path,
+    natives_dir: Path,
+    library_dir: Path,
+    classpath: str,
+    clientid: str,
+    resolution: tuple[int, int] | None = None,
+    launcher_name: str = LAUNCHER_NAME,
+    launcher_version: str = LAUNCHER_VERSION,
+    separator: str | None = None,
+) -> dict[str, str]:
+    """The complete substitution map from spec section 7. Every value is a string."""
+```
+
+The complete set — all twenty names, no more and no fewer:
+
+| Variable | Value |
+|---|---|
+| `auth_player_name` | `account.name` |
+| `version_name` | the launched version id: the vanilla id for a vanilla launch, the merged profile's `id` (`fabric-loader-0.19.5-26.2`) for Fabric |
+| `game_directory` | `str(game_dir)` — the instance directory |
+| `assets_root` | `str(assets_root)` — `paths.assets` |
+| `game_assets` | `str(game_assets)` — from `core.assets.game_assets_dir` |
+| `assets_index_name` | `asset_index_id`, the index id as a string (`"32"`) |
+| `auth_uuid` | `account.uuid` — 32 hex characters, no dashes |
+| `auth_access_token` | `account.access_token` |
+| `auth_xuid` | `account.xuid` — the `xid` from XSTS `DisplayClaims` (section 10.7) |
+| `clientid` | `config.clientid` — the stable per-install UUID from `config.json` |
+| `user_type` | `USER_TYPE`, which is `"msa"`. Not `"mojang"`, not `"legacy"` |
+| `version_type` | the version JSON's `type` (`"release"`, `"snapshot"`) |
+| `classpath` | the joined classpath from `core.libraries.build_classpath` |
+| `classpath_separator` | `";"` on Windows, `":"` elsewhere |
+| `natives_directory` | `str(natives_dir)` — the instance's `natives/` |
+| `library_directory` | `str(library_dir)` — `paths.libraries` |
+| `launcher_name` | `LAUNCHER_NAME`, `"MaestroLauncher"` |
+| `launcher_version` | `LAUNCHER_VERSION`, `"1.0"` |
+| `resolution_width` | `str(resolution[0])` when `resolution` is given, else `""` |
+| `resolution_height` | `str(resolution[1])` when `resolution` is given, else `""` |
+
+`resolution` is `None` unless `Features.has_custom_resolution` is set, and the two
+resolution variables only ever appear inside an argument gated by that feature.
+`separator` overrides `${classpath_separator}`; `None` means `";"` on Windows and
+`":"` everywhere else, which is the same rule `core.libraries.build_classpath` uses,
+so the two can never disagree.
+
+### 15.4 Memory and the plan
+
+```python
+def memory_flags(memory_gb: int) -> list[str]:
+    """`["-XmxNG", "-XmsNG"]` — equal min and max, which avoids heap-resize stutter."""
+```
+
+`memory_gb` is clamped to at least 1; `core/config.py` (section 8) is what clamps
+it to `[MIN_MEMORY_GB, max_memory_gb()]` when the slider moves. The default is 6,
+so the default flags are `["-Xmx6G", "-Xms6G"]`.
+
+```python
+@dataclass(frozen=True, slots=True)
+class LaunchPlan:
+    """Everything `process.GameProcess` needs to start the game, and nothing else."""
+    java: Path
+    argv: tuple[str, ...]
+    cwd: Path
+    env: dict[str, str] = field(default_factory=dict)
+    version_id: str = ""
+    instance_name: str = ""
+
+    def redacted_argv(self) -> tuple[str, ...]:
+        """`argv` with tokens replaced by `[redacted]` — the only form that may be logged."""
+
+def build_launch_plan(
+    *,
+    java: Path,
+    version_json: Mapping[str, Any],
+    main_class: str,
+    variables: Mapping[str, str],
+    memory_gb: int,
+    game_dir: Path,
+    version_id: str = "",
+    instance_name: str = "",
+    os_name: str | None = None,
+    arch: str | None = None,
+    os_version: str | None = None,
+    features: Features = DEFAULT_FEATURES,
+    extra_jvm_args: Sequence[str] = (),
+    extra_game_args: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
+) -> LaunchPlan:
+    """Assemble the final argv from a (possibly Fabric-merged) version JSON.
+
+    Raises:
+        UnresolvedPlaceholderError: a `${…}` survived substitution anywhere in argv.
+        ManifestError: the version JSON has neither `arguments` nor `minecraftArguments`.
+    """
+```
+
+`build_launch_plan`, normative. argv is built in exactly this order:
+
+1. `str(java)`.
+2. `memory_flags(memory_gb)`.
+3. The JVM arguments. When `core.versions.has_modern_arguments(version_json)` is
+   true, that is `evaluate_arguments(version_json["arguments"]["jvm"], …)`;
+   otherwise it is `list(LEGACY_JVM_ARGS)`. Either way the result goes through
+   `substitute`.
+4. `substitute(extra_jvm_args, variables)`.
+5. `main_class` — from the Fabric profile for a Fabric launch (section 13), from
+   `core.versions.main_class` for a vanilla one. Never hardcoded.
+6. The game arguments: `evaluate_arguments(version_json["arguments"]["game"], …)`
+   for a modern version, or `version_json["minecraftArguments"].split()` for a
+   legacy one; then `substitute`.
+7. `substitute(extra_game_args, variables)`.
+
+The `logging` block's `-Dlog4j.configurationFile=${path}` argument is **never**
+added. That configuration makes the game emit XML log events on stdout, which the
+plain-text log reader in section 19 would render as XML soup; without it the game
+uses its bundled plain-text log4j config. This is the section 0 amendment and it
+is a deliberate omission, not an oversight.
+
+After assembly the complete argv is scanned once more with `PLACEHOLDER_PATTERN`
+and `UnresolvedPlaceholderError` is raised if anything survives — `substitute`
+already guarantees it for the parts it processed, and this second pass covers
+`main_class` and anything a caller injected.
+
+`env` defaults to `dict(os.environ)`; when a mapping is given it is **merged over**
+the inherited environment rather than replacing it, so the game keeps `PATH`,
+`DISPLAY` and the user's locale.
+
+`redacted_argv()` returns `tuple(REDACTOR.redact(a) for a in argv)`. The Mojang
+access token is an ordinary element of argv (`--accessToken`), so the raw `argv` is
+never written to the log, never shown in a crash panel and never copied by the
+"copy log" button. Every log line that mentions the command uses this method.
+
+---

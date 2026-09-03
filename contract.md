@@ -2871,3 +2871,1728 @@ never written to the log, never shown in a crash panel and never copied by the
 "copy log" button. Every log line that mentions the command uses this method.
 
 ---
+
+## 16. `core/modrinth.py`
+
+Everything the launcher knows about Modrinth lives here: search, version resolution,
+transitive dependency planning, verified install, and the management of the jars that
+end up in `instances/{name}/mods/`. This module returns **raw bytes** for icons and
+plain dataclasses for everything else; it imports neither `PIL` nor `tkinter` nor
+`customtkinter` (ruling 2).
+
+```python
+MODRINTH_API: Final[str] = "https://api.modrinth.com/v2"
+SEARCH_URL: Final[str] = "https://api.modrinth.com/v2/search"
+PROJECT_URL: Final[str] = "https://api.modrinth.com/v2/project/{project}"
+PROJECT_VERSIONS_URL: Final[str] = "https://api.modrinth.com/v2/project/{project}/version"
+VERSION_URL: Final[str] = "https://api.modrinth.com/v2/version/{version_id}"
+
+USER_AGENT: Final[str] = core.net.USER_AGENT   # re-exported; see the note below
+
+SEARCH_LIMIT: Final[int] = 20             # spec section 9: limit=20
+SEARCH_MAX_LIMIT: Final[int] = 100        # Modrinth rejects a larger limit
+SORT_RELEVANCE: Final[str] = "relevance"
+SORT_DOWNLOADS: Final[str] = "downloads"
+SORT_UPDATED: Final[str] = "updated"
+SEARCH_SORTS: Final[tuple[str, str, str]] = (SORT_RELEVANCE, SORT_DOWNLOADS, SORT_UPDATED)
+
+FABRIC_LOADER: Final[str] = "fabric"
+KIND_MOD: Final[str] = "mod"
+KIND_RESOURCEPACK: Final[str] = "resourcepack"
+ProjectKind: TypeAlias = Literal["mod", "resourcepack"]
+
+DEP_REQUIRED: Final[str] = "required"
+DEP_OPTIONAL: Final[str] = "optional"
+DEP_INCOMPATIBLE: Final[str] = "incompatible"
+DEP_EMBEDDED: Final[str] = "embedded"
+MAX_DEPENDENCY_DEPTH: Final[int] = 16
+
+RATE_LIMIT_LIMIT_HEADER: Final[str] = "X-Ratelimit-Limit"
+RATE_LIMIT_REMAINING_HEADER: Final[str] = "X-Ratelimit-Remaining"
+RATE_LIMIT_RESET_HEADER: Final[str] = "X-Ratelimit-Reset"
+RATE_LIMIT_THRESHOLD: Final[int] = 1      # sleep when Remaining <= this
+RATE_LIMIT_MAX_SLEEP: Final[float] = 65.0 # the window is 60 s; never sleep longer
+RATE_LIMIT_PAD_SECONDS: Final[float] = 1.0
+
+FABRIC_MOD_JSON: Final[str] = "fabric.mod.json"
+JAR_SUFFIX: Final[str] = ".jar"
+DISABLED_SUFFIX: Final[str] = ".disabled"
+MODS_SIDECAR_NAME: Final[str] = ".maestro-mods.json"
+MODS_SIDECAR_FORMAT: Final[int] = 1
+ICON_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+
+FABRIC_API_SLUG: Final[str] = "fabric-api"
+SODIUM_SLUG: Final[str] = "sodium"
+FABRIC_API_MOD_ID: Final[str] = "fabric-api"          # the `id` in its fabric.mod.json
+PROTECTED_SLUGS: Final[frozenset[str]] = frozenset({FABRIC_API_SLUG})
+PROTECTED_MOD_IDS: Final[frozenset[str]] = frozenset({FABRIC_API_MOD_ID, "fabric"})
+PROTECTED_WARNING: Final[str] = (
+    "Fabric API is what your other mods run on. Turning it off or removing it will stop "
+    "them loading. Confirm that you want to do this."
+)
+```
+
+`USER_AGENT` is `core.net.USER_AGENT` re-exported, exactly as `auth.py` re-exports
+`LIVE_CLIENT_ID` (section 8.2): the literal
+`"MaestroLauncher/1.0 (+https://github.com/<placeholder>/maestrolauncher)"` is written
+once, in `core/net.py`. `Http` puts it in the session's default headers, so **every**
+request this module makes already carries it — including the icon fetch and the CDN
+download of a jar. Spec section 9 requires it on every request and this is how that is
+guaranteed rather than remembered. No method here sets a `User-Agent` header of its own.
+
+### 16.1 Facets
+
+```python
+def build_facets(kind: ProjectKind, game_version: str) -> str:
+    """The `facets` query value: a JSON array of AND-ed facet groups, as a compact string."""
+
+def build_version_filters(game_version: str, loader: str | None) -> dict[str, str]:
+    """The `game_versions` (and, when `loader` is given, `loaders`) query values."""
+```
+
+`build_facets`, normative — the two shapes, and only these two:
+
+| `kind` | facets value |
+|---|---|
+| `"mod"` | `[["project_type:mod"],["categories:fabric"],["versions:{game_version}"]]` |
+| `"resourcepack"` | `[["project_type:resourcepack"],["versions:{game_version}"]]` |
+
+A resource pack has **no loader**, so the `categories:fabric` group is absent from the
+second shape. Adding it returns zero hits for every query, which looks like a broken
+search box rather than a bug. Any other `kind` raises `ValueError`.
+
+The value is produced with `json.dumps(groups, separators=(",", ":"))` and handed to
+`Http` as an entry of the `params` mapping, so `requests` percent-encodes it. **The
+facets JSON is never concatenated into the URL string**; a hand-built URL leaves the
+`[`, `]`, `"` and `:` characters raw and Modrinth answers 400.
+
+`build_version_filters` returns `{"game_versions": '["26.2"]'}` and, when `loader` is
+not `None`, also `{"loaders": '["fabric"]'}` — both JSON arrays serialised the same way
+and passed through `params`. `loader=None` means "send no loader filter", which is what
+resource-pack queries need.
+
+### 16.2 Data
+
+```python
+@dataclass(frozen=True, slots=True)
+class ProjectHit:
+    """One entry of a `/search` response."""
+    project_id: str
+    slug: str
+    title: str
+    description: str
+    icon_url: str            # "" when the project has no icon; usually a .webp
+    downloads: int
+    author: str
+    categories: tuple[str, ...]
+    versions: tuple[str, ...]        # the game versions the project supports
+    project_type: str                # "mod" | "modpack" | "resourcepack" | "shader"
+                                     # | "datapack" | "plugin"
+    client_side: str                 # "required" | "optional" | "unsupported"
+    server_side: str
+    date_modified: str               # ISO-8601 as returned
+    latest_version: str = ""         # the newest game version, as Modrinth reports it
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "ProjectHit":
+        """Build a hit from one `hits[]` object, defaulting every missing field.
+
+        Raises:
+            ModrinthError: `project_id` is missing or empty.
+        """
+
+@dataclass(frozen=True, slots=True)
+class SearchPage:
+    """One page of search results and the numbers pagination needs."""
+    hits: tuple[ProjectHit, ...]
+    offset: int
+    total_hits: int
+    limit: int = SEARCH_LIMIT
+
+    @property
+    def has_more(self) -> bool:
+        """True when `offset + len(hits)` is below `total_hits`."""
+
+    @property
+    def next_offset(self) -> int:
+        """`offset + len(hits)` — the `offset` for the following page."""
+
+@dataclass(frozen=True, slots=True)
+class ModFile:
+    """One downloadable file of a version."""
+    url: str
+    filename: str
+    sha1: str
+    sha512: str
+    size: int
+    primary: bool = False
+    file_type: str | None = None
+
+@dataclass(frozen=True, slots=True)
+class Dependency:
+    """One entry of a version's `dependencies` array."""
+    dependency_type: str                 # "required" | "optional" | "incompatible" | "embedded"
+    version_id: str | None = None
+    project_id: str | None = None
+    file_name: str | None = None
+
+    @property
+    def is_required(self) -> bool:
+        """`dependency_type == DEP_REQUIRED` — the only kind that is ever installed."""
+
+@dataclass(frozen=True, slots=True)
+class ModVersion:
+    """One version of a Modrinth project."""
+    id: str
+    project_id: str
+    name: str
+    version_number: str
+    version_type: str                    # "release" | "beta" | "alpha"
+    date_published: str                  # ISO-8601; string comparison is chronological
+    game_versions: tuple[str, ...]
+    loaders: tuple[str, ...]
+    files: tuple[ModFile, ...]
+    dependencies: tuple[Dependency, ...] = ()
+    downloads: int = 0
+    featured: bool = False
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> "ModVersion":
+        """Build a version from a `/version` object.
+
+        Raises:
+            ModrinthError: `id` or `project_id` is missing.
+        """
+
+    @property
+    def primary_file(self) -> ModFile:
+        """The file marked `primary`, or the first file when none is.
+
+        Raises:
+            ModrinthError: the version has no files.
+        """
+
+    @property
+    def required_dependencies(self) -> tuple[Dependency, ...]:
+        """Only the `required` entries. Optional, incompatible and embedded are dropped here."""
+
+@dataclass(frozen=True, slots=True)
+class InstallPlan:
+    """Exactly what an Install click will write to disk, decided before anything downloads."""
+    root: ModVersion
+    versions_in_install_order: tuple[ModVersion, ...]
+    already_installed: tuple[ModVersion, ...] = ()
+
+    @property
+    def is_single(self) -> bool:
+        """True when the plan installs only `root` — the case that needs no confirm dialog."""
+
+    @property
+    def total_bytes(self) -> int:
+        """Sum of `primary_file.size` over `versions_in_install_order`."""
+
+    def describe(self) -> tuple[str, ...]:
+        """One line per file to be installed: "{name} {version_number} ({size})"."""
+
+@dataclass(frozen=True, slots=True)
+class FabricModMeta:
+    """The fields the launcher reads out of a jar's `fabric.mod.json`."""
+    id: str
+    name: str
+    version: str
+    description: str
+    icon_path: str = ""      # the `icon` value: a path *inside* the jar, "" when absent
+
+@dataclass(frozen=True, slots=True)
+class InstalledMod:
+    """One jar in an instance's mods directory, described by its own metadata."""
+    name: str
+    version: str
+    description: str
+    id: str                  # the fabric.mod.json id; "" when the jar has none
+    path: Path               # the file on disk, including a `.disabled` suffix when disabled
+    enabled: bool
+    filename: str            # `path.name` with any `.disabled` suffix removed — the sidecar key
+    icon_path: str = ""      # inside the jar; read on demand with `read_mod_icon`
+    project_id: str = ""     # from the sidecar; "" for a hand-dropped jar
+    version_id: str = ""     # from the sidecar; "" for a hand-dropped jar
+    slug: str = ""           # from the sidecar
+    protected: bool = False  # Fabric API: needs an explicit confirmation before change
+    size: int = 0
+```
+
+`InstalledMod` deliberately does **not** carry icon bytes. A modlist of forty jars would
+otherwise hold forty decoded images in memory for a list the user may never scroll;
+`read_mod_icon` fetches one on demand and `ui/widgets.IconCache` (section 22) is what
+keeps them.
+
+### 16.3 The client
+
+```python
+class ModrinthClient:
+    """Modrinth v2: search, version resolution, dependency planning and verified install."""
+
+    http: Http           # public: `install` and section 17 reach the downloader through it
+
+    def __init__(
+        self,
+        http: Http,
+        *,
+        api_base: str = MODRINTH_API,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Wrap an `Http`; `sleep` is injected so rate-limit tests run instantly."""
+
+    def request_json(
+        self, method: str, url: str, *,
+        params: Mapping[str, Any] | None = None,
+        cancel: CancelToken | None = None,
+    ) -> Any:
+        """One Modrinth request: pay any owed rate-limit debt, decode JSON, map the status.
+
+        Raises:
+            RateLimitedError: HTTP 429 survived the retry helper.
+            ModrinthError: 404, any other non-2xx, or a body that is not valid JSON.
+            NetworkError: transport failure that survived every attempt.
+            CancelledError: `cancel` was set.
+        """
+
+    def search(
+        self, query: str, *,
+        kind: ProjectKind = KIND_MOD,
+        game_version: str,
+        offset: int = 0,
+        limit: int = SEARCH_LIMIT,
+        sort: str = SORT_RELEVANCE,
+        cancel: CancelToken | None = None,
+    ) -> SearchPage:
+        """One page of `/search`, filtered by the facets for `kind` and `game_version`.
+
+        Raises:
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def get_project(self, project: str, *, cancel: CancelToken | None = None) -> dict[str, Any]:
+        """`GET /project/{slug-or-id}` — the decoded project object.
+
+        Raises:
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def get_versions(
+        self, project: str, game_version: str, *,
+        loader: str | None = FABRIC_LOADER,
+        cancel: CancelToken | None = None,
+    ) -> list[ModVersion]:
+        """`GET /project/{project}/version` filtered by game version and loader, newest first.
+
+        Raises:
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def get_version(self, version_id: str, *, cancel: CancelToken | None = None) -> ModVersion:
+        """`GET /version/{version_id}` — one exact version, whatever it targets.
+
+        Raises:
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def resolve_version(
+        self, project: str, game_version: str, *,
+        loader: str | None = FABRIC_LOADER,
+        cancel: CancelToken | None = None,
+    ) -> ModVersion:
+        """The newest usable build of `project` for this Minecraft version.
+
+        Raises:
+            NoCompatibleVersionError: the filtered list is empty, or no entry has a file.
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def resolve_install_plan(
+        self, project: str, game_version: str, *,
+        installed: Mapping[str, str] | None = None,
+        loader: str | None = FABRIC_LOADER,
+        progress: ProgressFn = null_progress,
+        cancel: CancelToken | None = None,
+    ) -> InstallPlan:
+        """Every file an install of `project` will write, resolved transitively before any download.
+
+        Raises:
+            NoCompatibleVersionError: `project` itself has no build for `game_version`.
+            DependencyResolutionError: a *required* dependency has no usable build.
+            RateLimitedError, ModrinthError, NetworkError, CancelledError.
+        """
+
+    def install(
+        self, plan: InstallPlan, dest_dir: Path, *,
+        game_version: str = "",
+        bundled: bool = False,
+        progress: ProgressFn = null_progress,
+        cancel: CancelToken | None = None,
+    ) -> list[Path]:
+        """Download every file in the plan, sha512-verified, and record it in the sidecar.
+
+        Raises:
+            ChecksumError: a downloaded jar's SHA-512 does not match the published hash.
+            ModrinthError: a version in the plan has no file.
+            InstanceError: the sidecar cannot be written.
+            NetworkError, HttpStatusError, CancelledError, OSError.
+        """
+
+    def fetch_icon_bytes(self, url: str, *, cancel: CancelToken | None = None) -> bytes:
+        """The raw bytes behind an `icon_url` — never a PIL image and never a CTkImage.
+
+        Raises:
+            ModrinthError: `url` is empty, the response is not 2xx, the body is empty,
+                or the body is larger than `ICON_MAX_BYTES`.
+            NetworkError, CancelledError.
+        """
+```
+
+`dest_dir` is the directory the files land in: `instance.mods` for mods and
+`instance.resourcepacks` for texture packs. The same call installs both, which is why
+the parameter is not named `mods_dir`; the sidecar (16.5) is written inside whichever
+directory is passed.
+
+`search`, normative:
+
+- `limit` is clamped to `[1, SEARCH_MAX_LIMIT]`; `offset` is clamped to `>= 0`;
+  a `sort` outside `SEARCH_SORTS` falls back to `SORT_RELEVANCE`.
+- Params: `{"query": query, "limit": limit, "offset": offset, "index": sort,
+  "facets": build_facets(kind, game_version)}`.
+- An empty `query` is legal and is what the Mods screen sends before the user types;
+  paired with `sort=SORT_DOWNLOADS` it produces "the mods most people install for this
+  version", which is the empty state's invitation rather than a blank panel.
+- Pagination is `offset` / `total_hits` and nothing else. The response's `total_hits`
+  is authoritative; `has_more` and `next_offset` are the only arithmetic the UI does.
+  There is no cursor and no page number.
+- A response that is not a JSON object, or whose `hits` is not a list, raises
+  `ModrinthError`. A single malformed hit is skipped and logged at WARNING rather than
+  failing the page.
+
+`get_versions`, normative: params are `build_version_filters(game_version, loader)`.
+The response is a JSON list ordered newest-first by Modrinth; that order is preserved
+and never re-sorted locally. Entries that fail `ModVersion.from_json` are skipped and
+logged at WARNING.
+
+`resolve_version`, normative: `get_versions(...)`, then the **first** entry that has at
+least one file. There is deliberately **no filter on `version_type`**: the current
+Sodium build for 26.2 is `"mc26.2-0.9.2-beta.1-fabric"` with `version_type == "beta"`,
+and a launcher that only accepts `"release"` reports Sodium as unavailable on a version
+where it plainly works. An empty list, or a list where no entry has a file, raises
+`NoCompatibleVersionError(project, game_version)` — the error whose message the bundled
+installer (section 17) turns into the Sodium banner.
+
+`fetch_icon_bytes`, normative: `http.request("GET", url, raise_for_status=False,
+cancel=cancel)` and, on a 2xx, `response.content`; a non-2xx status becomes
+`ModrinthError` so a missing icon can never raise an `HttpStatusError` into an icon task. Icons are `.webp`; decoding is `ui/widgets.py`'s job on the UI
+thread (controller design note). A body over `ICON_MAX_BYTES` (2 MiB) raises rather
+than being decoded — an icon that large is a mistake or an attack, not a thumbnail.
+
+### 16.4 Dependency resolution
+
+This is the part that decides whether one-click installs work. Spec section 9: a
+one-click installer that ignores required dependencies produces crash-on-launch and is
+worse than no installer.
+
+`resolve_install_plan`, normative — the exact algorithm:
+
+1. `installed` maps `project_id → version_id` for what is already on disk;
+   `installed_index(dest_dir)` (16.5) builds it. `None` means `{}`.
+2. `root = self.resolve_version(project, game_version, loader=loader, cancel=cancel)`.
+3. Walk the graph depth-first from `root`, keeping two visited sets:
+   `seen_versions: set[str]` of `ModVersion.id` and `seen_projects: set[str]` of
+   `ModVersion.project_id`. A version whose `id` is in `seen_versions`, or whose
+   `project_id` is in `seen_projects`, is not expanded again. **This is what stops
+   cycles** — iris requires sodium, and a dependency graph is free to contain one.
+4. For each version being expanded, iterate `version.required_dependencies` in order.
+   Entries whose `dependency_type` is `optional`, `incompatible` or `embedded` are
+   ignored completely: they are never resolved, never listed and never installed.
+   An `embedded` dependency is already inside the jar; installing it a second time is
+   how duplicate-mod crashes happen.
+5. Resolve each required dependency, **preferring `version_id` over `project_id`**:
+   - `dep.version_id` is a non-empty string → `self.get_version(dep.version_id)`. This
+     is an exact pin and it wins whenever it is present. Modrinth frequently sends
+     both: iris's `1.11.2+26.2-fabric` names sodium by `version_id` *and* `project_id`,
+     and the pinned version is the one iris was built against.
+   - otherwise `dep.project_id` is a non-empty string →
+     `self.resolve_version(dep.project_id, game_version, loader=loader)`.
+   - otherwise (both `None`) → `DependencyResolutionError("", game_version, technical=...)`.
+     A required dependency that names nothing is unresolvable and the install stops.
+6. A `NoCompatibleVersionError` raised while resolving a **dependency** is re-raised as
+   `DependencyResolutionError(dep.project_id or dep.version_id or "", game_version,
+   technical=str(exc))`, whose message is "One of the mods this needs isn't available
+   for Minecraft {game_version}. Nothing was installed." The same error from the
+   **root** propagates as `NoCompatibleVersionError`, because "Sodium isn't available
+   yet" and "Sodium needs something that isn't available" read differently to a user.
+7. A recursion depth over `MAX_DEPENDENCY_DEPTH` (16) raises
+   `DependencyResolutionError`. The visited sets already make an infinite walk
+   impossible; the cap is a second, cheap guarantee against a pathological graph.
+8. Ordering. The result is a **post-order** walk: a version appears in
+   `versions_in_install_order` only after every one of its required dependencies. `root`
+   is therefore last. Nothing depends on install order for correctness on disk, but the
+   confirm dialog reads top-down as "these first, then the mod you asked for", which is
+   what a user expects to see.
+9. Partitioning. A resolved version whose `project_id` is a key of `installed` **with
+   the same version id** goes to `already_installed` and is left out of
+   `versions_in_install_order` — it is already on disk and re-downloading it is waste.
+   The same project at a *different* version stays in the install list: that is an
+   upgrade, and `install` replaces the old file.
+10. Progress: `progress(f"Checking {name}", resolved, resolved + pending)` after each
+    resolution, where `pending` is the number of dependencies queued but not yet
+    resolved. The total therefore grows as the graph is discovered, which is honest;
+    `Progress.total` is never zero here.
+11. `check_cancel(cancel)` runs before every HTTP call in the walk.
+12. **Nothing is downloaded by this method.** It performs only `GET` requests against
+    the metadata API. The full list reaches the UI as an `InstallPlan` and section 22
+    shows it before `install` is ever called — spec section 9's "show the user the full
+    list of what will be installed before downloading", and the section 0 amendment's
+    reconciliation with one-click (`is_single` skips the dialog for a lone file).
+
+`install`, normative:
+
+1. `dest_dir.mkdir(parents=True, exist_ok=True)`.
+2. Files are fetched **serially, in `versions_in_install_order`**. A modlist is a
+   handful of files, order is what makes the plan readable, and serial requests keep
+   the Modrinth rate limit comfortable. There is no worker pool here.
+3. Per version: `file = version.primary_file`; `dest = dest_dir / file.filename`;
+   `self.http.download(file.url, dest, expected_hash=file.sha512, algorithm="sha512",
+   expected_size=file.size, label=file.filename, progress=<child reporter>,
+   cancel=cancel)`. **SHA-512 is the verified hash**, from `files[].hashes.sha512`,
+   because that is the hash Modrinth publishes for every file; `sha1` is recorded in
+   the sidecar but is not what the download is checked against.
+4. `file.filename` is used verbatim but is first rejected if it contains a path
+   separator, a `..` segment, or a NUL — a filename from a remote API is untrusted
+   input, and `ModrinthError` is raised rather than writing outside `dest_dir`.
+5. After each successful file, `record_install(dest_dir, version, file, ...)` writes
+   the sidecar entry, and any **other** filename the sidecar records for the same
+   `project_id` is deleted (both `X.jar` and `X.jar.disabled`) and forgotten. That is
+   the upgrade path: the new jar is on disk and verified before the old one goes.
+6. Progress: a `Reporter` gives version *i* of *n* the slice
+   `[i / n, (i + 1) / n]`, so the bar advances smoothly across a multi-file plan.
+7. Cancellation leaves the files already installed in place, with their sidecar
+   entries written. A half-installed modlist is recoverable; a half-written sidecar is
+   not, which is why the sidecar is rewritten after every file rather than at the end.
+8. Returns the destination paths in install order.
+
+### 16.5 The installed-mod sidecar
+
+`fabric.mod.json` tells the launcher what a jar *is*. It does not say where the jar came
+from, so nothing in a jar can answer "is there a newer version of this on Modrinth?".
+The sidecar records that link. It lives beside the jars, at
+`InstancePaths.mods_sidecar` (`mods/.maestro-mods.json`) for mods and at
+`resourcepacks/.maestro-mods.json` for texture packs — the same filename in whichever
+directory `install` wrote to.
+
+```json
+{
+  "format": 1,
+  "mods": {
+    "sodium-fabric-0.9.2-beta.1+mc26.2.jar": {
+      "project_id": "AANobbMI",
+      "version_id": "1kmSj7Jz",
+      "slug": "sodium",
+      "title": "Sodium",
+      "version_number": "mc26.2-0.9.2-beta.1-fabric",
+      "game_version": "26.2",
+      "sha512": "b4c8…",
+      "sha1": "3f1a…",
+      "size": 1885574,
+      "date_published": "2026-08-14T19:03:11Z",
+      "installed_at": "2026-09-03T14:22:05Z",
+      "bundled": true
+    }
+  }
+}
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `format` | integer | `1` | `MODS_SIDECAR_FORMAT`. A file whose `format` is unknown is treated as absent and rewritten. |
+| `mods` | object | `{}` | Filename → record. The key is the jar's name **without** any `.disabled` suffix, so toggling a mod never loses its record. |
+| `mods[].project_id` | string | `""` | Modrinth project id — what `check_updates` queries. |
+| `mods[].version_id` | string | `""` | The installed version's id — what "up to date" is compared against. |
+| `mods[].slug` | string | `""` | Modrinth slug. Drives `PROTECTED_SLUGS`. |
+| `mods[].title` | string | `""` | Project title, for the update badge's label. |
+| `mods[].version_number` | string | `""` | Human version string, e.g. `"0.159.0+26.2"`. |
+| `mods[].game_version` | string | `""` | The Minecraft version it was installed for. |
+| `mods[].sha512` | string | `""` | The published SHA-512 the file was verified against. |
+| `mods[].sha1` | string | `""` | The published SHA-1, recorded but not verified against. |
+| `mods[].size` | integer | `0` | Bytes. |
+| `mods[].date_published` | string | `""` | The version's `date_published`; ISO-8601 strings compare chronologically. |
+| `mods[].installed_at` | string | `""` | When the launcher wrote the file, ISO-8601 UTC with a `Z` suffix. |
+| `mods[].bundled` | boolean | `false` | True for files written by `install_bundled_mods` (section 17). |
+
+Unknown keys are ignored and dropped on the next write. A record for a filename that no
+longer exists is dropped by the next `write_sidecar`. A jar with no record is still
+listed — the user is free to drop a jar into `mods/` by hand — it simply has no update
+badge and no protection status from its slug.
+
+```python
+def sidecar_path(dest_dir: Path) -> Path:
+    """`dest_dir / MODS_SIDECAR_NAME` — the same value as `InstancePaths.mods_sidecar`."""
+
+def read_sidecar(dest_dir: Path) -> dict[str, dict[str, Any]]:
+    """The `mods` map. Returns `{}` for a missing, unreadable, corrupt or unknown-format file."""
+
+def write_sidecar(dest_dir: Path, records: Mapping[str, Mapping[str, Any]]) -> None:
+    """Write the whole sidecar atomically, dropping records whose file no longer exists.
+
+    Raises:
+        InstanceError: the file cannot be written.
+    """
+
+def record_install(
+    dest_dir: Path, version: ModVersion, file: ModFile, *,
+    slug: str = "", title: str = "", game_version: str = "", bundled: bool = False,
+    now: Callable[[], float] = time.time,
+) -> None:
+    """Add or replace one record and rewrite the sidecar.
+
+    Raises:
+        InstanceError: the file cannot be written.
+    """
+
+def forget_install(dest_dir: Path, filename: str) -> None:
+    """Drop one record (keyed by the name without `.disabled`) and rewrite the sidecar.
+
+    Raises:
+        InstanceError: the file cannot be written.
+    """
+
+def installed_index(dest_dir: Path) -> dict[str, str]:
+    """`project_id → version_id` for everything recorded — the `installed` argument of
+    `resolve_install_plan`."""
+```
+
+`read_sidecar` never raises: a corrupt sidecar must degrade to "no update badges", not
+to a mods screen that will not open.
+
+### 16.6 Reading a jar
+
+```python
+def read_fabric_mod_json(jar_path: Path) -> FabricModMeta:
+    """The mod's own metadata, read from `fabric.mod.json` inside the jar.
+
+    Raises:
+        ModrinthError: the file is not a readable zip, has no `fabric.mod.json`, or that
+            entry is not a JSON object.
+    """
+
+def read_mod_icon(jar_path: Path, icon_path: str) -> bytes | None:
+    """The bytes of an icon stored inside the jar, or None when there is no usable icon."""
+
+def list_installed(dest_dir: Path) -> list[InstalledMod]:
+    """Every jar in the directory, described by its own metadata rather than its filename.
+
+    Raises:
+        InstanceError: the directory exists but cannot be listed.
+    """
+
+def set_enabled(path: Path, enabled: bool, *, confirm_protected: bool = False) -> Path:
+    """Enable or disable a mod by renaming between `.jar` and `.jar.disabled`.
+
+    Raises:
+        InstanceError: the target name is taken, the rename failed, or the mod is
+            protected and `confirm_protected` is False.
+    """
+
+def delete_mod(path: Path, *, confirm_protected: bool = False) -> None:
+    """Delete a mod jar and forget its sidecar record.
+
+    Raises:
+        InstanceError: the file cannot be deleted, or the mod is protected and
+            `confirm_protected` is False.
+    """
+
+def is_protected_path(path: Path) -> bool:
+    """True when this jar is Fabric API, which must not be changed without a warning."""
+
+def base_filename(path: Path) -> str:
+    """`path.name` with a trailing `.disabled` removed — the sidecar key for this file."""
+```
+
+`read_fabric_mod_json`, normative: open with `zipfile.ZipFile`, read the archive member
+literally named `fabric.mod.json` at the root, decode it as UTF-8 JSON, and take
+`id`, `name`, `version`, `description` and `icon`. `name` falls back to `id` and then to
+the jar's stem; every other field falls back to `""`. The `icon` value may be a string
+(a path inside the jar) or an object keyed by pixel size (`{"128": "assets/…/icon.png"}`),
+in which case the largest numeric key wins. `zipfile.BadZipFile`, `KeyError`,
+`json.JSONDecodeError`, `UnicodeDecodeError` and `OSError` are all wrapped in
+`ModrinthError`.
+
+`list_installed`, normative — this is spec section 9's "read `fabric.mod.json` from
+inside each jar rather than showing filenames":
+
+1. A missing `dest_dir` returns `[]`.
+2. Only direct children whose name ends in `.jar` or `.jar.disabled` are considered.
+   The sidecar (a dotfile), any `.part` leftover and any subdirectory are ignored.
+3. `enabled = not path.name.endswith(DISABLED_SUFFIX)`.
+4. `read_fabric_mod_json(path)` supplies `id`, `name`, `version`, `description` and
+   `icon_path`. When it raises, the entry is still listed with
+   `name = base_filename(path).removesuffix(".jar")`, `version = ""`, `id = ""` and
+   `description = "Not a Fabric mod — no fabric.mod.json inside."`, and the failure is
+   logged at WARNING. **One unreadable jar never empties the list**; a Forge jar or a
+   half-copied download is exactly the case a user needs to see in order to delete it.
+5. `project_id`, `version_id` and `slug` come from `read_sidecar(dest_dir)` keyed by
+   `base_filename(path)`; `""` when there is no record.
+6. `protected = is_protected_path(path)`.
+7. Sorted by `name.casefold()`, then `filename`, so the list is stable across calls.
+
+`is_protected_path`, normative, in order: the sidecar record's `slug` is in
+`PROTECTED_SLUGS`; or the jar's `fabric.mod.json` `id` is in `PROTECTED_MOD_IDS`; or
+`base_filename(path).casefold()` starts with `"fabric-api"`. Any one of the three is
+enough, because a hand-dropped Fabric API jar has no sidecar record and must still be
+protected.
+
+`set_enabled` and `delete_mod`, normative: when `is_protected_path(path)` is true and
+`confirm_protected` is False, both raise `InstanceError` with
+`user_message=PROTECTED_WARNING` and change nothing. Spec section 9 requires that the
+user is never allowed to disable or delete Fabric API without an explicit warning; making
+the refusal live in this module rather than only in the dialog means no future screen,
+context menu or keyboard shortcut can route around it. `ui/mods.py` catches the error,
+shows the warning, and calls again with `confirm_protected=True`.
+
+`set_enabled` toggles by renaming: `X.jar` ↔ `X.jar.disabled`. It returns the new path,
+returns `path` unchanged when the file is already in the requested state, and raises
+`InstanceError` when the target name already exists — overwriting the twin would destroy
+a file. `delete_mod` unlinks the path (`missing_ok=True`) and calls
+`forget_install(path.parent, base_filename(path))`; `OSError` becomes `InstanceError`.
+Confirmation of an ordinary delete is the UI's job (spec section 9); the only refusal
+this module makes is the protected one.
+
+### 16.7 Updates
+
+```python
+def check_updates(
+    client: ModrinthClient,
+    installed: Sequence[InstalledMod],
+    game_version: str,
+    *,
+    loader: str | None = FABRIC_LOADER,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> dict[str, ModVersion]:
+    """Filename → the newer version available for it; absent means "up to date".
+
+    Raises:
+        RateLimitedError: Modrinth rate-limited the whole sweep.
+        CancelledError: `cancel` was set.
+    """
+```
+
+Normative:
+
+- Mods with an empty `project_id` are skipped: a hand-dropped jar has nothing to query.
+- For each remaining mod, `client.resolve_version(mod.project_id, game_version,
+  loader=loader)`. Disabled mods are checked too — the badge is about the file, not
+  about whether it is currently loading.
+- An update exists when the candidate's `id` differs from `mod.version_id` **and** its
+  `date_published` is greater than the `date_published` recorded in the sidecar. When
+  the record has no `date_published` (a sidecar written before that key existed), the id
+  comparison alone decides. The date guard is what stops a badge appearing when the user
+  deliberately installed a newer build than the filtered list returns.
+- `NoCompatibleVersionError` and `ModrinthError` for one project are caught, logged at
+  WARNING, and produce no entry: a delisted project must not break the sweep.
+  `RateLimitedError`, `NetworkError` and `CancelledError` propagate.
+- `check_cancel(cancel)` before each request; `progress(mod.name, done, len(installed))`
+  after each.
+- The keys of the result are `InstalledMod.filename` values, so the Mods screen can look
+  a badge up without re-deriving anything.
+
+### 16.8 Rate limiting
+
+Modrinth publishes `X-Ratelimit-Limit: 300`, `X-Ratelimit-Remaining: N` and
+`X-Ratelimit-Reset: <seconds until the window resets>` on **every** response, success or
+failure. Spec section 9 requires the launcher to read them and back off before it hits
+the 300/min limit rather than after.
+
+```python
+def rate_limit_delay(
+    headers: Mapping[str, str], *,
+    threshold: int = RATE_LIMIT_THRESHOLD,
+    max_sleep: float = RATE_LIMIT_MAX_SLEEP,
+) -> float:
+    """Seconds to wait before the next Modrinth request, read from the rate-limit headers."""
+```
+
+Normative:
+
+- Missing, empty or unparseable headers return `0.0`. Nothing is ever guessed.
+- `int(X-Ratelimit-Remaining) > threshold` returns `0.0`.
+- Otherwise the delay is `min(max_sleep, float(X-Ratelimit-Reset) + RATE_LIMIT_PAD_SECONDS)`,
+  clamped to `>= 0.0`. The one-second pad covers clock skew, and the 65-second ceiling
+  means a bogus `Reset` header can never freeze a worker for longer than one window.
+- The threshold is `1`, not `0`: at `Remaining == 0` the next request is already
+  refused, so the launcher stops one request early.
+
+`ModrinthClient.request_json` uses it like this, and this is the whole policy:
+
+1. Before issuing a request, if a previous response left a debt, `self.sleep(debt)` and
+   clear it. The wait happens on the calling worker thread; it is why `sleep` is
+   injectable and why nothing here touches the UI.
+2. Issue the request through `Http.request(..., raise_for_status=False)`. Passing
+   `raise_for_status=False` is what makes the headers readable on a failure response as
+   well as a successful one — `HttpStatusError` carries a status and a body but no
+   headers. Retries still happen: `Http` retries `RETRY_STATUSES` (which includes 429,
+   honouring `Retry-After`) regardless of `raise_for_status`, and only hands back the
+   `Response` once every attempt is spent.
+3. Record `rate_limit_delay(response.headers)` as the debt for the next call.
+4. Map the status:
+   - 2xx → `decode_json(response)`.
+   - 404 → `ModrinthError` with `user_message` "That project isn't on Modrinth any more,
+     or its address changed."
+   - 429 → `RateLimitedError(retry_after)`, where `retry_after` is the numeric
+     `Retry-After` header, else `X-Ratelimit-Reset`, else `RATE_LIMIT_MAX_SLEEP`. This
+     is the "after the retry helper gives up" path: `Http` has already retried four
+     times over roughly 3.5 seconds plus any `Retry-After` waits.
+   - any other status → `ModrinthError` whose `technical` names the status, the URL and
+     the first 500 characters of the body.
+5. `requests.ConnectionError` and `requests.Timeout` have already become `NetworkError`
+   inside `Http`; that propagates unchanged.
+
+`ModrinthClient` holds its rate-limit debt on the instance, so one client shared by the
+Mods screen serialises its own pacing. `Http.download` bypasses `request_json` — a file
+download goes to Modrinth's CDN, not to the rate-limited API — so a large install does
+not consume the request budget.
+
+---
+
+## 17. `core/instances.py`
+
+An instance is a directory under `instances/` plus one JSON file describing it. Spec
+section 10: instances are plural, they are created, renamed and deleted from the UI, and
+`default` is hardcoded nowhere except the first-run bootstrap in `main.py`.
+
+```python
+INSTANCE_JSON_NAME: Final[str] = "instance.json"
+INSTANCE_FORMAT: Final[int] = 1
+NAME_MAX_LENGTH: Final[int] = 48
+NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]*$")
+RESERVED_NAMES: Final[frozenset[str]] = frozenset({
+    "con", "prn", "aux", "nul",
+    "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+    "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+})
+BUNDLED_SLUGS: Final[tuple[str, str]] = (FABRIC_API_SLUG, SODIUM_SLUG)
+BUNDLED_TITLES: Final[dict[str, str]] = {FABRIC_API_SLUG: "Fabric API", SODIUM_SLUG: "Sodium"}
+MISSING_BANNER: Final[str] = "{name} isn't available for {version} yet."
+```
+
+`MISSING_BANNER.format(name="Sodium", version="26.2")` is
+`"Sodium isn't available for 26.2 yet."` — the exact sentence spec section 9 requires,
+written once so the Fabric API case reads the same way.
+
+`DEFAULT_INSTANCE_NAME` is **not** redefined here; it comes from `core.config`
+(section 8.2) and this module re-exports it
+(`from core.config import DEFAULT_INSTANCE_NAME`) so there is one literal `"default"`.
+`FABRIC_API_SLUG`, `SODIUM_SLUG` and `FABRIC_LOADER` come the same way, from
+`core.modrinth` (section 16); `BUNDLED_SLUGS` is built from them rather than from two
+new string literals.
+
+### 17.1 `Instance` and `instance.json`
+
+```python
+@dataclass(slots=True)
+class Instance:
+    """One playable instance: its directory name, its Minecraft version, its pending notice."""
+    name: str
+    version_id: str
+    created_at: str = ""     # ISO-8601 UTC with a Z suffix, e.g. "2026-09-03T14:22:05Z"
+    banner: str = ""         # a sentence for the Play screen; "" means there is nothing to say
+
+    def to_dict(self) -> dict[str, Any]:
+        """The exact instance.json object."""
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any], *, name: str) -> "Instance":
+        """Build an Instance from a parsed instance.json, defaulting every missing field.
+
+        The directory name always wins over a stale `name` inside the file."""
+```
+
+```json
+{
+  "format": 1,
+  "name": "default",
+  "version_id": "26.2",
+  "created_at": "2026-09-03T14:22:05Z",
+  "banner": ""
+}
+```
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `format` | integer | `1` | `INSTANCE_FORMAT`. An unknown value is ignored and rewritten on the next save; the file is never rejected for it. |
+| `name` | string | the directory name | Informational. The **directory name is authoritative** — if the two disagree, the directory wins and the file is corrected on the next save. |
+| `version_id` | string | `""` | The Minecraft version this instance plays. `""` means "not decided yet"; `core/pipeline.py` then falls back to the config and the manifest. |
+| `created_at` | string | `""` | ISO-8601 UTC, `Z` suffix. Display only. |
+| `banner` | string | `""` | One sentence shown by the Play screen until the user dismisses it, which calls `clear_banner`. Persisted so the notice survives the restart after a first-run bundled install. |
+
+`from_dict` never raises: a value of the wrong type is replaced by its default, because a
+hand-edited `instance.json` must not make the instance disappear from the list.
+
+### 17.2 Name validation
+
+```python
+def name_is_valid(name: str) -> bool:
+    """True when `validate_name` would accept this name."""
+
+def validate_name(name: str) -> str:
+    """The trimmed, checked instance name — the exact string used as a directory name.
+
+    Raises:
+        InstanceError: the name is empty, too long, uses a forbidden character,
+            ends with a dot or a space, or is a reserved Windows device name.
+    """
+```
+
+Rules, applied in this order. Each failure raises `InstanceError` with the stated
+`user_message`; the messages are interface copy and are exact.
+
+| # | Rule | `user_message` |
+|---|---|---|
+| 1 | Strip leading and trailing whitespace. The trimmed value is what is stored and returned. | — |
+| 2 | Not empty after trimming. | "Give the instance a name." |
+| 3 | At most `NAME_MAX_LENGTH` (48) characters. | "Instance names can be up to 48 characters." |
+| 4 | Matches `NAME_PATTERN`: the first character is a letter or digit, the rest are letters, digits, spaces, dots, dashes or underscores. | "Use letters, numbers, spaces, dots, dashes and underscores, and start with a letter or number." |
+| 5 | Does not end with `.` or a space. | "Instance names can't end with a dot or a space." |
+| 6 | The part before the first dot, case-folded, is not in `RESERVED_NAMES`. | "That name is reserved by Windows. Pick another one." |
+
+Rule 4 is what keeps a name from escaping the instances directory: `/`, `\`, `:`, `*`,
+`?`, `"`, `<`, `>`, `|` and every control character are excluded, and requiring an
+alphanumeric first character rules out `.`, `..` and leading-dot hidden directories.
+Rule 5 exists because Windows silently strips a trailing dot or space from a directory
+name, so `"My pack "` and `"My pack"` would become the same directory while the launcher
+believed they were two.
+
+Uniqueness is checked by `InstanceManager`, not here, because it needs the directory
+listing: `create` and `rename` reject a name that matches an existing instance
+**case-insensitively** (`casefold`). Windows filesystems are case-insensitive and Linux
+is not, so allowing `Default` beside `default` produces an instance list that works on
+one machine and collides on another.
+
+### 17.3 `InstanceManager`
+
+```python
+class InstanceManager:
+    """Creates, lists, renames and deletes the instances under `instances/`."""
+
+    def __init__(self, paths: Paths, *, clock: Callable[[], float] = time.time) -> None:
+        """Manage the instances under `paths.instances`; `clock` fills `created_at`."""
+
+    def list(self) -> list[Instance]:
+        """Every instance directory, sorted by name (case-insensitively). Never raises."""
+
+    def names(self) -> list[str]:
+        """`[i.name for i in self.list()]` — the instance dropdown's `values`."""
+
+    def exists(self, name: str) -> bool:
+        """True when a directory for this name exists (compared case-insensitively)."""
+
+    def get(self, name: str) -> Instance:
+        """One instance by name.
+
+        Raises:
+            InstanceError: there is no such instance.
+        """
+
+    def paths_for(self, name: str) -> InstancePaths:
+        """`paths.instance_paths(name)` — the directories inside that instance."""
+
+    def create(self, name: str, version_id: str, *, banner: str = "") -> Instance:
+        """Create the directory skeleton, a default options.txt and instance.json.
+
+        Raises:
+            InstanceError: invalid name, a name already in use, or the directories or
+                files cannot be written.
+        """
+
+    def save(self, instance: Instance) -> None:
+        """Write `instance.json` atomically.
+
+        Raises:
+            InstanceError: the file cannot be written.
+        """
+
+    def rename(self, instance: Instance, new_name: str) -> Instance:
+        """Rename the directory and rewrite instance.json; returns the renamed Instance.
+
+        Raises:
+            InstanceError: invalid name, a name already in use, or the rename failed.
+        """
+
+    def delete(self, name: str) -> None:
+        """Remove the instance directory and everything in it.
+
+        Raises:
+            InstanceError: there is no such instance, the path is not inside
+                `paths.instances`, or the tree cannot be removed.
+        """
+
+    def clear_banner(self, instance: Instance) -> Instance:
+        """Set `banner` to "" and save; what the banner's dismiss button calls.
+
+        Raises:
+            InstanceError: the file cannot be written.
+        """
+
+    def ensure_default(self, version_id: str) -> Instance:
+        """The `default` instance, creating it when it is missing — the first-run bootstrap.
+
+        Raises:
+            InstanceError: the instance cannot be created.
+        """
+
+    def install_bundled_mods(
+        self,
+        instance: Instance,
+        client: ModrinthClient,
+        *,
+        slugs: Sequence[str] = BUNDLED_SLUGS,
+        progress: ProgressFn = null_progress,
+        cancel: CancelToken | None = None,
+    ) -> "BundledResult":
+        """Install Fabric API and Sodium through the ordinary user-install path.
+
+        Raises:
+            ChecksumError: a bundled jar failed verification.
+            RateLimitedError, ModrinthError, NetworkError, HttpStatusError,
+            InstanceError, CancelledError, OSError.
+        """
+```
+
+`list`, normative: every **direct subdirectory** of `paths.instances`, in
+`name.casefold()` order. `instance.json` is read when present; when it is missing,
+unreadable or corrupt, the entry is still produced as
+`Instance(name=<directory name>, version_id="", created_at="", banner="")` and **nothing
+is written**. A directory a user copied in by hand appears in the dropdown immediately.
+A missing `paths.instances` returns `[]`. This method never raises — the instance
+dropdown must always populate.
+
+`create`, normative:
+
+1. `validate_name(name)`, then the case-insensitive uniqueness check against `names()`.
+   A duplicate raises `InstanceError` with "There's already an instance called {name}."
+2. `self.paths_for(name).ensure()` — creates `root`, `mods`, `resourcepacks`,
+   `shaderpacks`, `saves`, `logs` and `natives` (section 3.2).
+3. `options.txt` is written with `atomic_write_text(ip.options_txt, DEFAULT_OPTIONS_TXT)`
+   **only when it does not already exist**. Overwriting a user's settings when they
+   re-create an instance over an existing directory would be data loss.
+4. `instance.json` is written with `save()`. `created_at` is
+   `datetime.fromtimestamp(self._clock(), tz=timezone.utc)` formatted as
+   `"%Y-%m-%dT%H:%M:%SZ"`.
+5. Any `OSError` becomes `InstanceError`. A partially created directory is **left in
+   place**: deleting a directory the launcher did not fully create is how a user loses
+   a `saves/` folder.
+
+`rename`, normative: `validate_name(new_name)`; a rename to the same trimmed string is a
+no-op returning `instance` unchanged; a case-only rename of the *same* instance
+(`"Default"` → `"default"`) is allowed and skips the uniqueness check; any other
+collision raises. The move is `os.replace(old_dir, new_dir)`, then `instance.json` is
+rewritten with the new name. `InstanceManager` **never reads or writes `config.json`** —
+`ui/app.py` is what updates `Config.selected_instance` after a rename or a delete, and
+`main.py` is what saves it.
+
+`delete`, normative: the instance must exist; its resolved directory must be a direct
+child of `paths.instances.resolve()` or `InstanceError` is raised without touching the
+filesystem (a name that escaped validation must still not delete an arbitrary tree). The
+tree goes with `shutil.rmtree(dir, onexc=<handler>)`, where the handler clears the
+read-only bit with `os.chmod(path, stat.S_IWRITE)` and retries the operation once —
+Windows marks files read-only often enough that a plain `rmtree` fails on a mods
+directory. Deleting the last instance is allowed; the empty state belongs to `ui/app.py`.
+Confirmation is the UI's job.
+
+`DEFAULT_OPTIONS_TXT`, the file written into a fresh instance:
+
+```
+lang:en_us
+fullscreen:false
+enableVsync:true
+guiScale:0
+renderDistance:12
+simulationDistance:10
+maxFps:120
+pauseOnLostFocus:true
+```
+
+Every key here has been accepted by the game since 1.14, and the game ignores keys it
+does not know and supplies its own default for keys that are absent, so this file can
+never stop the game from starting. There is deliberately **no `version:` line**: without
+one the game runs its options data-fixer over the file, which is harmless for these
+eight keys and safe on every version the dropdown offers. `guiScale:0` means "auto".
+The game rewrites the whole file when it quits, so this is a starting point, not a
+setting the launcher owns.
+
+### 17.4 Bundled mods
+
+```python
+@dataclass(frozen=True, slots=True)
+class BundledResult:
+    """What the bundled install managed to do, and what it could not."""
+    installed: tuple[str, ...]     # slugs installed or already present, in attempt order
+    missing: tuple[str, ...]       # one banner sentence per slug that has no build
+    files: tuple[Path, ...]        # every jar written, in install order
+
+    @property
+    def banner(self) -> str:
+        """`missing` joined with a single space — what `Instance.banner` is set to."""
+```
+
+`install_bundled_mods`, normative:
+
+1. `game_version` is `instance.version_id`; there is no separate parameter, because a
+   bundled mod for a version the instance does not play is meaningless. An empty
+   `version_id` raises `InstanceError`.
+2. `mods_dir = self.paths_for(instance.name).mods`, created if needed.
+3. For each slug in `slugs`, **in order** — `fabric-api` first, then `sodium`:
+   - `installed = core.modrinth.installed_index(mods_dir)`, recomputed before each slug
+     so the second slug sees what the first one wrote and never re-downloads a shared
+     dependency.
+   - `plan = client.resolve_install_plan(slug, instance.version_id, installed=installed,
+     loader=FABRIC_LOADER, progress=<child>, cancel=cancel)`.
+   - `files = client.install(plan, mods_dir, game_version=instance.version_id,
+     bundled=True, progress=<child>, cancel=cancel)`.
+   - The slug is appended to `installed`; the paths are appended to `files`. A plan whose
+     `versions_in_install_order` is empty (everything already on disk at the right
+     version) still counts as installed.
+4. `NoCompatibleVersionError` or `DependencyResolutionError` for one slug is caught: that
+   slug is skipped, `MISSING_BANNER.format(name=BUNDLED_TITLES.get(slug, slug),
+   version=instance.version_id)` is appended to `missing`, and the loop continues with
+   the next slug. Spec section 9: if Sodium has no build for the selected version, the
+   instance is **not** failed — it stays vanilla-Fabric and the user is told, in those
+   exact words. The same treatment covers a required dependency of a bundled mod having
+   no build, because the outcome for the user is identical: that mod is not available
+   today.
+5. `ChecksumError`, `RateLimitedError`, `NetworkError`, `HttpStatusError`, `OSError` and
+   `CancelledError` **propagate**. Those mean "try again", not "not available", and
+   turning a dropped connection into a permanent "Sodium isn't available" banner would
+   be a lie.
+6. When `missing` is non-empty, `instance.banner` is set to `result.banner` and
+   `self.save(instance)` persists it, so the Play screen shows the sentence after the
+   task finishes and again after a restart, until the user dismisses it.
+7. Progress: a `Reporter` gives slug *i* of *n* the slice `[i / n, (i + 1) / n]`, and
+   within a slug resolution takes `[0.00, 0.15]` and downloading `[0.15, 1.00]`.
+8. The caller runs this as a task under `TASK_BUNDLED_MODS` (section 4).
+
+**No special-casing.** This method calls exactly the two public methods a user's Install
+click calls — `ModrinthClient.resolve_install_plan` then `ModrinthClient.install`. It
+contains no hardcoded dependency list, no hardcoded version number, no hardcoded
+filename and no branch that treats `sodium` differently from any other slug except for
+the title in the banner. Sodium's dependency set is whatever the API returns on the day
+it is asked; today `/project/sodium/version` reports `dependencies: []` for 26.2, and the
+code must not encode that. Fabric API is installed first only because installing it
+first means Sodium's resolution finds it already present — an ordering choice, not a
+special case.
+
+---
+
+## 18. `core/pipeline.py`
+
+One function turns "the user pressed Play" into a `LaunchPlan`. It is the only place
+that knows the order of the steps, and the only place that decides how much of the
+progress bar each step owns.
+
+```python
+STEP_MANIFEST: Final[int] = 0
+STEP_VERSION_JSON: Final[int] = 1
+STEP_RUNTIME: Final[int] = 2
+STEP_CLIENT_JAR: Final[int] = 3
+STEP_LIBRARIES: Final[int] = 4
+STEP_FABRIC_PROFILE: Final[int] = 5
+STEP_FABRIC_LIBRARIES: Final[int] = 6
+STEP_ASSETS: Final[int] = 7
+STEP_NATIVES: Final[int] = 8
+STEP_ARGV: Final[int] = 9
+
+STEP_WEIGHTS: Final[tuple[tuple[str, float, float], ...]] = (
+    ("Checking versions",          0.00, 0.02),
+    ("Reading the version file",   0.02, 0.04),
+    ("Installing Java",            0.04, 0.24),
+    ("Downloading the game",       0.24, 0.34),
+    ("Downloading libraries",      0.34, 0.49),
+    ("Setting up Fabric",          0.49, 0.52),
+    ("Downloading Fabric",         0.52, 0.60),
+    ("Downloading assets",         0.60, 0.96),
+    ("Unpacking natives",          0.96, 0.99),
+    ("Building the command",       0.99, 1.00),
+)
+
+def step_reporter(progress: ProgressFn, step: int) -> Reporter:
+    """A `Reporter` covering exactly the `STEP_WEIGHTS` slice of one step."""
+```
+
+The ten weights, and the reason each is the size it is. A cold first launch moves about
+580 MB: ~480 MB of assets, ~58 MB of JRE, ~39 MB of client jar and a few tens of MB of
+libraries. The weights are those proportions rounded, so the bar moves at roughly a
+constant rate instead of sitting at 4 % through the entire asset download.
+
+| Step | Constant | Label | Range | Weight |
+|---|---|---|---|---|
+| 1 | `STEP_MANIFEST` | "Checking versions" | 0.00 – 0.02 | 0.02 |
+| 2 | `STEP_VERSION_JSON` | "Reading the version file" | 0.02 – 0.04 | 0.02 |
+| 3 | `STEP_RUNTIME` | "Installing Java" | 0.04 – 0.24 | 0.20 |
+| 4 | `STEP_CLIENT_JAR` | "Downloading the game" | 0.24 – 0.34 | 0.10 |
+| 5 | `STEP_LIBRARIES` | "Downloading libraries" | 0.34 – 0.49 | 0.15 |
+| 6 | `STEP_FABRIC_PROFILE` | "Setting up Fabric" | 0.49 – 0.52 | 0.03 |
+| 7 | `STEP_FABRIC_LIBRARIES` | "Downloading Fabric" | 0.52 – 0.60 | 0.08 |
+| 8 | `STEP_ASSETS` | "Downloading assets" | 0.60 – 0.96 | 0.36 |
+| 9 | `STEP_NATIVES` | "Unpacking natives" | 0.96 – 0.99 | 0.03 |
+| 10 | `STEP_ARGV` | "Building the command" | 0.99 – 1.00 | 0.01 |
+
+`0.02 + 0.02 + 0.20 + 0.10 + 0.15 + 0.03 + 0.08 + 0.36 + 0.03 + 0.01 = 1.00` exactly.
+Every range starts where the previous one ended, so the bar never jumps backwards and
+never stalls at a value it will later exceed. A test asserts both facts directly against
+`STEP_WEIGHTS`.
+
+Step 8 is split further inside its own slice: the index download takes `0.60 – 0.62`,
+the objects `0.62 – 0.92`, and `materialise_assets` (only for a `virtual` or
+`map_to_resources` index) `0.92 – 0.96`. Step 3's internal split is section 11's
+(download 0.85, extract 0.12, install 0.03 of its own range); `Reporter.sub` composes
+the two so no module needs to know another's arithmetic.
+
+```python
+def resolve_version_id(
+    manifest: VersionManifest, config: Config, instance: Instance,
+    override: str | None = None,
+) -> str:
+    """Which Minecraft version this launch uses.
+
+    Raises:
+        ManifestError: the chosen id is not in the manifest.
+    """
+
+def prepare_launch(
+    http: Http,
+    paths: Paths,
+    config: Config,
+    instance: Instance,
+    account: Account,
+    *,
+    version_id: str | None = None,
+    use_fabric: bool = True,
+    features: Features = DEFAULT_FEATURES,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> LaunchPlan:
+    """Everything between the Play button and a runnable command line, in order.
+
+    Raises:
+        ManifestError: the version is unknown, its JSON is malformed, or Fabric has no
+            loader for it.
+        RuntimeProvisionError: the JRE could not be installed.
+        ChecksumError: a downloaded file failed verification.
+        UnresolvedPlaceholderError: a `${…}` survived substitution.
+        LaunchError: natives could not be unpacked.
+        ConfigError: the merged Fabric profile could not be written.
+        InstanceError: the instance directories could not be created.
+        NetworkError, HttpStatusError, CancelledError, OSError.
+    """
+```
+
+`resolve_version_id`, normative — first non-empty of: `override`, `instance.version_id`,
+`config.selected_version`, `manifest.latest_release`. The result must exist in the
+manifest or `ManifestError` is raised; this is the only place the fallback order is
+written down, and `ui/play.py` calls it to label the Play button.
+
+`prepare_launch`, normative. `check_cancel(cancel)` runs at every step boundary, so a
+cancelled launch stops within one file rather than at the end.
+
+**Step 1 — manifest** (`step_reporter(progress, STEP_MANIFEST)`).
+`ip = paths.instance_paths(instance.name)`, then `ip.ensure()` so a hand-edited or
+partially copied instance is repaired before anything else. `paths.ensure()` likewise.
+`manifest = core.versions.fetch_manifest(http, paths, cancel=cancel)`;
+`vid = resolve_version_id(manifest, config, instance, version_id)`;
+`entry = manifest.get(vid)`.
+
+**Step 2 — version JSON.** `version_json = core.versions.fetch_version_json(http, paths,
+entry, progress=…, cancel=cancel)`. Then `major = core.versions.java_major(version_json)`
+and `modern = core.versions.has_modern_arguments(version_json)`. When `use_fabric` is
+true and `modern` is false, raise `ManifestError` with the user message
+"Fabric doesn't support Minecraft {vid}. Pick 1.14 or newer." — the section 0 amendment.
+The version dropdown lists every release, so this is a reachable path and it fails here,
+clearly, rather than crashing later.
+
+**Step 3 — Java runtime.** `java = core.runtime.ensure_runtime(http, paths, major,
+progress=…, cancel=cancel)`. `major` comes from the version JSON and from nothing else;
+there is no default and no table.
+
+**Step 4 — client jar.** `client_jar = core.libraries.download_client_jar(http, paths,
+version_json, vid, progress=…, cancel=cancel)`. The id is always the **vanilla** id, so
+the file is `versions/26.2/client.jar` and never
+`versions/fabric-loader-0.19.5-26.2/client.jar`.
+
+**Step 5 — vanilla libraries.** `vanilla_libs = core.libraries.select_libraries(
+version_json, features=features.as_mapping())`, then
+`core.libraries.download_libraries(http, paths, vanilla_libs, progress=…, cancel=cancel)`.
+
+**Step 6 — Fabric profile and merge** (skipped when `use_fabric` is false).
+`entries = core.fabric.fetch_loader_versions(http, vid, cancel=cancel)`;
+`loader = core.fabric.choose_loader(entries)`;
+`profile = core.fabric.fetch_profile(http, vid, loader.version, cancel=cancel)`;
+`merged = core.fabric.merge_profile(version_json, profile)`;
+`core.fabric.write_merged_profile(paths, vid, merged)`.
+A `ManifestError` from `fetch_loader_versions` ("Fabric doesn't support Minecraft {v}
+yet") **propagates**. `prepare_launch` never silently falls back to a vanilla launch:
+the instance's `mods/` directory would then be ignored and the user would be told
+nothing, which is the worst possible outcome of a mod launcher.
+
+**Step 7 — Fabric libraries** (skipped when `use_fabric` is false).
+`libraries = core.libraries.select_libraries(merged, features=features.as_mapping())` —
+called on the **merged** document, so Fabric's `downloads`-less entries go through
+branch 4 of section 12.4. The download set is only what is new:
+`new_libs = [lib for lib in libraries if library_local_path(paths, lib) not in
+{library_local_path(paths, v) for v in vanilla_libs}]`. Those are fetched with
+`core.libraries.download_libraries(http, paths, new_libs,
+sha1_lookup=core.fabric.library_sha1_lookup(http), progress=…, cancel=cancel)`, so the
+`.sha1` sidecars are fetched lazily and only for entries whose inline `sha1` was absent.
+
+When `use_fabric` is false, steps 6 and 7 report their label once at their `start`
+fraction and immediately report their `end`; `libraries` stays `vanilla_libs`,
+`launch_json` stays `version_json`, `main_class` is
+`core.versions.main_class(version_json)` and `version_name` is `vid`. When `use_fabric`
+is true, `launch_json` is `merged`, `main_class` is `merged["mainClass"]` (from the
+profile, never hardcoded — section 13.4) and `version_name` is `merged["id"]`, for
+example `"fabric-loader-0.19.5-26.2"`.
+
+**Step 8 — assets.** `index_id, index_json = core.assets.fetch_asset_index(http, paths,
+launch_json, progress=…, cancel=cancel)`;
+`objects = core.assets.parse_asset_index(index_json)`;
+`core.assets.download_assets(http, paths, objects, progress=…, cancel=cancel)`;
+`game_assets = core.assets.game_assets_dir(paths, index_id, index_json, ip)`. When the
+index sets `virtual` or `map_to_resources`, `core.assets.materialise_assets(paths,
+objects, game_assets, progress=…, cancel=cancel)` runs in the last slice of the step.
+`index_id` is a string (`"32"`) and is passed to `build_variables` as one.
+
+**Step 9 — natives.** `core.libraries.extract_natives(paths, libraries, ip.natives,
+progress=…, cancel=cancel)`. This runs on **every** launch including modern versions
+that extract nothing, because `extract_natives` is what guarantees the directory exists
+and it is passed as `-Djava.library.path`.
+
+**Step 10 — variables and argv.**
+`classpath = core.libraries.build_classpath(paths, libraries, client_jar)`;
+`variables = core.launch.build_variables(account=account, version_name=version_name,
+version_type=core.versions.version_type(version_json), asset_index_id=index_id,
+game_dir=ip.root, assets_root=paths.assets, game_assets=game_assets,
+natives_dir=ip.natives, library_dir=paths.libraries, classpath=classpath,
+clientid=config.clientid)`; then
+`core.launch.build_launch_plan(java=java, version_json=launch_json,
+main_class=main_class, variables=variables, memory_gb=config.memory_gb,
+game_dir=ip.root, version_id=vid, instance_name=instance.name, features=features)`,
+which is returned.
+
+Three things `prepare_launch` deliberately does **not** do:
+
+- It never signs in and never refreshes a token. It takes an `Account` that is already
+  fresh; `ui/play.py` calls `auth.ensure_fresh` before submitting the launch task, so a
+  sign-in dialog can never appear from inside a download loop. `prepare_launch` does not
+  import `auth` for anything but the `Account` type.
+- It never writes `config.json` and never mutates `config`. The version the user picked
+  is saved by `ui/app.py`.
+- It never starts a process. `process.GameProcess` (section 19) receives the
+  `LaunchPlan` and the `InstancePaths`, and the caller already has both.
+
+---
+
+## 19. `process.py`
+
+Spec section 8 opens with the trap: "non-blocking" and "detached" are not the same thing,
+and detaching is the wrong choice here because it loses crash detection entirely. This
+module spawns the game as an ordinary **child** process whose output the launcher reads
+and whose exit code the launcher waits for, while keeping the launcher window fully
+usable.
+
+```python
+LOG_TAIL_LINES: Final[int] = 200          # spec section 8: the crash panel shows the last 200
+READER_ENCODING: Final[str] = "utf-8"
+READER_ERRORS: Final[str] = "replace"
+STOP_GRACE_SECONDS: Final[float] = 5.0    # terminate(), then kill() after this long
+JOIN_TIMEOUT_SECONDS: Final[float] = 5.0  # supervisor waits this long for the reader
+READER_THREAD_NAME: Final[str] = "game-reader"
+SUPERVISOR_THREAD_NAME: Final[str] = "game-supervisor"
+STDOUT_LOG_BACKUP_SUFFIX: Final[str] = ".1"   # launcher-stdout.log.1, one generation
+CREATE_NO_WINDOW: Final[int] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+```
+
+`CREATE_NO_WINDOW` is read through `getattr` because the attribute does not exist on
+POSIX; the literal `0x08000000` is the documented Windows value and keeps the constant
+importable everywhere. It is passed **only** when `sys.platform == "win32"`.
+
+Ruling 2 names this module explicitly: `process.py` imports neither `tkinter` nor
+`customtkinter` nor `theme` nor `ui`. It is handed a `queue.Queue` and puts
+`messages.py` dataclasses on it, and that is its entire relationship with the interface.
+
+### 19.1 Crash hints
+
+```python
+CRASH_HINTS: Final[tuple[tuple[re.Pattern[str], str], ...]] = (
+    (
+        re.compile(r"UnsupportedClassVersionError|has been compiled by a more recent version of the Java"),
+        "The game needs a newer Java than the one that started it. Delete the `runtimes` "
+        "folder inside your MaestroLauncher folder and press Play again — the launcher "
+        "will install the right version.",
+    ),
+    (
+        re.compile(r"OutOfMemoryError|GC overhead limit exceeded|Could not reserve enough space for .* object heap"),
+        "The game ran out of memory. Raise the Memory slider on the Play screen, or "
+        "remove a few mods, and try again.",
+    ),
+    (
+        re.compile(r"Mixin apply failed|MixinApplyError|MixinTransformerError|org\.spongepowered\.asm\.mixin"),
+        "Two mods are trying to change the same part of the game. Turn off the mods you "
+        "added most recently, one at a time, until the game starts.",
+    ),
+    (
+        re.compile(r"requires any version of fabric-api|fabric-api[^\n]{0,120}\bis missing\b|Missing mod fabric-api"),
+        "A mod needs Fabric API and it isn't installed. Install Fabric API from the Mods "
+        "screen, then press Play again.",
+    ),
+)
+
+def crash_hint(lines: Sequence[str]) -> str | None:
+    """The plain-English cause of a crash, or None when nothing in the tail is recognised."""
+```
+
+`crash_hint`, normative: the lines are joined with `"\n"` and each pattern is tried in
+**tuple order**; the first that matches supplies the hint and the scan stops. The order
+matters — an out-of-memory crash inside a mixin prints both signatures, and "the game
+ran out of memory" is the actionable one, so it is listed before the mixin pattern. No
+match returns `None`, and the crash panel then shows the tail with no hint rather than a
+guess. Each hint is a full sentence that names the next action, per spec section 13's
+copy rule; none of them mentions a stack trace or a class name.
+
+The table covers exactly the four causes spec section 8 names: wrong Java, out of
+memory, mod conflict, missing Fabric API. Adding a fifth is an amendment.
+
+### 19.2 `GameProcess`
+
+```python
+class GameProcess:
+    """Runs the game as a child process, streams its output, and reports how it ended."""
+
+    def __init__(
+        self,
+        plan: LaunchPlan,
+        instance: InstancePaths,
+        queue: "queue.Queue[UIMessage]",
+        task_id: str = TASK_GAME,
+        *,
+        popen: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+        tail_lines: int = LOG_TAIL_LINES,
+    ) -> None:
+        """Hold everything needed to start the game; `popen` is injected for tests."""
+
+    def start(self) -> int:
+        """Spawn the game, start the reader and supervisor threads, and return the pid.
+
+        Raises:
+            LaunchError: the process could not be spawned, or it is already running.
+            InstanceError: the instance or its `logs/` directory cannot be created.
+        """
+
+    def stop(self, *, grace: float = STOP_GRACE_SECONDS) -> None:
+        """Ask the game to quit, then kill it if it has not exited within `grace`. Never raises."""
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        """Block until the game exits; its exit code, or None when `timeout` elapsed first."""
+
+    @property
+    def is_running(self) -> bool:
+        """True between a successful `start()` and the process exiting."""
+
+    @property
+    def pid(self) -> int | None:
+        """The child's process id, or None before `start()`."""
+
+    @property
+    def returncode(self) -> int | None:
+        """The exit code once the process has ended, else None."""
+
+    @property
+    def stopped(self) -> bool:
+        """True when `stop()` was called — the UI uses it to skip the crash panel."""
+
+    @property
+    def log_tail(self) -> tuple[str, ...]:
+        """The last `tail_lines` lines of output, oldest first. Safe to read from any thread."""
+```
+
+`start`, normative — the spawn, exactly:
+
+1. Calling `start()` twice raises `LaunchError`; one `GameProcess` runs one game.
+2. `instance.ensure()`, then the log file is prepared: if
+   `instance.launcher_stdout_log` exists it is moved to
+   `launcher-stdout.log.1` with `os.replace` (one generation is kept, so the run before
+   last is discarded), and a fresh file is opened for appending. The reader appends to
+   it line by line for the life of the process. Rotating once per launch bounds the file
+   and still leaves the previous crash readable.
+3. **The launcher writes `logs/launcher-stdout.log`, never `logs/latest.log`.** The game
+   itself writes `latest.log` through its bundled log4j config, relative to the game
+   directory, which *is* the instance directory. Two writers on one file corrupt it and
+   break the game's own rotation on Windows. `InstancePaths.latest_log` exists so the UI
+   can *read* the game's file; nothing in this module opens it for writing. (Section 0
+   amendment, rows for sections 3 and 19.)
+4. The process is spawned with `self._popen(argv, **kwargs)` where `argv` is
+   `list(plan.argv)` — **a list, never a string** — and the keyword arguments are exactly:
+
+   | Argument | Value | Why |
+   |---|---|---|
+   | `cwd` | `str(plan.cwd)` | the instance directory; the game resolves `saves/`, `mods/`, `logs/` and `options.txt` relative to it |
+   | `env` | `dict(plan.env)` when non-empty, else `None` | section 15 already merged it over `os.environ` |
+   | `stdout` | `subprocess.PIPE` | one stream to read |
+   | `stderr` | `subprocess.STDOUT` | merged, so the crash tail keeps stdout and stderr interleaved in real order |
+   | `stdin` | `subprocess.DEVNULL` | the game never reads stdin; an inherited console handle can block it |
+   | `shell` | `False` | no shell, ever: a path with a space or an `&` would otherwise be re-parsed |
+   | `bufsize` | `-1` | default buffering on a binary pipe; the reader decodes lines itself |
+   | `close_fds` | `True` | the default, stated so nobody removes it |
+   | `creationflags` | `CREATE_NO_WINDOW`, **Windows only** | no flashing console window behind the launcher |
+   | `start_new_session` | `True`, **POSIX only** | a Ctrl+C in the terminal that started the launcher does not also kill the game |
+
+   Neither `DETACHED_PROCESS` nor `CREATE_NEW_CONSOLE` nor `os.setsid()`-style
+   detachment is used. `start_new_session=True` puts the child in its own session but
+   leaves it a **child** of the launcher, so `wait()` still returns its exit code. That
+   is the entire point of this module.
+5. `OSError` — including the `FileNotFoundError` a missing `java` produces — is wrapped
+   in `LaunchError` whose `technical` is `" ".join(plan.redacted_argv())`. The raw argv
+   is never logged: `--accessToken` is an ordinary element of it (section 15.4).
+6. `GameStarted(task_id, pid)` is put on the queue.
+7. Two `threading.Thread(daemon=True)` objects are started, named
+   `READER_THREAD_NAME` and `SUPERVISOR_THREAD_NAME`. They are daemons so a launcher
+   that is closing never blocks on them; the game itself is a separate process and keeps
+   running regardless.
+8. `start()` returns the pid and does not block.
+
+**Reader thread**, normative:
+
+- Iterates lines from `proc.stdout` until EOF. The pipe is **binary**; each line is
+  decoded with `READER_ENCODING` and `READER_ERRORS` (`utf-8`, `replace`) and its
+  trailing `\r\n` or `\n` is stripped. Decoding is done here rather than by asking
+  `Popen` for text mode because mod authors print in every encoding there is, and a
+  `UnicodeDecodeError` on this thread would silently end all logging for the session.
+- Each line is passed through `logsetup.REDACTOR.redact` **once**, and the redacted text
+  is what is both written to the file and put on the queue. Some versions echo launch
+  arguments on the first line, and the access token must reach neither the log file nor
+  the crash panel nor the "copy log" clipboard.
+- The redacted line is appended to the open log file followed by `"\n"`, and the file is
+  flushed after every line. A crash panel opened the instant the game dies must show the
+  lines that caused it.
+- The line is appended to a `collections.deque(maxlen=tail_lines)` guarded by a
+  `threading.Lock`, because `log_tail` is read from the UI thread.
+- `queue.put(LogLine(text))` — the only thing this thread ever tells the UI. It never
+  touches a widget, a `StringVar` or a `CTkImage`.
+- Every exception is caught, logged at ERROR, and ends the loop; the thread never
+  raises. On EOF the log file is closed.
+
+**Supervisor thread**, normative:
+
+1. `code = proc.wait()` — the blocking call that makes crash detection possible.
+2. `reader.join(JOIN_TIMEOUT_SECONDS)`, so the tail is complete before it is read. A
+   reader that has not finished in five seconds is abandoned and the tail is taken as it
+   stands; a hung pipe must not stop the exit from being reported.
+3. `tail = self.log_tail` — at most `LOG_TAIL_LINES` (200) lines, oldest first, matching
+   `GameExited.log_tail` in section 4.
+4. `hint = crash_hint(tail) if code != 0 else None`.
+5. `queue.put(GameExited(task_id, code, tail, hint))`.
+
+Exactly **one** `GameExited` is posted per `start()`, whatever ended the process. A
+user-requested stop still reports its code (`1` on Windows, `-15` on POSIX for a
+`SIGTERM`); the UI decides not to show a crash panel by reading `stopped`, not by
+guessing from the number. Spec section 8's crash panel — last 200 lines, a "copy log"
+button, and the hint — is built by `ui/play.py` from this one message.
+
+`stop`, normative:
+
+1. Sets `stopped = True` **first**, so the supervisor is already in the right state when
+   it wakes.
+2. No process, or one that has already exited, is a no-op.
+3. `proc.terminate()`, then `proc.wait(timeout=grace)`. On `subprocess.TimeoutExpired`,
+   `proc.kill()` and `wait()` again with no timeout.
+4. `OSError` and `ProcessLookupError` from a process that exited during the call are
+   logged at WARNING and swallowed. `stop()` never raises.
+5. It does **not** join the supervisor thread. `ui/play.py` calls `stop()` on the Tk
+   thread, and joining there would freeze the window for the duration of the shutdown —
+   the exact failure this module exists to avoid. The supervisor posts `GameExited` when
+   it is ready and the UI reacts to that message like any other.
+
+The launcher window stays usable the whole time the game runs and the launcher does not
+exit when the game starts; both follow from `start()` returning immediately and from
+every blocking call living on a daemon thread.
+
+---
+
+## 20. `tasks.py`
+
+The single bridge between worker threads and the Tk thread. Spec section 5 is
+non-negotiable: workers push plain dataclasses onto one `queue.Queue`, the UI drains it
+on a timer, and **every** `Future` gets an `add_done_callback` that catches everything so
+an unhandled exception inside a worker can never vanish silently.
+
+```python
+DEFAULT_MAX_WORKERS: Final[int] = 4
+THREAD_NAME_PREFIX: Final[str] = "maestro-task"
+DRAIN_BATCH: Final[int] = 200
+GENERIC_FAILURE_MESSAGE: Final[str] = LauncherError.default_user_message
+```
+
+`GENERIC_FAILURE_MESSAGE` is the re-exported class default from section 2, so the
+sentence exists once. Its literal value is
+`"Something went wrong. Check launcher.log for details."` — that is what the user sees
+when a worker raises something that is not a `LauncherError`, which by definition means
+the launcher has no better explanation to give.
+
+`DEFAULT_MAX_WORKERS` is 4 because this pool runs **tasks**, not files. A single launch
+task opens its own 16-worker download pool inside `core/libraries` and `core/assets`
+(section 12.5), so four here means four *activities* at once — a launch, a mod search, a
+batch of icon fetches and a sign-in poll — not four sockets. Keeping it small also paces
+the Modrinth icon fetches, which would otherwise burn the 300/min budget on a fast
+scroll.
+
+`DRAIN_BATCH` is 200 because the game's startup burst can print thousands of lines in a
+second. At 200 messages per 50 ms tick the UI keeps up with 4,000 lines a second and the
+Tk thread never spends an unbounded amount of time inside one drain; anything left over
+is handled on the next tick.
+
+### 20.1 `TaskRunner`
+
+```python
+class TaskRunner:
+    """A thread pool whose every outcome — value, error or cancellation — arrives on one queue."""
+
+    queue: "queue.Queue[UIMessage]"
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = DEFAULT_MAX_WORKERS,
+        queue: "queue.Queue[UIMessage] | None" = None,
+        executor: concurrent.futures.Executor | None = None,
+    ) -> None:
+        """Build the pool and the queue; pass either to run the whole thing synchronously in tests."""
+
+    def submit(
+        self, task_id: str, fn: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> concurrent.futures.Future[Any]:
+        """Run `fn(*args, **kwargs)` on the pool; its outcome always reaches the queue.
+
+        Raises:
+            RuntimeError: `shutdown()` has already been called.
+        """
+
+    def progress_fn(self, task_id: str) -> ProgressFn:
+        """A `ProgressFn` that posts `Progress(task_id, label, done, total)`. Never raises."""
+
+    def token(self, task_id: str) -> CancelToken:
+        """The cancel token for this task id, created on first use."""
+
+    def cancel(self, task_id: str) -> None:
+        """Set that task's cancel token; the worker stops at its next `check_cancel`."""
+
+    def cancel_all(self) -> None:
+        """Set every live cancel token."""
+
+    def is_running(self, task_id: str) -> bool:
+        """True while any future submitted under this exact task id is unfinished."""
+
+    def post(self, message: UIMessage) -> None:
+        """Put a message on the queue from any thread. Never raises."""
+
+    def drain(self, max_messages: int = DRAIN_BATCH) -> list[UIMessage]:
+        """Pop up to `max_messages` messages without blocking — what `_drain_queue` calls."""
+
+    def shutdown(self, *, wait: bool = False, cancel_futures: bool = True) -> None:
+        """Cancel everything, stop the pool, and refuse further work. Never raises."""
+```
+
+Construction, normative: `queue` defaults to a fresh **unbounded** `queue.Queue()` — no
+`maxsize`, so `put` can never block a worker or a reader thread. `executor` defaults to
+`concurrent.futures.ThreadPoolExecutor(max_workers=max_workers,
+thread_name_prefix=THREAD_NAME_PREFIX)`; passing one in is how a test substitutes an
+executor that runs the callable inline. Live futures are held in a
+`dict[str, set[concurrent.futures.Future[Any]]]` keyed by task id and guarded by a
+`threading.Lock`; the done-callback discards its own future from that set. Cancel tokens
+live in a `dict[str, CancelToken]` under the same lock.
+
+`submit`, normative — the guarantee this whole module exists for:
+
+1. **Every submitted task produces exactly one terminal message**: a `TaskFinished` or a
+   `TaskFailed`, never both and never neither. A screen can therefore always turn its
+   spinner off in one place.
+2. `future.add_done_callback(cb)` is attached before `submit` returns.
+3. The body of `cb` is wrapped in its own `try` / `except BaseException`. This is the
+   outermost net: an exception escaping a done-callback is only printed by
+   `concurrent.futures` to stderr and is otherwise lost, which is precisely the silent
+   disappearance spec section 5 forbids. The outer handler logs at ERROR and, if it can,
+   posts a `TaskFailed` with `GENERIC_FAILURE_MESSAGE`.
+4. Inside, the outcome is classified in this order:
+
+   | Outcome | Message posted | `user_message` |
+   |---|---|---|
+   | `future.cancelled()` | `TaskFailed(task_id, CancelledError(), …)` | `CancelledError.default_user_message` — "Cancelled." |
+   | `future.exception()` is `None` | `TaskFinished(task_id, future.result())` | — |
+   | the exception is a `LauncherError` (including `CancelledError` and every subclass in section 2) | `TaskFailed(task_id, exc, exc.user_message)` | the exception's own `user_message` |
+   | any other `BaseException` — `KeyError`, `OSError`, `MemoryError`, `KeyboardInterrupt`, `SystemExit` | `TaskFailed(task_id, exc, GENERIC_FAILURE_MESSAGE)` | the generic sentence above |
+
+   `future.exception()` is used rather than `future.result()` so an exception is
+   inspected without being re-raised inside the callback.
+5. Before posting a failure, the callback logs it with
+   `logger.error("task %s failed", task_id, exc_info=exc)`, so the traceback lands in
+   `launcher.log` with tokens redacted by `RedactingFilter` (section 5.2). The user gets
+   one sentence; the log gets everything.
+6. The future is removed from the live set, whichever branch ran, in a `finally`.
+7. A failure inside `queue.put` itself is logged and swallowed. A callback must never
+   propagate.
+8. **`submit` does not inject `progress` or `cancel` into `fn`.** Only the caller knows
+   the parameter names, so the call site is explicit:
+   `runner.submit(TASK_LAUNCH, prepare_launch, http, paths, config, instance, account,
+   progress=runner.progress_fn(TASK_LAUNCH), cancel=runner.token(TASK_LAUNCH))`.
+   There is no magic and nothing to discover by reading this module's source.
+9. Submitting a second future under an id that already has one is allowed; both run and
+   `is_running` stays true until the last one finishes. Per-item work uses distinct ids
+   anyway (`f"{TASK_MOD_ICON}:{project_id}"`, section 4).
+10. After `shutdown()`, `submit` raises `RuntimeError` — the stdlib's own behaviour,
+    deliberately not wrapped in a `LauncherError`, because submitting work to a closed
+    runner is a launcher bug and not something to show a user.
+
+`progress_fn`, normative: the returned callable puts `Progress(task_id, label, done,
+total)` on the queue and returns `None`. It is safe to call from any thread (`queue.put`
+is), and it **never raises**: a failure to post is logged at DEBUG and swallowed, because
+a dropped progress tick is not worth aborting a 480 MB download for. It performs no
+throttling — the sub-second cadence comes from the `Reporter` scale (1000 units,
+section 6.2) and from the UI's 50 ms drain.
+
+`token` / `cancel` / `cancel_all`, normative: `token` creates the `CancelToken` on first
+request and returns the same object afterwards, so the UI's Cancel button and the worker
+share one flag. `cancel(task_id)` sets it; the worker stops at its next
+`check_cancel(cancel)` and raises `CancelledError`, which the done-callback turns into a
+`TaskFailed` carrying "Cancelled." — a cancelled sign-in and a cancelled download report
+through exactly the same path as any other failure. A token is **not** reset by
+`submit`; a screen that wants a fresh one after a cancel calls `cancel` and then
+`reset_token`:
+
+```python
+    def reset_token(self, task_id: str) -> CancelToken:
+        """Replace this id's cancel token with a fresh one and return it."""
+```
+
+`drain`, normative: pops with `queue.get_nowait()` until the queue is empty or
+`max_messages` have been taken, ignoring `queue.Empty`, and returns them in order. It is
+called only from the Tk thread and returns a plain list, so `ui/app.py._drain_queue`
+iterates a snapshot rather than holding the queue while it mutates widgets.
+
+`shutdown`, normative: `cancel_all()` first, so running workers begin unwinding, then
+`executor.shutdown(wait=wait, cancel_futures=cancel_futures)`. The default `wait=False`
+means closing the window is instant. One caveat implementers must know:
+`ThreadPoolExecutor` threads are **not** daemons and are joined at interpreter exit, so a
+worker blocked on a socket keeps the process alive. That is bounded here, not hoped away:
+every long operation checks its `CancelToken` at least once per file or chunk (section 6)
+and `Http` fixes the read timeout at 60 seconds (section 7), so the worst case after
+`shutdown()` is roughly one read timeout. `shutdown()` is idempotent and never raises;
+calling it twice is a no-op.
+
+Nothing in this module imports `tkinter`, `customtkinter`, `theme` or `ui` — it is
+module 19 in the map and the UI is above it. It also does not import `process`: a
+`GameProcess` is handed the `TaskRunner`'s `queue` object directly (section 19), which is
+why the queue is a public attribute.
+
+---

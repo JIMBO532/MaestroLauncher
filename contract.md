@@ -38,6 +38,7 @@ section.
 | 2026-09-03 | 21 | `theme.py` defines seven colour constants: the six the spec allows plus `ACCENT_HOVER`, a darker shade of `ACCENT` with the same hue. `TEXT_ON_ACCENT` is an alias of `SURFACE`, not an eighth value. | `CTkButton` needs a distinct `hover_color`; a shade of the accent is a state, not a new colour. |
 | 2026-09-03 | 22 | The running-game button reads **"Stop"** with a separate status label "Running", instead of a single button captioned "Running — Stop" (spec §8). | Spec §13: buttons name what happens; "Running" is a state, not an action. |
 | 2026-09-03 | 15 | Versions whose JSON has no `arguments` block (pre-1.13, `minecraftArguments` string) are launched with `LEGACY_JVM_ARGS` plus the split `minecraftArguments`. Fabric does not exist for them, so `prepare_launch` stops with `ManifestError` ("Fabric doesn't support Minecraft {version}. Pick 1.14 or newer."). | The dropdown lists every release (spec §2); the launcher must fail clearly rather than crash on them. |
+| 2026-09-04 | 16, 21, 22 | `list_installed` (16.6) also accepts children ending in `.zip` and `.zip.disabled`, so the Texture Packs view can list what it installed. For a `.zip` the `fabric.mod.json` read is skipped entirely: `name` comes from the sidecar `title` falling back to the filename stem, `version` from the sidecar `version_number`, `description` is `""` and `id` is `""`. `ui/mods.py` offers no on/off switch in Texture Packs mode, so `set_enabled` is never called on a pack. | Section 21's Texture Packs screen needs an Installed pane and `list_installed` was jar-only; nothing else in section 16 could enumerate a pack. Minecraft turns resource packs on itself, so `.disabled` renaming has no meaning there. |
 
 ---
 
@@ -4594,5 +4595,709 @@ Nothing in this module imports `tkinter`, `customtkinter`, `theme` or `ui` — i
 module 19 in the map and the UI is above it. It also does not import `process`: a
 `GameProcess` is handed the `TaskRunner`'s `queue` object directly (section 19), which is
 why the queue is a public attribute.
+
+---
+
+## 21. `theme.py` — the design plan and the token interface
+
+Module 20 in the map. It is the only module in the project that may import
+`customtkinter` without being part of `ui/`, and the only file anywhere that is allowed
+to contain a colour literal, a font family name, a padding number or a corner radius.
+Sections 21.1 to 21.11 are the design plan spec section 13 requires *before* any UI code
+is written; section 21.12 is the interface the three UI tasks build against.
+
+### 21.1 Why this palette
+
+This block is normative prose and it is also the comment that goes at the top of
+`theme.py`, near enough word for word.
+
+MaestroLauncher exists to make Minecraft fast. It bundles Sodium and Fabric API on every
+new instance, its Play screen argues with the player about heap size, and its mod browser
+sells frame rate. So the palette is taken from the instruments that *measure*
+performance rather than from the games that consume it — a frame-time graph, a profiler,
+the F3 overlay: cool, desaturated, evenly lit, with a single warm value reserved for the
+reading that matters. Every non-accent colour in this file sits inside a four-degree band
+around hue 216°, a blue-grey slate. The accent is the only warm value in the entire
+application. Two hues, one of which is allowed to appear once per pane.
+
+The accent is sodium, and not as a metaphor. The mod is named after the element, and the
+element's emission line — the sodium D-line at 589 nm, the colour of every sodium street
+lamp — lands in sRGB at roughly hue 39°. `ACCENT` is `#F2A50C`: hue 39.9°, one step down
+in value so that the dark label on an accent button clears 8:1 rather than scraping past.
+That gives the launcher one memorable colour that is *about the thing it installs*,
+instead of a brand colour arrived at by elimination.
+
+What was rejected, and why. **Near-black plus a single acid accent** (`#0B0D10` with
+`#00FF88` or `#00E5FF`) is the default result for any dark desktop app; it also destroys
+the surface hierarchy, because a raised panel over a near-black ground measures 1.08:1 —
+that is not a step, it is a rumour — and green-on-black reads as a terminal, which this
+is not. **Minecraft's own grass green and dirt brown**: the launcher is not the game, and
+borrowing the game's chrome makes a launcher look like a fan page rather than a tool.
+**A light theme**: the game runs full-screen and dark, and a white launcher on alt-tab is
+a flashbang. **A second accent for danger or success**: colour-only status coding fails
+exactly the players most likely to need the status, and one accent that always means
+"this is the action" is worth more than three that each have to be learned. Errors here
+are marked by position and wording, not by hue.
+
+### 21.2 Colour tokens
+
+Seven constants and one alias — the six the spec allows, plus `ACCENT_HOVER` and the
+`TEXT_ON_ACCENT` alias permitted by the section 0 amendment dated 2026-09-03.
+
+| Constant | Value | Where it is used |
+|---|---|---|
+| `SURFACE` | `#171B22` | The window background and the content area of every screen; the ground the mod-browser rows sit on; also the value `TEXT_ON_ACCENT` aliases. |
+| `SURFACE_RAISED` | `#272F3C` | The sidebar; the Installed pane; the device-code block; the fill of `CTkEntry`, `CTkOptionMenu`, `CTkTextbox` and the progress track; the fill of the mod row under pointer or keyboard focus; the fill of a disabled button. |
+| `BORDER` | `#6C7889` | A 1 px outline on entries, option menus and the crash log box; the rule between Installed-pane entries and above the Play button bar; the line dividing sidebar from content. Nothing else gets a border. |
+| `TEXT` | `#E6EAF0` | Screen headings, mod titles, the device code, game log lines, labels on non-accent buttons, and the selected sidebar item. |
+| `TEXT_MUTED` | `#9AA6B6` | Mod descriptions, download counts, the memory note, unselected sidebar items, entry placeholder text, and the label of a disabled control. |
+| `ACCENT` | `#F2A50C` | Three things only: the fill of the one primary button in a pane, the fill of a determinate progress bar while its task runs, and the 2 px keyboard focus ring. |
+| `ACCENT_HOVER` | `#D89209` | The `hover_color` of a button whose `fg_color` is `ACCENT`. Nothing else. |
+| `TEXT_ON_ACCENT` | `= SURFACE` | The label of an accent-filled button. An alias, not an eighth value. |
+
+**The accent invariant, which is what makes the accent mean anything.** At most one
+accent-coloured element is visible per pane at any moment, plus the focus ring. The panes
+are: the sidebar (never accented), the content area, and — on Mods and Texture Packs
+only — the Installed pane. When a long operation starts the accent *moves* rather than
+multiplying: the Play button goes disabled (`SURFACE_RAISED` fill, `TEXT_MUTED` label)
+and the accent transfers to the progress bar; when the operation ends it transfers back.
+The mod browser at rest shows **no** accent at all, which is correct — browsing is not
+committing — and the row `Install` buttons are therefore quiet outline buttons. The
+accent reappears on the confirm dialog's `Install 3 files`, on the Installed pane's
+`Update 2 mods` when updates exist, and on the running row's inline progress bar.
+
+The focus ring is the one deliberate extension of "primary action and nowhere else", and
+it is argued rather than assumed: keyboard focus *is* the pre-state of the primary
+action — it marks the control that will fire on Return — at most one widget in the window
+can have it, and it vanishes the instant focus moves. The alternative, a near-white ring,
+is the same colour as `TEXT` and reads as a text selection rather than as focus.
+
+### 21.3 Contrast, computed
+
+Computed, not estimated: relative luminance with the sRGB linearisation
+(`c/12.92` when `c <= 0.04045`, else `((c+0.055)/1.055) ** 2.4`), weighted
+`0.2126 R + 0.7152 G + 0.0722 B`, then `(L1 + 0.05) / (L2 + 0.05)`. Every pair below is
+a pair that actually occurs in the interface.
+
+| Token | L | Hue |
+|---|---|---|
+| `SURFACE` `#171B22` | 0.01082 | 218.2° |
+| `SURFACE_RAISED` `#272F3C` | 0.02791 | 217.1° |
+| `BORDER` `#6C7889` | 0.18427 | 215.2° |
+| `TEXT` `#E6EAF0` | 0.81960 | 216.0° |
+| `TEXT_MUTED` `#9AA6B6` | 0.37520 | 214.3° |
+| `ACCENT` `#F2A50C` | 0.45814 | 39.9° |
+| `ACCENT_HOVER` `#D89209` | 0.35176 | 39.7° |
+
+Text pairs — the requirement is 4.5:1 and every one clears it:
+
+| Foreground | Background | Ratio | Where |
+|---|---|---|---|
+| `TEXT` | `SURFACE` | **14.30:1** | Headings, mod titles, log lines on the content ground. |
+| `TEXT` | `SURFACE_RAISED` | **11.16:1** | Sidebar labels, Installed-pane titles, entry text, the device code. |
+| `TEXT_MUTED` | `SURFACE` | **6.99:1** | Mod descriptions and download counts in the browser list. |
+| `TEXT_MUTED` | `SURFACE_RAISED` | **5.46:1** | Unselected sidebar items, Installed-pane version strings, placeholder text, disabled button labels. **The hard case — grey on dark grey — and the lowest ratio in the set.** |
+| `TEXT_ON_ACCENT` | `ACCENT` | **8.36:1** | The label of `Play`, `Copy code`, `Update 2 mods`, `Install 3 files`. |
+| `TEXT_ON_ACCENT` | `ACCENT_HOVER` | **6.61:1** | The same label while the pointer is over it. |
+
+Non-text pairs, held to the 3:1 that WCAG 1.4.11 asks of a control boundary:
+
+| Pair | Ratio | Why it matters |
+|---|---|---|
+| `BORDER` on `SURFACE` | 3.85:1 | The entry and option-menu outline on the content ground. |
+| `BORDER` on `SURFACE_RAISED` | 3.01:1 | The same outline inside the Installed pane; the rules between entries. |
+| `ACCENT` on `SURFACE` | 8.36:1 | The focus ring, and the progress fill against the page. |
+| `ACCENT` on `SURFACE_RAISED` | 6.52:1 | The focus ring on a raised control; the progress fill against its own track. |
+| `SURFACE_RAISED` on `SURFACE` | 1.28:1 | Not a boundary — every raised element also carries either a border or a 3:1 focus ring, so nothing is identified by this step alone. It is a lift, and it is deliberately gentle. |
+
+### 21.4 Spacing
+
+One scale. Every `padx` and `pady` in `ui/` is one of these six names; a bare integer in
+a geometry call is a review failure. The name states the value so that a wrong one is
+visible without opening this file.
+
+| Constant | Value | Used for |
+|---|---|---|
+| `SPACE_4` | `4` | The gap between a label and the control directly beneath it; the inset of the focus ring; vertical padding inside a dense Installed-pane entry. |
+| `SPACE_8` | `8` | The gap between two controls on the same row; the gap between a mod title and its description; padding inside a small button. |
+| `SPACE_12` | `12` | The gap between the icon block and the text block of a mod row; the vertical rhythm of a form row on the Play screen. |
+| `SPACE_16` | `16` | The inner padding of the Installed pane; the space between the sidebar rule and the account row; the gutter between the browse list and the Installed pane. |
+| `SPACE_24` | `24` | The outer margin of every content area; the space beneath a screen heading; the space above the Play button bar. |
+| `SPACE_32` | `32` | The one large break: between the device-code block and the instructions above it, and between the memory note and the button bar on Play. |
+
+### 21.5 Type
+
+Three sizes, two weights, three resolved families. Nothing else.
+
+| Constant | Value | Used for |
+|---|---|---|
+| `SIZE_DISPLAY` | `24` | The single screen heading, and — the same token, not a fourth size — the device code set in the mono family. |
+| `SIZE_BODY` | `14` | All running text, button labels, mod titles, form labels, sidebar items. |
+| `SIZE_SMALL` | `12` | Muted metadata: descriptions, counts, version strings, the memory note, the game log. |
+| `WEIGHT_NORMAL` | `"normal"` | Everything that is not in the next row. |
+| `WEIGHT_BOLD` | `"bold"` | Mod titles, button labels, the selected sidebar item, Installed-pane entry names. |
+
+Families are **ordered fallback lists resolved once at startup** against
+`tkinter.font.families()`. Each list ends in a family Tk maps to a real face on every
+platform even when `families()` does not list it, which is why `resolve_font_family`
+returns the last candidate rather than raising when nothing matches. Verified on the
+development machine (Windows 11, Tk 9.0): `Segoe UI`, `Bahnschrift`, `Segoe UI Semibold`,
+`Cascadia Mono`, `Cascadia Code` and `Consolas` are all present; `Helvetica` is **not**
+in `families()` yet `Font(family="Helvetica").actual()` still resolves — that is the
+guarantee the tail of each list relies on.
+
+| Constant | Ordered candidates | First hit here |
+|---|---|---|
+| `UI_FAMILIES` | `["Segoe UI", "SF Pro Text", "Helvetica Neue", "DejaVu Sans", "Helvetica"]` | `Segoe UI` |
+| `DISPLAY_FAMILIES` | `["Bahnschrift", "Segoe UI Semibold", "SF Pro Display", "Helvetica Neue", "DejaVu Sans", "Helvetica"]` | `Bahnschrift` |
+| `MONO_FAMILIES` | `["Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier"]` | `Cascadia Mono` |
+
+The second family earns its place. `Bahnschrift` is Windows' DIN — the typeface of
+instrument panels and industrial signage — and it is narrower and firmer in colour than
+`Segoe UI` at the same size. It sets the screen heading at `WEIGHT_NORMAL`, because it
+already carries more weight than the body face and because bolding a variable font
+through Tk is not something to depend on. If it is absent the heading falls to
+`Segoe UI Semibold` and then to the UI family, and the screen still reads correctly.
+
+Monospace is reserved for the two places where character identity is the point: the
+device code, which the player retypes into a browser, and the game log, whose alignment
+is information. It is used nowhere else — not for version numbers, not for file sizes.
+
+### 21.6 Radius, borders and the focus ring
+
+Exactly two radii, chosen so that hierarchy is legible without a third:
+
+| Constant | Value | Applies to |
+|---|---|---|
+| `RADIUS_CONTAINER` | `10` | Things that hold other things: the Installed pane, the device-code block, the confirm dialog, the crash log box. |
+| `RADIUS_CONTROL` | `6` | Things you click or type into: buttons, entries, option menus, the progress bar. |
+
+`corner_radius=0` is used for full-bleed surfaces — the sidebar, the content frame, the
+mod-browser rows, the 1 px rules — and is not a token, because zero is the absence of a
+radius rather than a third value. A container is never given the control radius and a
+control is never given the container radius; that difference is the whole point of having
+two.
+
+| Constant | Value | Applies to |
+|---|---|---|
+| `BORDER_WIDTH` | `1` | Entries, option menus, the crash log box, the rules. |
+| `FOCUS_WIDTH` | `2` | The keyboard focus ring, in `ACCENT`. |
+
+Borders are not decoration and are not applied uniformly. A raised panel is identified by
+its fill; a text input is identified by its outline, because that is the only thing that
+says "type here". Buttons carry a border only when they are the quiet outline variety
+(`fg_color="transparent"`, `border_width=BORDER_WIDTH`, `border_color=BORDER`); an
+accent-filled button has none.
+
+The focus ring is `border_width=FOCUS_WIDTH, border_color=ACCENT`, and CustomTkinter draws
+a border **inside** the widget's own box, so gaining focus moves nothing. Every focusable
+control is built through `ui/widgets.py` (section 22), which is responsible for three
+things per control: making it take keyboard focus, binding `<FocusIn>` / `<FocusOut>` to
+swap the border to the ring and back to whatever the control had before, and binding
+`<Return>` and `<space>` to the same command as the click. A control that exposes no
+border of its own — `CTkSwitch`, `CTkSlider` — is wrapped in a `CTkFrame` that paints the
+ring around it. Tab order is creation order within each container, and each screen creates
+its widgets in reading order for that reason.
+
+### 21.7 Layout constants
+
+```python
+MIN_WINDOW: Final[tuple[int, int]] = (960, 600)
+SIDEBAR_WIDTH: Final[int] = 208
+INSTALLED_PANE_WIDTH: Final[int] = 288
+CONTROL_HEIGHT: Final[int] = 36
+MIN_TARGET: Final[int] = 32
+MOD_ICON_SIZE: Final[int] = 48
+MOD_ROW_HEIGHT: Final[int] = 72
+PROGRESS_HEIGHT: Final[int] = 8
+CRASH_LOG_HEIGHT: Final[int] = 180
+DIALOG_WIDTH: Final[int] = 480
+TEXT_COLUMN_MAX: Final[int] = 560
+```
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `MIN_WINDOW` | `(960, 600)` | Passed to `root.minsize(*MIN_WINDOW)`. It fits inside section 8's `window` default of 1040 × 680 with 80 px and 80 px to spare, so the clamp in `Config.from_dict` never raises the stored size. |
+| `SIDEBAR_WIDTH` | `208` | Fixed width of the navigation column; the sidebar frame does not expand. |
+| `INSTALLED_PANE_WIDTH` | `288` | Fixed width of the Installed pane on Mods and Texture Packs. |
+| `CONTROL_HEIGHT` | `36` | Height of every button, entry and option menu — above the 32 px floor with room for the focus ring. |
+| `MIN_TARGET` | `32` | The floor itself. No clickable thing in the app is smaller than 32 × 32, including the Remove control in the Installed pane. |
+| `MOD_ICON_SIZE` | `48` | The `CTkImage` size for a project icon, in both browser and Installed pane. |
+| `MOD_ROW_HEIGHT` | `72` | One browser row: `SPACE_12` + 48 + `SPACE_12`. |
+| `PROGRESS_HEIGHT` | `8` | `CTkProgressBar` height. |
+| `CRASH_LOG_HEIGHT` | `180` | The `CTkTextbox` in the crash panel. |
+| `DIALOG_WIDTH` | `480` | The dependency confirm dialog and the protected-mod warning. |
+| `TEXT_COLUMN_MAX` | `560` | Maximum `wraplength` for a paragraph of running text, so the memory note and the sign-in instructions do not stretch to a 1400 px line on a wide window. |
+
+The arithmetic at the minimum width, which is where a layout breaks if it is going to:
+`960 − 208 (sidebar) − 24 (left margin) − 16 (gutter) − 288 (Installed) − 24 (right
+margin) = 400 px` for the browse list. Inside a row: `16 + 48 (icon) + 12 + [flexible
+title and description] + 12 + 96 (Install) + 16`, which leaves **200 px** for the title
+and description at the minimum and about 280 px at the 1040 default. The title and
+description are the only elastic elements on the row and both truncate with an ellipsis;
+nothing else moves. Vertically, 600 px yields five full browser rows after the heading,
+search field and filter row.
+
+The Play screen's body is a `CTkScrollableFrame` so that the crash panel — which appears
+below the memory note and is 180 px tall plus its hint — can never push the Play button
+off the bottom of a 600 px window.
+
+### 21.8 The screens
+
+Four sidebar entries, three screen modules: `ui/mods.py` renders both **Mods** and
+**Texture Packs**, differing only in the search facet (section 16.1), the destination
+directory (`instance.mods` versus `instance.resourcepacks`) and the absence of an on/off
+switch. Navigation order is by frequency, not by prerequisite: Play, Mods, Texture Packs
+at the top, and the account row pinned to the bottom of the sidebar showing the signed-in
+player's name — clicking it opens the Account screen. On a first run with no account the
+app opens on Account and that row reads `Sign in`.
+
+The selected navigation item is marked without colour: its row is filled with `SURFACE`
+— the content-area colour — so the content surface appears to continue into the sidebar,
+and its label goes from `TEXT_MUTED` at `WEIGHT_NORMAL` to `TEXT` at `WEIGHT_BOLD`. The
+wireframes show this as the missing divider on the selected row.
+
+`<ACCENT>` marks the one accent-coloured element in each pane.
+
+**Account** — signed out, device code issued:
+
+```text
+┌────────────────┬───────────────────────────────────────────────────────────────────────┐
+│ MaestroLauncher│                                                                       │
+│                │  Account                                                              │
+│  Play          │                                                                       │
+│  Mods          │  Sign in with your Microsoft account to play.                         │
+│  Texture Packs │                                                                       │
+│                │  1  Open  microsoft.com/link                                          │
+│                │  2  Enter this code                                                   │
+│                │                                                                       │
+│                │     ┌───────────────────────────┐                                     │
+│                │     │        H4TG-QM29          │   mono, display size                │
+│                │     └───────────────────────────┘                                     │
+│                │                                                                       │
+│                │     [ Copy code ]  <ACCENT>          [ Cancel ]                       │
+│                │                                                                       │
+│ ───────────────│  Waiting for you to finish in your browser.                           │
+│  Sign in                                                                               │
+└────────────────┴───────────────────────────────────────────────────────────────────────┘
+```
+
+Widgets, in order: `CTkLabel` (display) / `CTkLabel` (body) / two `CTkLabel` steps, the
+first containing a `CTkLabel` bound to `<Button-1>` with `cursor="hand2"` for the link /
+a `CTkFrame` at `RADIUS_CONTAINER` holding a `CTkLabel` in `mono_display` / a `CTkButton`
+`Copy code` (accent) / a `CTkButton` `Cancel` (outline) / a `CTkLabel` status line.
+
+| State | What changes |
+|---|---|
+| Signed out, idle | Code block and status line hidden. One accent button: `Sign in`. |
+| Waiting | As drawn. `Cancel` sets the sign-in task's `CancelToken` (section 20), which stops the polling thread. |
+| Signed in | Code block replaced by the player name and UUID; the accent button reads `Sign out`; a `Switch account` outline button sits beside it. |
+| Entra with no client id | The code block is replaced by: "MaestroLauncher needs an application id before it can sign you in. Register one in Azure, or switch to the Minecraft launcher's own sign-in." The accent button reads `Use Minecraft sign-in` and performs the one-click switch to `auth_mode = "live"` from the section 0 amendment. |
+| Failed | The status line carries the error's `user_message`; the accent button returns to `Sign in`. |
+
+**Play** — idle, ready to launch:
+
+```text
+┌────────────────┬───────────────────────────────────────────────────────────────────────┐
+│ MaestroLauncher│                                                                       │
+│                │  Play                                                                 │
+│  Play                                                                                  │
+│  Mods          │  Version    [ 26.2                    ▾ ]   [x] Show snapshots        │
+│  Texture Packs │  Instance   [ default                 ▾ ]                             │
+│                │                                                                       │
+│                │  Memory     2 GB ─────────●──────────── 12 GB        6 GB             │
+│                │             More memory is not more speed. 4-8 GB suits Sodium        │
+│                │             and a normal modlist; a bigger heap makes pauses          │
+│                │             longer.                                                   │
+│                │                                                                       │
+│                │  Ready to play 26.2 with Fabric.                                      │
+│                │                                                                       │
+│                │  ─────────────────────────────────────────────────────────────────    │
+│                │                                                                       │
+│ ───────────────│                                              [ Play ]  <ACCENT>       │
+│  Notch         │                                                                       │
+└────────────────┴───────────────────────────────────────────────────────────────────────┘
+```
+
+Widgets: two `CTkOptionMenu` rows, a `CTkCheckBox` for snapshots, a `CTkSlider`
+(`from_=2`, `to=max_memory_gb()`, `number_of_steps` = the span) with two end labels and a
+live value label, a wrapped `CTkLabel` note, a status `CTkLabel`, a 1 px rule, and the
+button bar.
+
+While a launch is preparing, the button bar area becomes:
+
+```text
+┌───────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  ████████████████████████████░░░░░░░░░░░░░░░░░░░░   <ACCENT fill>     │
+│  Downloading assets                     1,284 of 3,140 files          │
+│                                                                       │
+│  ─────────────────────────────────────────────────────────────────    │
+│                                                                       │
+│                                    [ Play ]      [ Cancel ]           │
+│                                    disabled                           │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+The bar is `CTkProgressBar(mode="determinate")` driven by `Progress` messages
+(section 4); `Progress.total == 0` leaves the bar where it is and updates only the label,
+and no operation in this app shows a bare spinner. The Play button is disabled and still
+reads `Play` — the verb survives the flow — while the status label carries the state.
+When the game is running the button reads `Stop` and the status label reads `Running`,
+per the section 0 amendment.
+
+On a non-zero exit the crash panel takes the place of the memory note:
+
+```text
+┌───────────────────────────────────────────────────────────────────────┐
+│                                                                       │
+│  Minecraft stopped unexpectedly.  Exit code 1                         │
+│                                                                       │
+│  Two mods are trying to change the same part of the game. Turn        │
+│  off the mods you added most recently, one at a time, until the       │
+│  game starts.                                                         │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────┐          │
+│  │ [12:04:31] [Render thread/ERROR]: Mixin apply failed:   │          │
+│  │ sodium.mixins.json:features.render.MixinLevelRenderer   │          │
+│  │ ...                                          (scrolls)  │          │
+│  └─────────────────────────────────────────────────────────┘          │
+│                                                                       │
+│  [ Copy log ]                              [ Play ]  <ACCENT>         │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+The hint sentence is `GameExited.hint` from section 19.1, shown only when one was
+recognised; the box holds `GameExited.log_tail` in `mono`; `Copy log` puts the tail on the
+clipboard and its label changes to `Copied` for two seconds via `after()`, then back.
+
+**Mods** — the one screen that carries visual weight:
+
+```text
+┌────────────────┬────────────────────────────────────────────┬──────────────────────────┐
+│ MaestroLauncher│                                            │                          │
+│                │  Mods                                      │  Installed          12   │
+│  Play          │                                            │                          │
+│  Mods             [ Search mods                        ]    │  [ Update 2 mods ]       │
+│  Texture Packs │  [ Most downloads ▾ ]  For 26.2, Fabric    │        <ACCENT>          │
+│                │                                            │  ──────────────────────  │
+│                │  ┌────┐  Sodium                    4.2M    │  Fabric API              │
+│                │  │ ▨▨ │  Rendering engine that lifts       │  0.159.0+26.2            │
+│                │  │ ▨▨ │  frame rates          [ Installed ]│  ( ●) On  [ Remove ]     │
+│                │  └────┘                                    │  ──────────────────────  │
+│                │  ┌────┐  Iris Shaders              1.8M    │  Sodium                  │
+│                │  │ ▨▨ │  Shader support for Fabric,        │  0.9.1 → 0.9.2 ready     │
+│                │  │ ▨▨ │  works with Sodium     [ Install ] │  (● ) Off [ Remove ]     │
+│                │  └────┘                                    │  ──────────────────────  │
+│                │  ┌────┐  Lithium                   3.1M    │  Lithium                 │
+│                │  │ ▨▨ │  Faster world ticks, no            │  0.19.0                  │
+│                │  │ ▨▨ │  behaviour changes     [ Install ] │  ( ●) On  [ Remove ]     │
+│                │  └────┘                                    │                          │
+│                │                                            │                          │
+│ ───────────────│  Showing 20 of 412      [ Show 20 more ]   │                          │
+│  Notch         │                                            │                          │
+└────────────────┴────────────────────────────────────────────┴──────────────────────────┘
+```
+
+The boldness is structural, not chromatic. The browser is a real two-pane catalogue: a
+wide continuous list of 72 px rows with 48 px project icons on the plain `SURFACE`
+ground, and a permanent Installed pane so the player can see what they already have while
+they shop. There are no cards, no rules between rows and no accent at rest; separation
+comes from the icon rhythm and from `SPACE_12`, and the row under the pointer or under
+keyboard focus fills with `SURFACE_RAISED`. Metadata is laid out in columns — the
+download count is a right-aligned cell, the game version and loader are a single sentence
+under the search field — so no string is ever assembled by joining fragments with
+separators.
+
+Widgets: `CTkEntry` (debounced 300 ms), `CTkOptionMenu` for sort, `CTkScrollableFrame`
+for the results, one `CTkFrame` per row containing a `CTkLabel` with a `CTkImage`, two
+`CTkLabel`s, a count `CTkLabel` and a `CTkButton`. The Installed pane is a `CTkFrame` at
+`RADIUS_CONTAINER` holding a `CTkScrollableFrame` of entries, each a name `CTkLabel`, a
+version `CTkLabel`, a `CTkSwitch` and a `Remove` `CTkButton`.
+
+| Element | Copy and behaviour |
+|---|---|
+| Row button | `Install` → while running, an inline `CTkProgressBar` in `ACCENT` with the label `Installing` → `Installed`, disabled. The verb survives. |
+| Dependencies | Section 0's amendment: one file installs immediately, more than one opens the confirm dialog below. |
+| `Update 2 mods` | Appears in the Installed pane only when `check_updates` returned entries. Takes that pane's accent. Singular form `Update 1 mod`. |
+| Removing Fabric API | The `InstanceError` carrying `PROTECTED_WARNING` (section 16.6) is caught and shown in a dialog whose accent button reads `Remove Fabric API`; the quiet button reads `Keep it`. |
+| Search returned nothing | "No mods match *sdium* for 26.2. Try a shorter word, or change the version on the Play screen." |
+| Installed pane empty | "No mods yet. Search on the left and press Install." |
+
+The confirm dialog, shown when a plan resolves to more than one file:
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                                                              │
+│  Install Iris Shaders                                        │
+│                                                              │
+│  Iris Shaders needs two more files. All three go into        │
+│  the default instance.                                       │
+│                                                              │
+│    Iris Shaders    1.9.2+mc26.2            2.4 MB            │
+│    Sodium          0.9.2+mc26.2            1.8 MB            │
+│    Fabric API      0.159.0+26.2            2.1 MB            │
+│                                                              │
+│            [ Cancel ]   [ Install 3 files ]  <ACCENT>        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Texture Packs** — the same shell, quieter:
+
+```text
+┌────────────────┬────────────────────────────────────────────┬──────────────────────────┐
+│ MaestroLauncher│                                            │                          │
+│                │  Texture Packs                             │  Installed           1   │
+│  Play          │                                            │                          │
+│  Mods          │  [ Search texture packs               ]    │  Turn packs on inside    │
+│  Texture Packs    [ Most downloads ▾ ]  For 26.2            │  Minecraft, under        │
+│                │                                            │  Options then            │
+│                │  ┌────┐  Faithful 32x              9.1M    │  Resource Packs.         │
+│                │  │ ▨▨ │  The vanilla look at twice         │  ──────────────────────  │
+│                │  │ ▨▨ │  the resolution        [ Install ] │  Faithful 32x            │
+│                │  └────┘                                    │  1.21.4-a                │
+│                │  ┌────┐  Fresh Animations          6.4M    │           [ Remove ]     │
+│                │  │ ▨▨ │  Hand-drawn mob animations         │                          │
+│                │  │ ▨▨ │  for any pack          [ Install ] │                          │
+│                │  └────┘                                    │                          │
+│                │                                            │                          │
+│ ───────────────│  Showing 20 of 188      [ Show 20 more ]   │                          │
+│  Notch         │                                            │                          │
+└────────────────┴────────────────────────────────────────────┴──────────────────────────┘
+```
+
+Texture packs have no dependencies, so the confirm dialog never appears here. They have
+no on/off switch either: Minecraft enables packs itself, which is what the line at the
+top of the pane says. The empty state is an invitation and it is the normal first state:
+"No texture packs yet. Search above and install one. Packs turn on inside Minecraft,
+under Options then Resource Packs."
+
+### 21.9 Interface copy
+
+Active voice, sentence case, no filler, no apology. `Texture Packs` is the one title-cased
+label in the interface, because that is how Minecraft's own options screen names the
+thing and the player already knows it that way.
+
+| Situation | The string |
+|---|---|
+| Primary action, Play | `Play` — never `Play →`, never `Launch`. |
+| Game running | Button `Stop`, status label `Running`. |
+| Preparing | Button `Play`, disabled; status label names the step, e.g. `Downloading assets`, with `1,284 of 3,140 files` right-aligned beside it. |
+| Memory note | "More memory is not more speed. 4–8 GB suits Sodium and a normal modlist; a bigger heap makes pauses longer." |
+| Sign-in wait | "Waiting for you to finish in your browser." |
+| Network failure | "Couldn't reach Modrinth. Check your connection and try again." — the `user_message` already carried by `NetworkError` (section 2). |
+| Crash | "Minecraft stopped unexpectedly." plus the exit code, plus `crash_hint` when there is one (section 19.1). No apology, no stack trace in the sentence. |
+| Empty browser | Before the first keystroke the browser is not empty: an empty query with `sort=downloads` shows the mods most people install for this version (section 16.3). |
+
+An error is shown as a `CTkFrame` in `SURFACE_RAISED` with a `BORDER` outline, pinned
+directly under the screen heading, carrying the message in `TEXT` and, when there is
+something to do, one quiet button. No red, no icon, no colour coding: position and
+wording do the work.
+
+### 21.10 The anti-defaults checklist
+
+Run item by item against the plan above, with the evidence.
+
+| # | Anti-default | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Tracked-out ALL-CAPS section labels | **Pass** | No string in the interface is upper-cased and no letter-spacing is applied anywhere; Tk cannot track type without inserting spaces into the string, and that is exactly the tell. Section headings are sentence case at `SIZE_BODY` `WEIGHT_BOLD` (`Installed`), and the one heading per screen is `SIZE_DISPLAY` in the display family. |
+| 2 | Identical corner radius and border on every element | **Pass** | Three distinct treatments by role: containers at `10`, controls at `6`, full-bleed surfaces at `0`. Borders appear on text inputs and on the crash log box, where the outline is what identifies the control, and on the quiet outline buttons; accent buttons, panes, rows and the sidebar have none. |
+| 3 | Emoji used as icons | **Pass** | There is no emoji in any wireframe or copy string. The sidebar is text-only. The only images in the app are project icons fetched from Modrinth and rendered as `CTkImage` at 48 px, which are real content. `▾` in an option menu and `●` in a switch are the widgets' own glyphs, not decoration. |
+| 4 | Metadata joined with middle dots | **Pass** | The mod row uses a grid: title and description in the elastic centre column, download count right-aligned in its own cell, action in its own cell. The filter line is a sentence — `For 26.2, Fabric` — not a join. The Installed entry stacks name over version. The character `·` appears nowhere in the interface. |
+| 5 | An arrow glued onto button text | **Pass** | Every button label is a bare verb phrase: `Play`, `Stop`, `Install`, `Install 3 files`, `Copy code`, `Copy log`, `Remove`, `Update 2 mods`, `Show 20 more`. The one arrow in the interface is `0.9.1 → 0.9.2 ready`, which denotes a version transition and carries meaning; the banned arrow is the decorative one on a button, and there is none. |
+| 6 | Accent sprayed across every interactive element | **Pass** | Stated as an invariant in 21.2 and checkable in the wireframes: at rest, exactly one amber element per pane, and the Mods browser has none at all. The twenty row buttons — the obvious place for spray — are quiet outline buttons. Sidebar selection is expressed by surface, not by accent. |
+| 7 | Every screen chopped into identical rounded cards | **Pass** | Account and Play have no cards: they are forms on a plain ground with one `RADIUS_CONTAINER` block each (the device code; the crash log). The Mods browser deliberately has none either — rows sit directly on `SURFACE`. Exactly one card-shaped thing exists in the app, the Installed pane, and it is a pane rather than a repeated unit. |
+
+### 21.11 What I changed and why
+
+The checklist was run against a first pass, and it changed seven things.
+
+1. **Row `Install` buttons were accent-filled.** Twenty amber buttons in a scrolling list
+   is item 6 exactly, and it left the screen with no way to say which action was the
+   important one. They became quiet outline buttons, and the accent invariant of 21.2 was
+   written down so this cannot drift back.
+2. **The panes were headed `MODS` and `INSTALLED` in tracked caps.** Replaced by sentence
+   case with a count (`Installed  12`), which says more in less space.
+3. **Every mod row was a rounded card on `SURFACE_RAISED`.** Twenty identical cards is
+   item 7, and it also wasted 8 px of every row on chrome. Rows were flattened onto
+   `SURFACE`, with `SURFACE_RAISED` reassigned to the hover and focus state — where it
+   now does real work.
+4. **The row metadata was `4.2M downloads · 26.2 · Fabric`.** Item 4. Replaced by a
+   column grid, which also survives truncation at the minimum window width, where a
+   joined string would have lost its tail.
+5. **The sidebar had emoji icons.** Item 3. Dropped; nothing replaced them, and the
+   sidebar is better for it.
+6. **One radius, `10`, on everything.** Item 2. Split into container `10`, control `6`,
+   full-bleed `0`.
+7. **`TEXT_MUTED` was `#7C8899` and `BORDER` was `#323A48`.** Both failed once measured
+   rather than eyeballed. `#7C8899` gives 4.80:1 on `SURFACE` — which is why it looked
+   fine — but only **3.75:1** on `SURFACE_RAISED`, and the sidebar, the Installed pane
+   and every placeholder are raised surfaces, so most muted text in the app would have
+   been below the floor. It was lightened to `#9AA6B6` (5.46:1). `#323A48` gave a
+   **1.18:1** outline on `SURFACE_RAISED` — an invisible border on a search field is a
+   search field with no affordance — so `BORDER` was lifted to `#6C7889` (3.01:1). This
+   is the one item that could not have been caught by looking.
+
+**The thing I liked and cut.** A sodium-lamp warm-up on the Play button: when the button
+became enabled, `after()` would step `fg_color` from a dim amber to full `ACCENT` over
+about 400 ms, the way a sodium street lamp comes up. It is buildable with the toolkit,
+and it tied the motion directly to the palette's argument. It is cut. Without
+interpolation the step count is whatever `after()` gives at 60 ms — a stepped fade that
+would read as a rendering bug rather than as a lamp — and the whole effect lands on the
+one control the player wants to hit the instant it lights up, holding the primary action
+below its contrast floor while it animates. It was a good idea about the palette and a
+bad idea about the button.
+
+### 21.12 The module interface
+
+```python
+"""Design tokens. The only file in the project that contains a colour literal."""
+
+SURFACE: Final[str] = "#171B22"
+SURFACE_RAISED: Final[str] = "#272F3C"
+BORDER: Final[str] = "#6C7889"
+TEXT: Final[str] = "#E6EAF0"
+TEXT_MUTED: Final[str] = "#9AA6B6"
+ACCENT: Final[str] = "#F2A50C"
+ACCENT_HOVER: Final[str] = "#D89209"
+TEXT_ON_ACCENT: Final[str] = SURFACE
+
+SPACE_4: Final[int] = 4
+SPACE_8: Final[int] = 8
+SPACE_12: Final[int] = 12
+SPACE_16: Final[int] = 16
+SPACE_24: Final[int] = 24
+SPACE_32: Final[int] = 32
+
+SIZE_DISPLAY: Final[int] = 24
+SIZE_BODY: Final[int] = 14
+SIZE_SMALL: Final[int] = 12
+WEIGHT_NORMAL: Final[str] = "normal"
+WEIGHT_BOLD: Final[str] = "bold"
+
+UI_FAMILIES: Final[tuple[str, ...]] = (
+    "Segoe UI", "SF Pro Text", "Helvetica Neue", "DejaVu Sans", "Helvetica",
+)
+DISPLAY_FAMILIES: Final[tuple[str, ...]] = (
+    "Bahnschrift", "Segoe UI Semibold", "SF Pro Display", "Helvetica Neue",
+    "DejaVu Sans", "Helvetica",
+)
+MONO_FAMILIES: Final[tuple[str, ...]] = (
+    "Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier",
+)
+
+RADIUS_CONTAINER: Final[int] = 10
+RADIUS_CONTROL: Final[int] = 6
+BORDER_WIDTH: Final[int] = 1
+FOCUS_WIDTH: Final[int] = 2
+
+MIN_WINDOW: Final[tuple[int, int]] = (960, 600)
+SIDEBAR_WIDTH: Final[int] = 208
+INSTALLED_PANE_WIDTH: Final[int] = 288
+CONTROL_HEIGHT: Final[int] = 36
+MIN_TARGET: Final[int] = 32
+MOD_ICON_SIZE: Final[int] = 48
+MOD_ROW_HEIGHT: Final[int] = 72
+PROGRESS_HEIGHT: Final[int] = 8
+CRASH_LOG_HEIGHT: Final[int] = 180
+DIALOG_WIDTH: Final[int] = 480
+TEXT_COLUMN_MAX: Final[int] = 560
+
+APPEARANCE_MODE: Final[str] = "dark"
+```
+
+The family constants are tuples rather than lists so they cannot be mutated at import
+time; `resolve_font_family` takes a `list[str]` as the spec's signature requires and any
+sequence satisfies it at the call site via `list(UI_FAMILIES)`.
+
+```python
+def resolve_font_family(candidates: list[str]) -> str:
+    """The first candidate this machine actually has, else the last candidate.
+
+    Raises:
+        ValueError: `candidates` is empty.
+        RuntimeError: called before a Tk root exists — `tkinter.font.families()`
+            needs a live interpreter.
+    """
+```
+
+Normative: compare case-insensitively (`casefold`) against `tkinter.font.families()` and
+return the name **exactly as `families()` spells it**, so the string handed to `CTkFont`
+is one Tk already knows. When nothing matches, return `candidates[-1]` and log at DEBUG;
+every list in this module ends in a Tk-guaranteed alias, which Tk resolves to a real face
+even though it is absent from `families()` — verified on Tk 9.0, where `families()` has no
+`Helvetica` but `Font(family="Helvetica").actual()` returns one. The function never
+returns `""` and never raises for a missing font.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Fonts:
+    """The six fonts the interface uses, built once against a live Tk interpreter."""
+    display: "customtkinter.CTkFont"       # SIZE_DISPLAY, display family, normal — the
+                                           # single screen heading, one per screen
+    body: "customtkinter.CTkFont"          # SIZE_BODY, UI family, normal — all running
+                                           # text, form labels, status lines
+    body_bold: "customtkinter.CTkFont"     # SIZE_BODY, UI family, bold — button labels,
+                                           # mod titles, the selected sidebar item
+    small: "customtkinter.CTkFont"         # SIZE_SMALL, UI family, normal — descriptions,
+                                           # counts, version strings, the memory note
+    mono: "customtkinter.CTkFont"          # SIZE_SMALL, mono family, normal — the game log
+                                           # and the crash tail, and nothing else
+    mono_display: "customtkinter.CTkFont"  # SIZE_DISPLAY, mono family, normal — the device
+                                           # code, and nothing else
+    ui_family: str                         # what UI_FAMILIES resolved to on this machine
+    display_family: str                    # what DISPLAY_FAMILIES resolved to
+    mono_family: str                       # what MONO_FAMILIES resolved to
+
+
+def make_fonts(root: "customtkinter.CTk") -> Fonts:
+    """Resolve the three families on this machine and build the six fonts, once.
+
+    Raises:
+        RuntimeError: `root` has no live Tk interpreter, so the families cannot be read.
+    """
+
+
+def apply_theme() -> None:
+    """Pin CustomTkinter to dark mode. Called once, before the root window is built.
+    Never raises.
+    """
+```
+
+`make_fonts`, normative: it is called exactly once, from `main.py` immediately after the
+`CTk` root is constructed, and the returned `Fonts` is passed down to every screen — no
+module-level font object exists, because a `CTkFont` cannot be built before an
+interpreter does. `root` is a parameter rather than an implicit default so a test can
+build fonts against its own `Tk()`; it is used for `tkinter.font.families(root=root)` and
+for nothing else. The three families are resolved once here, not per widget.
+
+`apply_theme`, normative: sets `customtkinter.set_appearance_mode(APPEARANCE_MODE)` and
+nothing else. It is idempotent and must run before `CTk()` so that no widget is ever
+constructed under the system appearance. It deliberately does **not** call
+`set_default_color_theme`: every widget in `ui/` is given explicit colours from this
+module, so a bundled theme would only supply values nothing reads. Pinning the mode
+matters because CustomTkinter resolves a single-string colour the same way in both modes
+but repaints on a system light/dark change; pinned to `"dark"`, the launcher looks the
+same on every machine.
+
+Two places CustomTkinter paints without being asked, and what each is given:
+
+| Widget | Setting |
+|---|---|
+| `CTk` (the root window) | `configure(fg_color=SURFACE)` in `ui/app.py`. |
+| `CTkScrollableFrame` | `scrollbar_button_color=BORDER`, `scrollbar_button_hover_color=TEXT_MUTED`, `fg_color="transparent"`. |
+
+**The rule this module exists to enforce.** No raw hex colour, no font family name, no
+padding integer, no corner radius and no font size appears anywhere outside `theme.py`.
+`ui/widgets.py`, the three screens and `main.py` import the names. Section 24's
+`tests/test_theme.py` enforces the colour half mechanically: it parses every file under
+`ui/` plus `main.py` with `ast`, walks every string constant, and fails on any that
+matches `^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$`. The same test asserts that
+`resolve_font_family(list(UI_FAMILIES))` returns a member of `tkinter.font.families()` or
+the list's tail, and that every text/background pair in 21.3 still computes to at least
+4.5:1 — the contrast table is a test, not a claim.
 
 ---

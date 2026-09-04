@@ -39,6 +39,10 @@ section.
 | 2026-09-03 | 22 | The running-game button reads **"Stop"** with a separate status label "Running", instead of a single button captioned "Running — Stop" (spec §8). | Spec §13: buttons name what happens; "Running" is a state, not an action. |
 | 2026-09-03 | 15 | Versions whose JSON has no `arguments` block (pre-1.13, `minecraftArguments` string) are launched with `LEGACY_JVM_ARGS` plus the split `minecraftArguments`. Fabric does not exist for them, so `prepare_launch` stops with `ManifestError` ("Fabric doesn't support Minecraft {version}. Pick 1.14 or newer."). | The dropdown lists every release (spec §2); the launcher must fail clearly rather than crash on them. |
 | 2026-09-04 | 16, 21, 22 | `list_installed` (16.6) also accepts children ending in `.zip` and `.zip.disabled`, so the Texture Packs view can list what it installed. For a `.zip` the `fabric.mod.json` read is skipped entirely: `name` comes from the sidecar `title` falling back to the filename stem, `version` from the sidecar `version_number`, `description` is `""` and `id` is `""`. `ui/mods.py` offers no on/off switch in Texture Packs mode, so `set_enabled` is never called on a pack. | Section 21's Texture Packs screen needs an Installed pane and `list_installed` was jar-only; nothing else in section 16 could enumerate a pack. Minecraft turns resource packs on itself, so `.disabled` renaming has no meaning there. |
+| 2026-09-04 | 21, 22 | The Play screen's instance row carries three `SecondaryButton`s — `New`, `Rename`, `Delete` — in the position the `Show snapshots` checkbox occupies on the row above, and `ui/widgets.py` gains a `PromptDialog` (and `AppShell.prompt`) to ask for the name. | Spec §10 requires instances to be created, renamed and deleted from the UI. Section 21's Play wireframe enumerates its widgets exhaustively and omits all four, so this is an addition to that list rather than a reading of it. |
+| 2026-09-04 | 21, 22 | The Play screen's progress detail label shows a percentage (`64%`), not the wireframe's `1,284 of 3,140 files`. | `Progress.done`/`total` arriving from `prepare_launch` is permille — `Reporter` forwards `round(fraction * total_units)` out of `total_units = 1000` (6.2) — and the file and byte counts live inside `Progress.label` (`"Assets — 132.4 MB of 480.1 MB"`, section 14). A file count is not recoverable from the message without parsing its label, and the UI is required never to assume a progress scale. |
+| 2026-09-04 | 18, 22 | `auth.ensure_fresh` runs as the **first statement of the `TASK_LAUNCH` worker**, on a worker thread, rather than on the Tk thread before the task is submitted, as section 18's prose words it. | The invariant section 18 actually needs is that `prepare_launch` receives an already-fresh account so no sign-in can appear from inside a download loop; that still holds. Running a network round-trip on the Tk thread would freeze the window, which spec §5 and section 22's rule 1 forbid. |
+| 2026-09-04 | 21, 23 | `theme.make_fonts(root)` is called from `MaestroApp.__init__` immediately after `super().__init__()`, not from `main.py`. `MaestroApp.__init__` takes `fonts: Fonts \| None = None` so a display test can inject its own. | `MaestroApp` **is** the `CTk` root, so there is no root for `main.py` to pass; section 21's "immediately after the `CTk` root is constructed" is, for this application, inside that constructor. |
 
 ---
 
@@ -5299,5 +5303,3081 @@ matches `^#(?:[0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$`. The same test asserts that
 `resolve_font_family(list(UI_FAMILIES))` returns a member of `tkinter.font.families()` or
 the list's tail, and that every text/background pair in 21.3 still computes to at least
 4.5:1 — the contrast table is a test, not a claim.
+
+---
+
+## 22. The `ui/` package
+
+Modules 21 and 22 in the map. `ui/widgets.py` holds every reusable control;
+`ui/app.py` holds the window; `ui/account.py`, `ui/play.py` and `ui/mods.py` hold one
+screen each. `ui/__init__.py` exports `MaestroApp` and nothing else.
+
+Four rules govern every line in this package. They are repeated at each point where
+they bite, because each one is a bug that only shows up on a user's machine.
+
+1. **The Tk thread is the only code that mutates a widget.** No function in `ui/` is
+   called from a worker thread except `TaskRunner.progress_fn`'s returned callable and
+   `queue.put`, neither of which touches a widget. Worker functions submitted from a
+   screen live at module level in that screen's module, take only plain data, and
+   return only plain data. They never close over a widget, a `StringVar`, a `CTkImage`
+   or `self`. A worker returns bytes; the UI thread turns bytes into a `CTkImage`.
+2. **Every long operation goes through `TaskRunner`** (section 20) with
+   `progress=runner.progress_fn(task_id)` and `cancel=runner.token(task_id)`, and every
+   operation that can report a total drives a determinate `CTkProgressBar`. There is no
+   spinner widget anywhere in this package, and no operation shows an indeterminate bar.
+   Operations that genuinely have no measurable total (a search, a directory listing)
+   show a **text** state — `Searching`, `Loading` — never an animation.
+3. **The UI never assumes a progress scale.** `Progress.done` is permille (0–1000) when
+   the worker reported through a `Reporter` (section 6.2), a step number out of five for
+   `auth.sign_in`, and a file count for `check_updates`. Every consumer computes
+   `done / total` when `total > 0` and does nothing when `total == 0` except update the
+   label, exactly as section 4 requires.
+4. **No raw hex, no font family name, no padding integer, no corner radius and no font
+   size appears in this package.** Every one comes from `theme.py` (section 21.12) by
+   name. `tests/test_theme.py` (section 24) fails the build on any string under `ui/`
+   that looks like a colour literal.
+
+The window is `MaestroApp`, a `ctk.CTk` subclass. Each screen is a `ctk.CTkFrame`
+subclass gridded into the content column at `row=0, column=1, sticky="nsew"` and hidden
+with `grid_remove()`. Screens **never import one another** (section 1) and never import
+`ui.app`; everything a screen needs from the window it reaches through the `AppShell`
+protocol defined in `ui/widgets.py`, so the import direction stays strictly one way.
+
+### 22.1 `ui/widgets.py`
+
+```python
+ICON_CACHE_CAPACITY: Final[int] = 64      # project icons held as CTkImage, LRU
+COPIED_FEEDBACK_MS: Final[int] = 2000     # how long a copy button reads "Copied"
+FOCUS_KEYS: Final[tuple[str, ...]] = ("<Return>", "<KP_Enter>", "<space>")
+INNER_WIDGET_ATTRS: Final[tuple[str, ...]] = ("_entry", "_textbox", "_canvas")
+COUNT_WORDS: Final[tuple[str, ...]] = (
+    "no", "one", "two", "three", "four", "five",
+    "six", "seven", "eight", "nine", "ten",
+)
+
+SCREEN_ACCOUNT: Final[str] = "account"
+SCREEN_PLAY: Final[str] = "play"
+SCREEN_MODS: Final[str] = "mods"
+SCREEN_PACKS: Final[str] = "texturepacks"
+SCREEN_ORDER: Final[tuple[str, ...]] = (SCREEN_PLAY, SCREEN_MODS, SCREEN_PACKS)
+NAV_ITEMS: Final[tuple[tuple[str, str], ...]] = (
+    (SCREEN_PLAY, "Play"),
+    (SCREEN_MODS, "Mods"),
+    (SCREEN_PACKS, "Texture Packs"),
+)
+LABEL_SIGN_IN: Final[str] = "Sign in"
+LABEL_CANCEL: Final[str] = "Cancel"
+LABEL_CLOSE: Final[str] = "Close"
+LABEL_COPIED: Final[str] = "Copied"
+```
+
+The four `SCREEN_*` keys live **here**, in module 21, rather than in `ui/app.py`: a
+screen has to be able to say `app.show(SCREEN_ACCOUNT)` and screens may not import
+`ui.app` (section 1). `ui/app.py` re-exports all six names, so `ui.app.SCREEN_PLAY` is
+valid without a second literal.
+
+The four shared labels live here for the same reason. `Sign in` is the sidebar's account
+row, the Account screen's primary button *and* the Play screen's "you aren't signed in"
+banner action; `Cancel` is the default quiet label of every dialog and the Account and
+Play screens' cancel buttons; `Close` is the error dialog's only button; `Copied` is what
+both `Copy code` and `Copy log` become for `COPIED_FEEDBACK_MS`. Each is one literal
+imported by three modules rather than three literals that can drift apart. Every other
+string in the interface belongs to exactly one screen and is defined in that screen's
+module.
+
+`ICON_CACHE_CAPACITY` is the literal `64`. A search page holds 20 hits and the Installed
+pane rarely exceeds 40 mods, so 64 covers a full page plus the pane plus a page of
+scrollback without a refetch, and 64 icons at 48×48 RGBA is about 590 KB — a size worth
+holding to keep a scroll from hitting Modrinth again.
+
+#### 22.1.1 The focus ring
+
+Section 21.6 fixes the appearance (`border_width=FOCUS_WIDTH`, `border_color=ACCENT`,
+drawn inside the widget's own box so nothing moves) and requires that every focusable
+control does three things: take keyboard focus, swap its border to the ring on
+`<FocusIn>` and back on `<FocusOut>`, and fire its command on `<Return>` and `<space>`.
+This is where all three live, in one place, for every control in the app.
+
+```python
+def focus_target(widget: "ctk.CTkBaseClass") -> "tkinter.Misc":
+    """The real Tk widget that takes focus and receives key events for a CTk widget.
+
+    Raises:
+        nothing.
+    """
+
+def attach_focus_ring(
+    widget: "ctk.CTkBaseClass",
+    *,
+    command: Callable[[], None] | None = None,
+    ring_on: "ctk.CTkBaseClass | None" = None,
+) -> None:
+    """Make `widget` keyboard-reachable and paint the section 21.6 focus ring on it.
+
+    Raises:
+        nothing.
+    """
+```
+
+`focus_target`, normative. CustomTkinter 6.0.0 composes each widget from real Tk
+widgets and forwards `CTkBaseClass.bind` to the inner one; the outer `tkinter.Frame`
+never receives a key event and never takes focus. `focus_target` returns the first
+attribute of `INNER_WIDGET_ATTRS` the widget actually has, and the widget itself when it
+has none:
+
+| CTk class | Inner widget | Attribute |
+|---|---|---|
+| `CTkEntry` | `tkinter.Entry` | `_entry` |
+| `CTkTextbox` | `tkinter.Text` | `_textbox` |
+| `CTkButton`, `CTkOptionMenu`, `CTkSwitch`, `CTkCheckBox`, `CTkSlider`, `CTkFrame`, `CTkProgressBar` | `tkinter.Canvas` | `_canvas` |
+
+These are private attribute names and that is stated rather than hidden: CustomTkinter
+6.0.0 exposes no public accessor for the inner widget, and `widget.bind(...)` already
+reaches it. Keeping the knowledge in this one function means a CustomTkinter upgrade is
+a one-line change here and nowhere else. Verified on the development machine against
+CustomTkinter 6.0.0 / Tk 9.0: setting `takefocus=True` on the inner widget puts the
+control in the Tab order in creation order, and `<FocusIn>` / `<FocusOut>` fire on it.
+
+`attach_focus_ring`, normative:
+
+1. `target = focus_target(widget)`; `target.configure(takefocus=True)`. This is what
+   puts the control in the Tab chain. Tab order is creation order inside each container,
+   which is why every screen builds its widgets in reading order.
+2. The widget's current `border_width` and `border_color` are read once with `cget` and
+   remembered. `ring_on` names the widget that should *paint* the ring when the focused
+   control has no border of its own — a `FocusFrame` passes itself; everything else
+   leaves it `None` and paints on itself.
+3. `<FocusIn>` sets `border_width=FOCUS_WIDTH, border_color=ACCENT` on the painting
+   widget. `<FocusOut>` restores the two remembered values exactly. A control whose
+   border is part of its identity (an entry, a `SecondaryButton`) therefore returns to
+   `BORDER_WIDTH` / `BORDER`, and an accent-filled button returns to no border at all.
+4. When `command` is given, each sequence in `FOCUS_KEYS` is bound on `target` to a
+   handler that calls `command()` and returns `"break"`. `<space>` is **not** bound on a
+   `CTkEntry` or a `CTkTextbox` — typing a space there must insert a space — so
+   `attach_focus_ring` skips `<space>` whenever `focus_target` resolved through `_entry`
+   or `_textbox`.
+5. Every bind uses `add="+"`, which CustomTkinter's `bind` already enforces, so the
+   widget's own internal handlers keep working.
+6. It never raises: a widget that cannot be configured is logged at DEBUG and left alone.
+
+**The 32 × 32 rule.** No clickable thing in the application is smaller than
+`MIN_TARGET` (32) in either dimension. Every constructor in this module that produces a
+clickable widget passes `height=CONTROL_HEIGHT` (36) and a `width` of at least
+`MIN_TARGET`, and clamps a caller-supplied `width` up to `MIN_TARGET`. That includes the
+small ones the rule exists for: the Installed pane's `Remove` button, the `CTkSwitch`
+(wrapped in a `FocusFrame` whose own height is `CONTROL_HEIGHT`), and the sidebar's
+account row.
+
+```python
+class FocusFrame(ctk.CTkFrame):
+    """A ring-painting wrapper for a control that has no border of its own."""
+
+    def __init__(self, master: Any) -> None:
+        """A transparent `CTkFrame` at `RADIUS_CONTROL` that will paint the focus ring.
+
+        Raises:
+            nothing.
+        """
+
+    def adopt(
+        self, child: "ctk.CTkBaseClass", *, command: Callable[[], None] | None = None
+    ) -> None:
+        """Grid `child` inside with `SPACE_4` of inset and route its focus ring to this frame.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def child(self) -> "ctk.CTkBaseClass | None":
+        """The adopted control, or None before `adopt`."""
+```
+
+`FocusFrame` exists for exactly the two widgets section 21.6 names, `CTkSwitch` and
+`CTkSlider`, plus the mod-browser row (a `CTkFrame` that is clickable as a whole).
+`adopt` grids the child with `padx=SPACE_4, pady=SPACE_4` — the ring inset from section
+21.4 — and calls `attach_focus_ring(child, command=command, ring_on=self)`.
+
+#### 22.1.2 Buttons
+
+```python
+class PrimaryButton(ctk.CTkButton):
+    """The one accent-filled action in a pane. Section 21.2's accent invariant applies."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        text: str,
+        command: Callable[[], None] | None = None,
+        width: int | None = None,
+    ) -> None:
+        """An accent button: ACCENT fill, ACCENT_HOVER on pointer, TEXT_ON_ACCENT label.
+
+        Raises:
+            nothing.
+        """
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable, swapping the fill to SURFACE_RAISED and the label to TEXT_MUTED.
+
+        Raises:
+            nothing.
+        """
+
+    def set_text(self, text: str) -> None:
+        """Change the label. The verb must survive the flow (section 21.9).
+
+        Raises:
+            nothing.
+        """
+
+
+class SecondaryButton(ctk.CTkButton):
+    """A quiet outline button: everything that is not the one primary action."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        text: str,
+        command: Callable[[], None] | None = None,
+        width: int | None = None,
+    ) -> None:
+        """An outline button: transparent fill, BORDER outline, TEXT label.
+
+        Raises:
+            nothing.
+        """
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Enable or disable, swapping the label to TEXT_MUTED.
+
+        Raises:
+            nothing.
+        """
+
+    def set_text(self, text: str) -> None:
+        """Change the label.
+
+        Raises:
+            nothing.
+        """
+```
+
+Fixed construction values, which are the whole reason these two classes exist:
+
+| Property | `PrimaryButton` | `SecondaryButton` |
+|---|---|---|
+| `fg_color` | `ACCENT` | `"transparent"` |
+| `hover_color` | `ACCENT_HOVER` | `SURFACE_RAISED` |
+| `text_color` | `TEXT_ON_ACCENT` | `TEXT` |
+| `text_color_disabled` | `TEXT_MUTED` | `TEXT_MUTED` |
+| `border_width` | `0` | `BORDER_WIDTH` |
+| `border_color` | not set | `BORDER` |
+| `corner_radius` | `RADIUS_CONTROL` | `RADIUS_CONTROL` |
+| `height` | `CONTROL_HEIGHT` | `CONTROL_HEIGHT` |
+| `font` | `fonts.body_bold` | `fonts.body_bold` |
+
+`width` is passed through when given and clamped up to `MIN_TARGET`; when `None`,
+CustomTkinter's own width applies. Both constructors call
+`attach_focus_ring(self, command=command)` last, so a button is Tab-reachable and fires
+on Return and Space.
+
+`set_enabled(False)` on a `PrimaryButton` sets `state="disabled"` **and**
+`fg_color=SURFACE_RAISED`; the accent leaves the button entirely, which is what section
+21.2's accent invariant means by "the accent moves to the progress bar". `set_enabled(True)`
+restores `fg_color=ACCENT`. On a `SecondaryButton` only `state` changes; the outline
+stays, and the label goes muted through `text_color_disabled`.
+
+#### 22.1.3 Sidebar
+
+```python
+class Sidebar(ctk.CTkFrame):
+    """The fixed navigation column and the account row pinned to its bottom."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        items: Sequence[tuple[str, str]],
+        on_select: Callable[[str], None],
+        on_account: Callable[[], None],
+    ) -> None:
+        """`items` are (screen key, label) pairs in navigation order.
+
+        Raises:
+            nothing.
+        """
+
+    def select(self, key: str) -> None:
+        """Mark one item selected; an unknown key clears the selection.
+
+        Raises:
+            nothing.
+        """
+
+    def set_account_label(self, text: str) -> None:
+        """Set the bottom row's label — the player's name, or "Sign in".
+
+        Raises:
+            nothing.
+        """
+```
+
+Normative. The frame is `SURFACE_RAISED` at `corner_radius=0` with
+`width=SIDEBAR_WIDTH` and `grid_propagate(False)`, so it never resizes with its content.
+The title `MaestroLauncher` sits at the top in `fonts.body_bold` / `TEXT`, padded
+`SPACE_16`. Items are `CTkButton`s at `corner_radius=0`, `border_width=0`,
+`fg_color="transparent"`, `hover_color=SURFACE`, `anchor="w"`,
+`height=CONTROL_HEIGHT`, each calling `on_select(key)`.
+
+Selection is marked **without colour**, exactly as section 21.8 requires: the selected
+row's `fg_color` becomes `SURFACE` — the content-area ground, so the content surface
+appears to continue into the sidebar — and its label goes from `TEXT_MUTED` /
+`fonts.body` to `TEXT` / `fonts.body_bold`. No accent is ever set on any sidebar widget.
+
+The account row is pinned to the bottom with `sticky="sew"` above a 1 px `BORDER` rule,
+separated from the items by `SPACE_16`. It is a `CTkButton` with the same flat styling
+calling `on_account()`, and its label is the signed-in player's name or the exact string
+`Sign in`. Both the items and the account row get `attach_focus_ring`.
+
+`items` for this application is
+`((SCREEN_PLAY, "Play"), (SCREEN_MODS, "Mods"), (SCREEN_PACKS, "Texture Packs"))`,
+in that order — by frequency, not by prerequisite (section 21.8).
+
+#### 22.1.4 Empty state and banner
+
+```python
+class EmptyState(ctk.CTkFrame):
+    """An invitation shown where a list has nothing in it — never a blank panel."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        text: str = "",
+        action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """A transparent frame holding wrapped muted text and at most one quiet button.
+
+        Raises:
+            nothing.
+        """
+
+    def set_text(self, text: str) -> None:
+        """Replace the invitation text.
+
+        Raises:
+            nothing.
+        """
+
+
+class Banner(ctk.CTkFrame):
+    """The one in-place notice per screen: a Sodium notice, or an error with a next action."""
+
+    def __init__(self, master: Any, fonts: Fonts) -> None:
+        """A SURFACE_RAISED frame with a BORDER outline at RADIUS_CONTAINER, hidden at first.
+
+        Raises:
+            nothing.
+        """
+
+    def show(
+        self,
+        text: str,
+        *,
+        action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show `text` and, when `action_label` is given, one quiet button beside it.
+
+        Raises:
+            nothing.
+        """
+
+    def hide(self) -> None:
+        """Remove the banner from the layout with `grid_remove()`.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def visible(self) -> bool:
+        """True between `show()` and `hide()`."""
+```
+
+`EmptyState` text is `fonts.small` / `TEXT_MUTED`, `justify="left"`, with
+`wraplength=TEXT_COLUMN_MAX`. Its optional button is a `SecondaryButton`.
+
+`Banner` is section 21.9's error presentation and section 17's Sodium notice in one
+widget: a `SURFACE_RAISED` frame, `border_width=BORDER_WIDTH`, `border_color=BORDER`,
+`corner_radius=RADIUS_CONTAINER`, message in `fonts.body` / `TEXT` with
+`wraplength=TEXT_COLUMN_MAX`, and at most one `SecondaryButton`. **No red, no icon, no
+colour coding** — position (directly under the screen heading) and wording do the work.
+It carries no accent, so a banner never violates the accent invariant.
+
+#### 22.1.5 Code label
+
+```python
+class CodeLabel(ctk.CTkFrame):
+    """The device code, in the one place monospace at display size is allowed."""
+
+    def __init__(self, master: Any, fonts: Fonts) -> None:
+        """A SURFACE_RAISED block at RADIUS_CONTAINER holding the code in `fonts.mono_display`.
+
+        Raises:
+            nothing.
+        """
+
+    def set_code(self, code: str) -> None:
+        """Set the code shown. An empty string blanks the label but keeps the block sized.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def code(self) -> str:
+        """The code currently shown; "" when there is none."""
+```
+
+The label is `fonts.mono_display` (`SIZE_DISPLAY`, mono family) in `TEXT` on
+`SURFACE_RAISED` — 11.16:1, section 21.3 — padded `SPACE_24` horizontally and
+`SPACE_16` vertically. The code is a label, not an entry: it is copied with the
+`Copy code` button, which is a target the keyboard reaches, rather than by a selection
+gesture that a keyboard user cannot make.
+
+#### 22.1.6 Icon cache
+
+```python
+class IconCache:
+    """An LRU of project icons, keyed by Modrinth project id. UI thread only."""
+
+    def __init__(
+        self,
+        capacity: int = ICON_CACHE_CAPACITY,
+        *,
+        size: int = MOD_ICON_SIZE,
+    ) -> None:
+        """Bind the cache to the calling thread and hold at most `capacity` images.
+
+        Raises:
+            ValueError: `capacity` is below 1.
+        """
+
+    def get(self, project_id: str) -> "ctk.CTkImage | None":
+        """The cached image for this project, marking it most-recently-used, or None.
+
+        Raises:
+            RuntimeError: called from a thread other than the one that built the cache.
+        """
+
+    def put(self, project_id: str, data: bytes) -> "ctk.CTkImage | None":
+        """Decode `data`, build a `CTkImage`, cache it and return it; None when undecodable.
+
+        Raises:
+            RuntimeError: called from a thread other than the one that built the cache.
+        """
+
+    def has(self, project_id: str) -> bool:
+        """True when this project's icon is cached, without changing its LRU position."""
+
+    def clear(self) -> None:
+        """Drop every cached image."""
+
+    def __len__(self) -> int:
+        """How many images are cached."""
+
+    @property
+    def capacity(self) -> int:
+        """The LRU capacity — `ICON_CACHE_CAPACITY` unless a test overrode it."""
+```
+
+Normative, and this is the trap the class exists to make impossible:
+
+1. `__init__` records `threading.get_ident()`. `get` and `put` compare against it and
+   raise `RuntimeError` when they differ. `IconCache` is constructed by `MaestroApp` on
+   the Tk thread, so **any** attempt to build or read a `CTkImage` from a worker fails
+   loudly and immediately instead of corrupting the interpreter intermittently. A worker
+   that fetched icon bytes returns those bytes; the UI thread calls `put`.
+2. Storage is a `collections.OrderedDict[str, ctk.CTkImage]`. `get` and `put` call
+   `move_to_end`; `put` evicts with `popitem(last=False)` while `len(self) > capacity`.
+3. `put` decodes `data` with `PIL.Image.open(io.BytesIO(data))`, converts to `"RGBA"`,
+   resizes to `(size, size)` with `Image.Resampling.LANCZOS`, and builds
+   `ctk.CTkImage(light_image=image, dark_image=image, size=(size, size))`. Both
+   arguments get the same image: the launcher is pinned to dark mode (section 21.12
+   `APPEARANCE_MODE`) and a one-argument `CTkImage` warns.
+4. Modrinth icons are `.webp`; Pillow 12.3.0 decodes WebP, which is why `Pillow` is a
+   pinned dependency (section 25) rather than an optional extra.
+5. Undecodable, empty or truncated bytes return `None` and log at DEBUG. Nothing is
+   cached, nothing is shown to the user, and the row keeps its placeholder block. A
+   broken icon is not an error a player needs to be told about.
+6. The cache is owned by `MaestroApp` and shared by both `ModsScreen` instances, so
+   switching between Mods and Texture Packs refetches nothing.
+7. There is no placeholder `CTkImage`. A row with no icon yet shows an empty
+   `CTkLabel` sized `MOD_ICON_SIZE` with `fg_color=SURFACE_RAISED` and
+   `corner_radius=RADIUS_CONTROL`, which needs no image and no decoding.
+
+#### 22.1.7 Dialogs
+
+Three modal dialogs, all `ctk.CTkToplevel`, all `DIALOG_WIDTH` wide.
+
+```python
+class ModalDialog(ctk.CTkToplevel):
+    """Base of the launcher's modal dialogs: heading, body, optional lines, two buttons."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        title: str,
+        body: str,
+        lines: Sequence[str] = (),
+        confirm_label: str = "",
+        cancel_label: str = LABEL_CANCEL,
+    ) -> None:
+        """Build the dialog; it is not shown until `ask()` runs.
+
+        Raises:
+            nothing.
+        """
+
+    def ask(self) -> bool:
+        """Show the dialog modally and block until it closes; True when confirmed.
+
+        Raises:
+            nothing.
+        """
+
+
+class ConfirmDialog(ModalDialog):
+    """A yes/no question whose accent button names exactly what will happen."""
+
+
+class ErrorDialog(ModalDialog):
+    """A failure with nothing to decide: one quiet `Close` button."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        title: str,
+        body: str,
+        detail: str = "",
+    ) -> None:
+        """A dialog with no accent button; `detail` is shown in `fonts.small` when given.
+
+        Raises:
+            nothing.
+        """
+
+
+class PromptDialog(ModalDialog):
+    """A one-line text question — the only place the launcher asks for a typed value."""
+
+    def __init__(
+        self,
+        master: Any,
+        fonts: Fonts,
+        *,
+        title: str,
+        body: str,
+        initial: str = "",
+        placeholder: str = "",
+        confirm_label: str,
+        validate: Callable[[str], str] | None = None,
+    ) -> None:
+        """`validate` returns "" for an acceptable value or the message to show under the entry.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def value(self) -> str:
+        """The trimmed text the user confirmed; "" when the dialog was cancelled."""
+
+
+def ask_confirm(
+    master: Any, fonts: Fonts, *, title: str, body: str,
+    lines: Sequence[str] = (), confirm_label: str, cancel_label: str = LABEL_CANCEL,
+) -> bool:
+    """Build a `ConfirmDialog`, show it modally, and return the answer.
+
+    Raises:
+        nothing.
+    """
+
+def show_error_dialog(
+    master: Any, fonts: Fonts, *, title: str, body: str, detail: str = ""
+) -> None:
+    """Build an `ErrorDialog` and show it modally.
+
+    Raises:
+        nothing.
+    """
+
+def ask_text(
+    master: Any, fonts: Fonts, *, title: str, body: str, initial: str = "",
+    placeholder: str = "", confirm_label: str,
+    validate: Callable[[str], str] | None = None,
+) -> str | None:
+    """Build a `PromptDialog`, show it modally, and return the trimmed value or None.
+
+    Raises:
+        nothing.
+    """
+```
+
+Modal behaviour, normative and identical for all three:
+
+1. `title(title)`, `resizable(False, False)`, `configure(fg_color=SURFACE)`,
+   `transient(master)`, and geometry centred over the master's current window rectangle,
+   clamped so the dialog is fully on screen.
+2. The heading is `title` in `fonts.body_bold` / `TEXT`; the body is `fonts.body` /
+   `TEXT` wrapped at `TEXT_COLUMN_MAX`; `lines` are `fonts.small` / `TEXT_MUTED`, one
+   `CTkLabel` per line, in the order given. `InstallPlan.describe()` (section 16.2)
+   produces the lines for the dependency dialog and its per-line format is that method's,
+   not this one's.
+3. Buttons sit on one row at the bottom right: the cancel `SecondaryButton` first, then
+   the confirm `PrimaryButton`. `ErrorDialog` has only a `SecondaryButton` reading
+   `LABEL_CLOSE` (`Close`), so an error dialog carries no accent.
+4. `grab_set()` makes it modal; `<Escape>` and `WM_DELETE_WINDOW` both cancel;
+   `<Return>` confirms. Initial focus is the confirm button, or the entry for a
+   `PromptDialog`.
+5. `ask()` calls `wait_window(self)` and returns the recorded answer. **`wait_window`
+   re-enters the Tk event loop**, so `MaestroApp._drain_queue` keeps running while a
+   dialog is open: a download behind the dialog keeps updating its progress bar, and
+   `_drain_queue`'s re-entrancy guard (section 22.2) is what keeps that from producing
+   two timer chains.
+6. A `PromptDialog` with a `validate` callback runs it on confirm; a non-empty return
+   value is shown in `fonts.small` / `TEXT` directly under the entry and the dialog stays
+   open. The message is the `user_message` of the `InstanceError` that
+   `core.instances.validate_name` would raise (section 17.2), so the wording is the
+   contract's, not the dialog's.
+7. `grab_release()` and `destroy()` run in a `finally`, so a dialog can never leave the
+   application grabbed.
+
+#### 22.1.8 The app shell protocol
+
+```python
+class AppShell(Protocol):
+    """What a screen is allowed to ask of the window. Screens never import `ui.app`."""
+
+    paths: Paths
+    config: Config
+    http: Http
+    runner: TaskRunner
+    store: AccountStore
+    instances: InstanceManager
+    modrinth: ModrinthClient
+    fonts: Fonts
+    icons: IconCache
+    account: Account | None
+    bootstrap_bundled: bool
+
+    def show(self, name: str) -> None: ...
+    def set_account(self, account: Account | None) -> None: ...
+    def save_config(self) -> None: ...
+    def game_version(self) -> str: ...
+    def set_game_version(self, version_id: str) -> None: ...
+    def current_instance(self) -> Instance | None: ...
+    def instance_changed(self) -> None: ...
+    def show_error(self, title: str, message: str, *, detail: str = "") -> None: ...
+    def confirm(
+        self, title: str, body: str, *, confirm_label: str,
+        cancel_label: str = LABEL_CANCEL, lines: Sequence[str] = (),
+    ) -> bool: ...
+    def prompt(
+        self, title: str, body: str, *, confirm_label: str, initial: str = "",
+        placeholder: str = "", validate: Callable[[str], str] | None = None,
+    ) -> str | None: ...
+```
+
+`AppShell` lives in `ui/widgets.py` — module 21 — so `ui/account.py`, `ui/play.py` and
+`ui/mods.py` (module 22) can type their `app` parameter without importing `ui.app`, at
+runtime or under `TYPE_CHECKING`. `MaestroApp` satisfies it structurally; nothing
+declares the inheritance.
+
+#### 22.1.9 Formatting helpers
+
+```python
+def format_count(n: int) -> str:
+    """A download count for a browser row: '843', '9.4K', '4.2M'. Never a joined string."""
+
+def count_word(n: int) -> str:
+    """The English word for a small count: 0-10 from COUNT_WORDS, otherwise `str(n)`."""
+
+def copy_to_clipboard(widget: "tkinter.Misc", text: str) -> bool:
+    """Put `text` on the system clipboard; False when the clipboard refused it."""
+
+def open_url(url: str) -> bool:
+    """Open `url` in the user's browser with `webbrowser.open`; False when it failed."""
+```
+
+`format_count`: below 1,000 the integer itself; below 1,000,000 `f"{n / 1_000:.1f}K"`;
+otherwise `f"{n / 1_000_000:.1f}M"`; a trailing `".0"` is dropped in both scaled forms,
+so 9,000,000 is `9M` and 9,100,000 is `9.1M`. Negative input is treated as 0.
+
+`copy_to_clipboard` calls `widget.clipboard_clear()` then `widget.clipboard_append(text)`
+then `widget.update_idletasks()` — the last call matters on Windows, where a clipboard
+written without an event-loop turn is lost when the process is not idle. `tkinter.TclError`
+returns `False`. `open_url` catches `webbrowser.Error` and `OSError` and returns `False`.
+Neither raises, because failing to copy is a thing to report in the button label, not an
+exception to propagate.
+
+### 22.2 `ui/app.py`
+
+```python
+from ui.widgets import (                  # re-exported; the literals live in module 21
+    LABEL_CANCEL, LABEL_SIGN_IN, NAV_ITEMS, SCREEN_ACCOUNT, SCREEN_MODS,
+    SCREEN_ORDER, SCREEN_PACKS, SCREEN_PLAY,
+)
+
+DRAIN_INTERVAL_MS: Final[int] = 50        # spec section 5: `after(50, self._drain_queue)`
+WINDOW_TITLE: Final[str] = "MaestroLauncher"
+GENERIC_ERROR_TITLE: Final[str] = "Something went wrong"
+CLOSE_WITH_GAME_TITLE: Final[str] = "Close the launcher?"
+CLOSE_WITH_GAME_BODY: Final[str] = (
+    "Minecraft is still running. It keeps running if you close the launcher."
+)
+CLOSE_WITH_GAME_CONFIRM: Final[str] = "Close launcher"
+CLOSE_WITH_GAME_CANCEL: Final[str] = "Keep it open"
+CONFIG_SAVE_ERROR_TITLE: Final[str] = "Couldn't save settings"
+ACCOUNT_SAVE_ERROR_TITLE: Final[str] = "Couldn't save your account"
+```
+
+#### 22.2.1 `MaestroApp`
+
+```python
+class MaestroApp(ctk.CTk):
+    """The launcher window: the sidebar, the three screens, and the only queue drain."""
+
+    def __init__(
+        self,
+        paths: Paths,
+        config: Config,
+        *,
+        http: Http,
+        runner: TaskRunner,
+        store: AccountStore,
+        instances: InstanceManager,
+        modrinth: ModrinthClient,
+        account: Account | None = None,
+        bootstrap_bundled: bool = False,
+        fonts: Fonts | None = None,
+    ) -> None:
+        """Build the window, the fonts, the sidebar and the three screens.
+
+        Raises:
+            tkinter.TclError: Tk could not create a window — no display, no window
+                station. Deliberately unwrapped: there is no interface in which to
+                show a `LauncherError`, and `main.py` reports it (section 23.5).
+        """
+
+    def run(self) -> None:
+        """Start the drain loop and enter `mainloop()`. Returns when the window closes.
+
+        Raises:
+            nothing.
+        """
+
+    def show(self, name: str) -> None:
+        """Make one screen visible, hiding the previous one and marking the sidebar.
+
+        Raises:
+            KeyError: `name` is not a registered screen key.
+        """
+
+    def dispatch(self, message: UIMessage) -> None:
+        """Route one queue message to the screen that owns it.
+
+        Raises:
+            nothing.
+        """
+
+    def show_error(self, title: str, message: str, *, detail: str = "") -> None:
+        """Open a modal `ErrorDialog`. For failures no screen owns.
+
+        Raises:
+            nothing.
+        """
+
+    def show_banner(
+        self,
+        text: str,
+        *,
+        screen: str | None = None,
+        action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show a `Banner` on `screen` (default: the visible one).
+
+        Raises:
+            nothing.
+        """
+
+    def clear_banner(self, *, screen: str | None = None) -> None:
+        """Hide the banner on `screen` (default: the visible one).
+
+        Raises:
+            nothing.
+        """
+
+    def confirm(
+        self,
+        title: str,
+        body: str,
+        *,
+        confirm_label: str,
+        cancel_label: str = LABEL_CANCEL,
+        lines: Sequence[str] = (),
+    ) -> bool:
+        """Ask a modal yes/no question; True when the accent button was pressed.
+
+        Raises:
+            nothing.
+        """
+
+    def prompt(
+        self,
+        title: str,
+        body: str,
+        *,
+        confirm_label: str,
+        initial: str = "",
+        placeholder: str = "",
+        validate: Callable[[str], str] | None = None,
+    ) -> str | None:
+        """Ask modally for one line of text; None when cancelled.
+
+        Raises:
+            nothing.
+        """
+
+    def set_account(self, account: Account | None) -> None:
+        """Adopt a signed-in account (or none), update the sidebar and persist the choice.
+
+        Raises:
+            nothing.
+        """
+
+    def save_config(self) -> None:
+        """Write `config.json`; a failure opens an error dialog rather than propagating.
+
+        Raises:
+            nothing.
+        """
+
+    def game_version(self) -> str:
+        """The Minecraft version the Mods screens filter by; "" when it is not known yet.
+
+        Raises:
+            nothing.
+        """
+
+    def set_game_version(self, version_id: str) -> None:
+        """Record the resolved version and tell both Mods screens to refilter.
+
+        Raises:
+            nothing.
+        """
+
+    def current_instance(self) -> Instance | None:
+        """The instance named by `config.selected_instance`, or None when it is gone.
+
+        Raises:
+            nothing.
+        """
+
+    def instance_changed(self) -> None:
+        """Tell every screen the selected instance or its contents changed.
+
+        Raises:
+            nothing.
+        """
+
+    def on_close(self) -> None:
+        """Save the window size, shut the runner down, close `Http`, and destroy the window.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def screens(self) -> Mapping[str, Screen]:
+        """The screen registry, keyed by `SCREEN_*`."""
+
+    @property
+    def current_screen(self) -> str:
+        """The key of the visible screen; "" before the first `show()`."""
+```
+
+```python
+class Screen(Protocol):
+    """What `MaestroApp` requires of a screen. Every screen is also a `ctk.CTkFrame`."""
+
+    def on_show(self) -> None:
+        """The screen became visible: load what it needs, once."""
+
+    def on_hide(self) -> None:
+        """The screen was hidden: stop timers, cancel a debounce, keep tasks running."""
+
+    def handle(self, message: UIMessage) -> None:
+        """Act on one message `dispatch` decided belongs to this screen."""
+
+    def set_banner(
+        self, text: str, *, action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show this screen's banner."""
+
+    def clear_banner(self) -> None:
+        """Hide this screen's banner."""
+
+    def instance_changed(self) -> None:
+        """The selected instance or its contents changed; reload on next show."""
+```
+
+#### 22.2.2 Construction
+
+Normative, in this order:
+
+1. `super().__init__()`. `theme.apply_theme()` has already run in `main.py` (section 23)
+   and must have, because CustomTkinter resolves colours at widget-construction time.
+2. `self.fonts = fonts if fonts is not None else theme.make_fonts(self)`. Section 21
+   states that `make_fonts` is called once, immediately after the `CTk` root exists;
+   `MaestroApp` **is** that root, so the call is here and not in `main.py` (section 0
+   amendment, 2026-09-04). The `fonts` parameter exists so a display test can build the
+   window against fonts it made itself.
+3. `self.title(WINDOW_TITLE)`; `self.minsize(*MIN_WINDOW)`;
+   `self.geometry(f"{config.window_width}x{config.window_height}")`;
+   `self.configure(fg_color=SURFACE)`. `MIN_WINDOW` is `(960, 600)` and the config
+   defaults are 1040 × 680, so the stored size is never below the minimum (section 21.7).
+4. `self.icons = IconCache()` — built here, on the Tk thread, which is what its thread
+   guard then enforces for the life of the process.
+5. Grid: column 0 is the `Sidebar` (`SIDEBAR_WIDTH`, `weight=0`), column 1 is the content
+   area (`weight=1`); row 0 has `weight=1`. A 1 px `CTkFrame` in `BORDER` sits between
+   them as the dividing line (section 21.2).
+6. The screens are constructed once, in `SCREEN_ORDER` then `SCREEN_ACCOUNT`, gridded
+   into column 1 and immediately `grid_remove()`d:
+
+   | Key | Class | Constructed as |
+   |---|---|---|
+   | `SCREEN_PLAY` | `ui.play.PlayScreen` | `PlayScreen(content, self, self.fonts)` |
+   | `SCREEN_MODS` | `ui.mods.ModsScreen` | `ModsScreen(content, self, self.fonts, kind=KIND_MOD)` |
+   | `SCREEN_PACKS` | `ui.mods.ModsScreen` | `ModsScreen(content, self, self.fonts, kind=KIND_RESOURCEPACK)` |
+   | `SCREEN_ACCOUNT` | `ui.account.AccountScreen` | `AccountScreen(content, self, self.fonts)` |
+
+   Both Mods screens are separate instances of the same class differing only in `kind`,
+   which is section 21.8's "four sidebar entries, three screen modules".
+7. `self.set_account(account)` without persisting — the account came from the store.
+8. `self.protocol("WM_DELETE_WINDOW", self.on_close)` and `self.bind("<Control-q>", …)`
+   routed to the same handler.
+9. `bootstrap_bundled` is stored and read once by `PlayScreen` (section 22.4); the window
+   itself never schedules a task.
+10. `MaestroApp` does not call `show()`; `main.py` does, choosing Account or Play.
+
+#### 22.2.3 The drain loop
+
+Spec section 5 is exact about this and so is the implementation. `run()` schedules the
+first tick and enters `mainloop()`; every tick is `self.after(DRAIN_INTERVAL_MS,
+self._drain_queue)`, self-rescheduling.
+
+Normative:
+
+1. **The very first statement of each tick is the reschedule**, storing the returned id
+   in `self._after_id`. Every invocation therefore schedules exactly one successor, and
+   the tail of the method schedules none.
+2. Immediately after, a re-entrancy guard: if a drain is already in progress, the tick
+   returns. This matters because a modal dialog's `wait_window` re-enters the event loop
+   from inside `dispatch`, so a tick can fire while an earlier tick is still running.
+   The guard means the nested tick only keeps the timer chain alive; it does not start a
+   second drain. Without it the chain would fork and the queue would be drained twice as
+   fast for the rest of the session, growing a new branch per dialog.
+3. `messages = self.runner.drain()` — up to `DRAIN_BATCH` (200) messages, popped into a
+   plain list (section 20), so the queue is not held while widgets are mutated.
+4. Each message goes to `self.dispatch(message)` inside its own `try` / `except
+   Exception`, logged at ERROR with `exc_info`. **One screen's failure to render one
+   message never stops the drain**, and never stops the timer: the launcher stays
+   responsive even if a screen has a bug.
+5. The guard is cleared in a `finally`.
+6. `on_close` calls `after_cancel(self._after_id)` before destroying the window, so no
+   tick can fire against a destroyed widget tree.
+
+**This loop is the only code in the launcher that mutates a widget.** Everything a
+worker knows reaches the interface through it.
+
+#### 22.2.4 `dispatch` — the routing table
+
+`dispatch` decides which screen owns a message and calls that screen's `handle`. It
+does nothing else: no screen logic lives here.
+
+| Message | Routed to | How the target is decided |
+|---|---|---|
+| `AuthCode` | `SCREEN_ACCOUNT` | Only `auth.sign_in`'s `on_code` produces it. |
+| `LogLine` | `SCREEN_PLAY` | Only `process.GameProcess`'s reader thread produces it. |
+| `GameStarted` | `SCREEN_PLAY` | As above. |
+| `GameExited` | `SCREEN_PLAY` | As above. |
+| `Progress`, `TaskFinished`, `TaskFailed` | by task kind, below | `messages.task_key(message.task_id)` |
+
+Task kinds, from section 4:
+
+| `task_key` | Screen |
+|---|---|
+| `TASK_SIGN_IN`, `TASK_REFRESH` | `SCREEN_ACCOUNT` |
+| `TASK_VERSIONS`, `TASK_LAUNCH`, `TASK_GAME`, `TASK_INSTANCE`, `TASK_BUNDLED_MODS` | `SCREEN_PLAY` |
+| `TASK_MOD_SEARCH`, `TASK_MOD_INSTALL`, `TASK_MOD_ICON`, `TASK_MOD_LIST`, `TASK_MOD_UPDATES`, `TASK_MOD_DELETE` | `SCREEN_MODS` or `SCREEN_PACKS`, chosen by the kind segment of the item key |
+
+The mod task kinds serve two screens, so their ids carry the `ProjectKind` in the item
+key. `ui/mods.py` builds them with `mods_task_id` (section 22.5) and `dispatch` reads
+them back: the item key is `messages.task_item(task_id)`, its first `"/"`-separated
+segment is the `ProjectKind`, and `KIND_MOD` selects `SCREEN_MODS` while
+`KIND_RESOURCEPACK` selects `SCREEN_PACKS`. An id whose kind segment is neither is
+logged at WARNING and dropped.
+
+Normative rules `dispatch` applies before delegating:
+
+- A message for a screen that does not exist, or a `task_key` in no row above, is logged
+  at WARNING and dropped — except a `TaskFailed` whose `exc` is **not** a `CancelledError`,
+  which additionally opens `show_error(GENERIC_ERROR_TITLE, message.user_message)`. An
+  unroutable failure is a launcher bug and it must be visible, not silent; an unroutable
+  cancellation is not a failure at all and stays silent, per the table in 22.2.5.
+- Messages are delivered to a screen **whether or not it is visible**. A search that
+  finishes while the user is on the Play screen updates the Mods screen's widgets
+  immediately; Tk allows configuring a `grid_remove()`d widget and the result is correct
+  when it is shown again.
+- `dispatch` never opens a dialog itself except in the unroutable-failure case above.
+  Screens decide between a banner and a dialog.
+
+#### 22.2.5 Errors, banners and dialogs
+
+The division, stated once so no screen has to decide it:
+
+| Kind of failure | Presentation | Why |
+|---|---|---|
+| A failure inside a screen's own flow — a search, an install, a launch, a sign-in | that screen's `Banner`, carrying `TaskFailed.user_message` and, when there is one, a single quiet retry button | Section 21.9: the error sits under the heading of the screen the user is already looking at, in position, without colour coding. |
+| A failure with no screen — `config.json` cannot be written, `accounts.json` cannot be written, an unroutable `TaskFailed` | `show_error(...)`, a modal `ErrorDialog` | There is no screen to pin it to and the user must acknowledge it. |
+| A cancellation — any `TaskFailed` whose `exc` is a `CancelledError` | **no dialog, ever** | The user asked for it. A screen may put the message in its own status line; `show_error` is never called for one. |
+
+`show_error` builds an `ErrorDialog(self, self.fonts, title=title, body=message,
+detail=detail)` and calls `ask()`. `title` names the situation
+(`CONFIG_SAVE_ERROR_TITLE`, `ACCOUNT_SAVE_ERROR_TITLE`, `GENERIC_ERROR_TITLE`); `message`
+is a `LauncherError.user_message` verbatim, never a rephrasing; `detail` is optional and
+is used only for a technical string the user might quote in a bug report.
+
+`confirm` builds a `ConfirmDialog` through `ask_confirm` and returns its answer.
+`prompt` builds a `PromptDialog` through `ask_text`. Both block on the Tk thread inside
+`wait_window`, which is safe because of the drain loop's guard, and both are called only
+from a screen's own event handler — never from `dispatch` and never from a worker.
+
+`show_banner` / `clear_banner` forward to the named screen's `set_banner` /
+`clear_banner`; `screen=None` means the visible screen, and when no screen is visible
+yet the call is dropped and logged at DEBUG.
+
+#### 22.2.6 Account, version and instance state
+
+`set_account(account)`, normative:
+
+1. `self.account = account`.
+2. `sidebar.set_account_label(account.name if account is not None else LABEL_SIGN_IN)`.
+3. `config.last_account = account.uuid if account is not None else None`, then
+   `save_config()`.
+4. `AccountScreen.on_account_changed()` and `PlayScreen.on_account_changed()` are called
+   so both redraw. It does **not** write `accounts.json`; `AccountScreen` owns the store.
+
+`game_version()` returns the first non-empty of: the version `PlayScreen` last resolved
+(set through `set_game_version`), `config.selected_version`, and `""`. It never touches
+the network and never raises; the Mods screens render an `EmptyState` when it is `""` and
+`PlayScreen` fills it as soon as `TASK_VERSIONS` returns.
+
+`current_instance()` returns `instances.get(config.selected_instance)`, catching
+`InstanceError` and returning `None` when the directory is gone (a user can delete it
+from outside the launcher). Callers treat `None` as "there is no instance yet" and show
+the Play screen's instance empty state.
+
+`instance_changed()` calls `instance_changed()` on every screen. Both Mods screens use
+it to mark their Installed pane stale so it reloads on their next `on_show`, or
+immediately when they are the visible screen. It is called after an instance is created,
+renamed, deleted or selected, and after bundled mods finish installing.
+
+`save_config()` calls `core.config.save_config(self.paths, self.config)` and, on
+`ConfigError`, calls `show_error(CONFIG_SAVE_ERROR_TITLE, exc.user_message)`. It never
+propagates: a read-only settings file must not take down the window.
+
+#### 22.2.7 Shutdown
+
+`on_close`, normative, in this order:
+
+1. If a game is running (`PlayScreen.game_is_running()` is True), ask
+   `confirm(CLOSE_WITH_GAME_TITLE, CLOSE_WITH_GAME_BODY,
+   confirm_label=CLOSE_WITH_GAME_CONFIRM, cancel_label=CLOSE_WITH_GAME_CANCEL)`. A `False`
+   answer returns without closing anything. The launcher **never kills the game on
+   close**: the child was spawned with `start_new_session=True` on POSIX and
+   `CREATE_NO_WINDOW` on Windows (section 19), so it survives the launcher, and the copy
+   says exactly that rather than implying otherwise.
+2. `after_cancel(self._after_id)` when a tick is pending, so no timer fires into a
+   destroyed widget tree.
+3. `config.window_width, config.window_height = winfo_width(), winfo_height()`, each
+   clamped up to the corresponding component of `MIN_WINDOW`, then `save_config()`.
+4. `runner.shutdown(wait=False, cancel_futures=True)` — every cancel token is set first
+   (section 20), so a worker in a download loop stops at its next chunk.
+5. `http.close()`.
+6. `self.destroy()`.
+
+Steps 3 to 5 each run inside their own `try` / `except Exception` logged at WARNING, so a
+failure in one still lets the window be destroyed. `on_close` never raises.
+
+The launcher window stays usable for the entire life of the game process, and closing it
+is a deliberate act with its own confirmation — spec section 8's "the launcher window
+stays usable throughout and does not exit when the game is running", enforced here and in
+`PlayScreen`.
+
+### 22.3 `ui/account.py`
+
+The device-code screen from section 21.8: a code the player retypes into a browser, a
+link they can click, a live waiting state, and a Cancel button that actually stops the
+polling thread.
+
+```python
+from ui.widgets import LABEL_CANCEL, LABEL_COPIED, LABEL_SIGN_IN   # shared literals
+
+HEADING: Final[str] = "Account"
+LEAD_SIGNED_OUT: Final[str] = "Sign in with your Microsoft account to play."
+STEP_OPEN: Final[str] = "Open"
+STEP_ENTER: Final[str] = "Enter this code"
+LABEL_SIGN_OUT: Final[str] = "Sign out"
+LABEL_SWITCH: Final[str] = "Switch account"
+LABEL_COPY_CODE: Final[str] = "Copy code"
+LABEL_USE_LIVE: Final[str] = "Use Minecraft sign-in"
+STATUS_WAITING: Final[str] = "Waiting for you to finish in your browser."
+STATUS_CHECKING: Final[str] = "Checking your sign-in."
+STATUS_SIGNED_IN: Final[str] = "Signed in as {name}"
+STATUS_COPY_FAILED: Final[str] = "Couldn't reach the clipboard. Type the code by hand."
+STATUS_LINK_FAILED: Final[str] = "Couldn't open your browser. Go to {url} by hand."
+NO_CLIENT_ID_BODY: Final[str] = (
+    "MaestroLauncher needs an application id before it can sign you in. Register one in "
+    "Azure, or switch to the Minecraft launcher's own sign-in."
+)
+```
+
+`STATUS_WAITING` and `NO_CLIENT_ID_BODY` are the exact strings section 21.8 and 21.9
+specify. `LABEL_USE_LIVE` performs the one-click switch to `auth_mode = "live"` from the
+section 0 amendment dated 2026-09-03.
+
+```python
+class AccountScreen(ctk.CTkFrame):
+    """Microsoft device-code sign-in: the code, the link, the wait, and the cancel."""
+
+    def __init__(self, master: Any, app: AppShell, fonts: Fonts) -> None:
+        """Build the account screen. Nothing is fetched until `on_show`.
+
+        Raises:
+            nothing.
+        """
+
+    def on_show(self) -> None:
+        """Redraw for the current account state. Starts no task by itself.
+
+        Raises:
+            nothing.
+        """
+
+    def on_hide(self) -> None:
+        """Nothing to stop: a sign-in in progress keeps polling while other screens are up.
+
+        Raises:
+            nothing.
+        """
+
+    def handle(self, message: UIMessage) -> None:
+        """Act on `AuthCode`, and on `Progress`/`TaskFinished`/`TaskFailed` for sign-in and refresh.
+
+        Raises:
+            nothing.
+        """
+
+    def set_banner(
+        self, text: str, *, action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show this screen's banner under the heading.
+
+        Raises:
+            nothing.
+        """
+
+    def clear_banner(self) -> None:
+        """Hide this screen's banner.
+
+        Raises:
+            nothing.
+        """
+
+    def instance_changed(self) -> None:
+        """No-op: the account screen shows nothing that depends on the instance.
+
+        Raises:
+            nothing.
+        """
+
+    def on_account_changed(self) -> None:
+        """Called by `MaestroApp.set_account`; redraws for the new account state.
+
+        Raises:
+            nothing.
+        """
+
+    def start_sign_in(self) -> None:
+        """Submit the sign-in task and enter the waiting state.
+
+        Raises:
+            nothing.
+        """
+
+    def cancel_sign_in(self) -> None:
+        """Set the sign-in task's cancel token, which stops the polling thread.
+
+        Raises:
+            nothing.
+        """
+
+    def sign_out(self) -> None:
+        """Forget the current account and return to the signed-out state.
+
+        Raises:
+            nothing.
+        """
+```
+
+Module-level worker — the only function in this module a worker thread runs:
+
+```python
+def sign_in_worker(
+    mode: str,
+    client_id: str,
+    http: Http,
+    queue: "queue.Queue[UIMessage]",
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> Account:
+    """Run `auth.sign_in`, posting the device code to `queue` as an `AuthCode` message.
+
+    Raises:
+        ConfigError: unknown mode, or an empty client id.
+        AuthExpiredError, AuthDeclinedError, XboxAccountError, NoJavaEditionError,
+        TokenExpiredError, AuthError, NetworkError, HttpStatusError, CancelledError.
+    """
+```
+
+It takes only strings, an `Http` and the queue object, and returns an `Account` —
+plain data in, plain data out. Its `on_code` callback is
+`lambda code: queue.put(AuthCode(code.user_code, code.verification_uri))`, which is a
+`queue.put` and nothing more: **the worker never touches a widget, a `StringVar` or a
+`CTkImage`.** The code reaches the interface as an `AuthCode` message drained on the Tk
+thread, like everything else.
+
+#### 22.3.1 Layout
+
+The widgets, in creation order — which is also Tab order:
+
+1. Heading `Account`, `fonts.display` / `TEXT`.
+2. `Banner` (hidden).
+3. Lead paragraph, `fonts.body` / `TEXT`, wrapped at `TEXT_COLUMN_MAX`.
+4. Step 1 row: `1` in `fonts.body` / `TEXT_MUTED`, the word `Open`, and the link — a
+   `CTkLabel` in `fonts.body` / `ACCENT`… **no**: the link is `fonts.body` / `TEXT` with
+   `cursor="hand2"`, bound to `<Button-1>` and, through `attach_focus_ring`, to Return
+   and Space. It is not accent-coloured, because section 21.2 allows exactly one accent
+   element per pane and that is the `Copy code` button. The link text is the
+   `verification_uri` with a leading `https://` and a leading `www.` removed, so
+   `https://www.microsoft.com/link` renders as `microsoft.com/link`, matching the
+   wireframe.
+5. Step 2 row: `2` and the words `Enter this code`.
+6. `CodeLabel`, separated from the instructions above it by `SPACE_32` (section 21.4's
+   one large break).
+7. `PrimaryButton` — the screen's single accent element; its label depends on state.
+8. `SecondaryButton` — `Cancel` while waiting, `Switch account` when signed in, hidden
+   otherwise.
+9. Status `CTkLabel`, `fonts.small` / `TEXT_MUTED`, wrapped at `TEXT_COLUMN_MAX`.
+
+There is **no progress bar on this screen.** `auth.sign_in` reports `(label, step, 5)`
+(section 10.8) and the five labels are already sentences; the status line shows
+`Progress.label` verbatim and the wait is expressed in words. That is section 21's
+choice, and it is not a spinner: the label changes at each of the five real steps.
+
+#### 22.3.2 States
+
+The five states of section 21.8's table, and exactly what each shows:
+
+| State | Code block | Primary button | Secondary button | Status line |
+|---|---|---|---|---|
+| Signed out, idle | hidden | `Sign in` | hidden | empty |
+| Waiting | shown, with the live code | `Copy code` | `Cancel` | `Waiting for you to finish in your browser.` |
+| Signed in | replaced by `Signed in as {name}` in `fonts.body` / `TEXT` and `account.uuid_dashed` in `fonts.small` / `TEXT_MUTED` | `Sign out` | `Switch account` | empty |
+| Entra with no client id | replaced by `NO_CLIENT_ID_BODY` in `fonts.body` / `TEXT` | `Use Minecraft sign-in` | hidden | empty |
+| Failed | hidden | `Sign in` | hidden | the error's `user_message` |
+
+`uuid_dashed` (section 10.3) is display only and is never substituted into
+`${auth_uuid}`. It is set in `fonts.small`, **not** monospace: section 21.5 reserves the
+mono family for the device code and the game log, and a UUID is neither.
+
+The "Entra with no client id" state is detected with `config.effective_client_id() == ""`
+(section 8.3), which is the only condition that produces it. `Use Minecraft sign-in` sets
+`config.auth_mode = "live"`, calls `app.save_config()`, redraws, and then starts the
+sign-in immediately — one click, as the amendment requires.
+
+#### 22.3.3 Sign-in flow
+
+`start_sign_in`, normative:
+
+1. `client_id = core.config.require_client_id(app.config)`. A `ConfigError` here is
+   caught and switches the screen to the "Entra with no client id" state rather than
+   opening a dialog — the situation has a one-click fix on this very screen.
+2. `app.runner.reset_token(TASK_SIGN_IN)` — a previous cancel must not stop the new
+   attempt before it starts (section 20's `reset_token`).
+3. `app.runner.submit(TASK_SIGN_IN, sign_in_worker, app.config.auth_mode, client_id,
+   app.http, app.runner.queue, progress=app.runner.progress_fn(TASK_SIGN_IN),
+   cancel=app.runner.token(TASK_SIGN_IN))`.
+4. The screen enters the Waiting state with an empty `CodeLabel` and the status line
+   `STATUS_CHECKING` until the `AuthCode` message arrives; the primary button is
+   `Copy code`, disabled until there is a code to copy.
+
+Messages `AccountScreen` handles:
+
+| Message | Effect |
+|---|---|
+| `AuthCode` | `code_label.set_code(message.code)`; the link is set from `message.url`; the primary button is enabled; the status line becomes `STATUS_WAITING`. `open_url` is **not** called automatically — the launcher does not seize the browser; the player clicks the link. |
+| `Progress` with `task_key == TASK_SIGN_IN` | the status line shows `message.label`, which is one of section 10.8's five step labels. `done`/`total` are ignored: there is no bar on this screen. |
+| `Progress` with `task_key == TASK_REFRESH` | the status line shows `STATUS_CHECKING`. |
+| `TaskFinished` for `TASK_SIGN_IN` or `TASK_REFRESH` | `result` is cast to `Account`; `app.store.upsert(account)` (a `ConfigError` here calls `app.show_error(ACCOUNT_SAVE_ERROR_TITLE, exc.user_message)` and the account is still adopted for this session); `logsetup.REDACTOR.register` has already seen the tokens inside `AccountStore.save`; then `app.set_account(account)`, the Signed-in state, and — when the screen was reached from the first-run Account screen — `app.show(SCREEN_PLAY)`. |
+| `TaskFailed` for `TASK_SIGN_IN` or `TASK_REFRESH` | the Failed state, with `message.user_message` in the status line verbatim. No dialog. |
+
+Every one of section 2's auth errors reaches the user through that last row without
+this screen knowing which it was: `XboxAccountError` already carries the XErr sentence,
+`NoJavaEditionError` already carries the Game Pass explanation, `AuthExpiredError`
+already says to start again. The screen adds no wording of its own, which is why the
+messages are defined once in `errors.py` and not here.
+
+`cancel_sign_in` calls `app.runner.cancel(TASK_SIGN_IN)`. That sets the `CancelToken`
+the worker was given; `DeviceCodeSession.wait_for_token` waits on the token rather than
+sleeping (section 6.1's `CancelToken.wait`), so the polling thread stops at once instead
+of at the end of its current interval. The resulting `CancelledError` arrives as a
+`TaskFailed` and the status line reads `Cancelled.` — `CancelledError.user_message`
+from section 2, used verbatim like every other failure. No dialog opens, per section
+22.2.5.
+
+`sign_out` calls `app.store.remove(account.uuid)` (`ConfigError` →
+`app.show_error(ACCOUNT_SAVE_ERROR_TITLE, …)`), `logsetup.REDACTOR.clear()`, and
+`app.set_account(None)`. `Switch account` is `sign_out` followed by `start_sign_in`.
+
+`Copy code` calls `copy_to_clipboard(self, code_label.code)`. On success the button label
+becomes `LABEL_COPIED` for `COPIED_FEEDBACK_MS` (2000 ms) and then returns to
+`LABEL_COPY_CODE` through a single `after` call whose id is cancelled if the screen
+redraws first. On failure the status line becomes `STATUS_COPY_FAILED` and the label
+does not change — the button must not claim a copy that did not happen. The verb
+survives the flow: `Copy code` produces `Copied`.
+
+---
+
+### 22.4 `ui/play.py`
+
+```python
+from ui.widgets import LABEL_CANCEL, LABEL_COPIED, LABEL_SIGN_IN   # shared literals
+
+HEADING: Final[str] = "Play"
+LABEL_VERSION: Final[str] = "Version"
+LABEL_INSTANCE: Final[str] = "Instance"
+LABEL_MEMORY: Final[str] = "Memory"
+LABEL_SNAPSHOTS: Final[str] = "Show snapshots"
+LABEL_PLAY: Final[str] = "Play"
+LABEL_STOP: Final[str] = "Stop"
+LABEL_NEW: Final[str] = "New"
+LABEL_RENAME: Final[str] = "Rename"
+LABEL_DELETE: Final[str] = "Delete"
+LABEL_COPY_LOG: Final[str] = "Copy log"
+LABEL_DISMISS: Final[str] = "Dismiss"
+LABEL_TRY_AGAIN: Final[str] = "Try again"
+MEMORY_NOTE: Final[str] = (
+    "More memory is not more speed. 4–8 GB suits Sodium and a normal modlist; "
+    "a bigger heap makes pauses longer."
+)
+MEMORY_UNIT: Final[str] = "{gb} GB"
+STATUS_READY: Final[str] = "Ready to play {version} with Fabric."
+STATUS_RUNNING: Final[str] = "Running"
+STATUS_CLOSED: Final[str] = "Minecraft closed."
+STATUS_LOADING_VERSIONS: Final[str] = "Loading versions"
+STATUS_NO_ACCOUNT: Final[str] = "Sign in before you play."
+STATUS_NO_INSTANCE: Final[str] = "No instance yet. Press New to make one."
+STATUS_DELETING: Final[str] = "Deleting {name}"
+CRASH_TITLE: Final[str] = "Minecraft stopped unexpectedly."
+CRASH_EXIT_CODE: Final[str] = "Exit code {code}"
+VERSION_PLACEHOLDER: Final[str] = "Loading versions"
+NEW_INSTANCE_TITLE: Final[str] = "New instance"
+NEW_INSTANCE_BODY: Final[str] = (
+    "Name it something you'll recognise. Letters, numbers, spaces, dots, dashes and "
+    "underscores."
+)
+NEW_INSTANCE_CONFIRM: Final[str] = "Create instance"
+NEW_INSTANCE_PLACEHOLDER: Final[str] = "My instance"
+RENAME_INSTANCE_TITLE: Final[str] = "Rename {name}"
+RENAME_INSTANCE_CONFIRM: Final[str] = "Rename instance"
+DELETE_INSTANCE_TITLE: Final[str] = "Delete {name}"
+DELETE_INSTANCE_BODY: Final[str] = (
+    "The {name} instance and everything in it — mods, worlds and settings — will "
+    "be removed. This can't be undone."
+)
+DELETE_INSTANCE_CONFIRM: Final[str] = "Delete instance"
+DELETE_INSTANCE_CANCEL: Final[str] = "Keep it"
+LAUNCH_ERROR_TITLE: Final[str] = "Couldn't start the game"
+```
+
+`MEMORY_NOTE` is section 21.9's exact sentence, with a real en dash in "4–8 GB". It is
+the interface copy spec section 7 requires, and it lives here rather than in
+`core/config.py` (section 8 says so explicitly).
+
+```python
+@dataclass(frozen=True, slots=True)
+class LaunchResult:
+    """What the launch task hands back to the Tk thread."""
+    account: Account
+    plan: LaunchPlan
+
+
+class PlayScreen(ctk.CTkFrame):
+    """Version, instance, memory, determinate progress, Play/Stop, and the crash panel."""
+
+    def __init__(self, master: Any, app: AppShell, fonts: Fonts) -> None:
+        """Build the Play screen. Nothing is fetched until `on_show`.
+
+        Raises:
+            nothing.
+        """
+
+    def on_show(self) -> None:
+        """Load the version list once, repopulate the instance dropdown, redraw the state.
+
+        Raises:
+            nothing.
+        """
+
+    def on_hide(self) -> None:
+        """Nothing is stopped: a launch and a running game continue while other screens are up.
+
+        Raises:
+            nothing.
+        """
+
+    def handle(self, message: UIMessage) -> None:
+        """Act on the launch, versions, instance, bundled-mod and game messages.
+
+        Raises:
+            nothing.
+        """
+
+    def set_banner(
+        self, text: str, *, action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show this screen's banner under the heading."""
+
+    def clear_banner(self) -> None:
+        """Hide this screen's banner."""
+
+    def instance_changed(self) -> None:
+        """Repopulate the instance dropdown and redraw the ready line.
+
+        Raises:
+            nothing.
+        """
+
+    def on_account_changed(self) -> None:
+        """Enable or disable Play for the new account state.
+
+        Raises:
+            nothing.
+        """
+
+    def game_is_running(self) -> bool:
+        """True while a `GameProcess` this screen started is alive — what `on_close` asks.
+
+        Raises:
+            nothing.
+        """
+
+    def start_launch(self) -> None:
+        """Submit the launch task and switch the button bar to the preparing state.
+
+        Raises:
+            nothing.
+        """
+
+    def stop_game(self) -> None:
+        """Ask the running game to quit; the `GameExited` message finishes the transition.
+
+        Raises:
+            nothing.
+        """
+
+
+class CrashPanel(ctk.CTkFrame):
+    """The last 200 lines of a crashed run, a plain-English hint, and a copy button."""
+
+    def __init__(self, master: Any, app: AppShell, fonts: Fonts) -> None:
+        """Build the crash panel, hidden.
+
+        Raises:
+            nothing.
+        """
+
+    def show(self, exit_code: int, log_tail: Sequence[str], hint: str | None) -> None:
+        """Fill and reveal the panel for one crashed run.
+
+        Raises:
+            nothing.
+        """
+
+    def hide(self) -> None:
+        """Remove the panel from the layout with `grid_remove()`.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def visible(self) -> bool:
+        """True between `show()` and `hide()`."""
+```
+
+Module-level workers:
+
+```python
+def versions_worker(
+    http: Http, paths: Paths, *, cancel: CancelToken | None = None
+) -> VersionManifest:
+    """Fetch the Mojang manifest (or its cached copy) for the version dropdown.
+
+    Raises:
+        ManifestError, NetworkError, HttpStatusError, CancelledError.
+    """
+
+def launch_worker(
+    http: Http,
+    paths: Paths,
+    config: Config,
+    instance: Instance,
+    account: Account,
+    client_id: str,
+    store: AccountStore,
+    *,
+    version_id: str | None = None,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> LaunchResult:
+    """Refresh the account if needed, then build the launch plan.
+
+    Raises:
+        ConfigError, TokenExpiredError, XboxAccountError, NoJavaEditionError, AuthError,
+        ManifestError, RuntimeProvisionError, ChecksumError, UnresolvedPlaceholderError,
+        LaunchError, InstanceError, NetworkError, HttpStatusError, CancelledError, OSError.
+    """
+
+def instance_create_worker(
+    instances: InstanceManager, name: str, version_id: str
+) -> Instance:
+    """Create one instance directory skeleton.
+
+    Raises:
+        InstanceError: invalid name, a name in use, or the directories cannot be written.
+    """
+
+def instance_rename_worker(
+    instances: InstanceManager, instance: Instance, new_name: str
+) -> Instance:
+    """Rename one instance directory.
+
+    Raises:
+        InstanceError: invalid name, a name in use, or the rename failed.
+    """
+
+def instance_delete_worker(instances: InstanceManager, name: str) -> str:
+    """Delete one instance tree; returns the name that was deleted.
+
+    Raises:
+        InstanceError: no such instance, or the tree cannot be removed.
+    """
+
+def bundled_mods_worker(
+    instances: InstanceManager,
+    client: ModrinthClient,
+    instance: Instance,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> BundledResult:
+    """Install Fabric API and Sodium into a fresh instance.
+
+    Raises:
+        ChecksumError, RateLimitedError, ModrinthError, NetworkError, HttpStatusError,
+        InstanceError, CancelledError, OSError.
+    """
+```
+
+`launch_worker`, normative — and this is the resolution of an open point in section 18.
+Section 18 says `ui/play.py` calls `auth.ensure_fresh` before the launch task so that a
+sign-in can never appear from inside a download loop. Calling it on the Tk thread would
+put a network round-trip in front of the window, which rule 1 of section 22 forbids, so
+the refresh is the **first statement of the launch worker**, on a worker thread, before
+`prepare_launch` is entered (section 0 amendment, 2026-09-04):
+
+1. `account = auth.ensure_fresh(account, client_id, http, store=store, cancel=cancel)`.
+   Passing `store` means a renewed token is persisted by `AccountStore.upsert` without
+   the UI doing anything.
+2. `plan = core.pipeline.prepare_launch(http, paths, config, instance, account,
+   version_id=version_id, progress=progress, cancel=cancel)` — the account it receives is
+   already fresh, which is the invariant section 18 actually needs.
+3. Returns `LaunchResult(account, plan)`. Both are plain data; no widget is touched and
+   nothing is a `Path` the Tk thread has to resolve.
+
+#### 22.4.1 Layout
+
+The Play screen's body is a `CTkScrollableFrame` (section 21.7), so the crash panel can
+appear without pushing the button bar off a 600 px window. Widgets in creation order,
+which is Tab order:
+
+1. Heading `Play`, `fonts.display` / `TEXT`.
+2. `Banner` (hidden).
+3. Version row: label `Version`; `CTkOptionMenu` for the version;
+   `CTkCheckBox` reading `Show snapshots`.
+4. Instance row: label `Instance`; `CTkOptionMenu` for the instance; three
+   `SecondaryButton`s — `New`, `Rename`, `Delete` — in the position the snapshots
+   checkbox occupies on the row above. Section 21's Play widget list omitted them and
+   spec section 10 requires create, rename and delete from the UI; see the section 0
+   amendment dated 2026-09-04.
+5. Memory row: label `Memory`; end labels `2 GB` and `{max} GB`; a `CTkSlider` wrapped
+   in a `FocusFrame`; a live value label `{n} GB` in `fonts.body` / `TEXT`.
+6. The memory note, `fonts.small` / `TEXT_MUTED`, wrapped at `TEXT_COLUMN_MAX`,
+   separated from the button bar by `SPACE_32`.
+7. `CrashPanel` (hidden) — it takes the memory note's place when a run crashes.
+8. Status label, `fonts.body` / `TEXT`.
+9. A determinate `CTkProgressBar` (`mode="determinate"`, `height=PROGRESS_HEIGHT`,
+   `progress_color=ACCENT`, `fg_color=SURFACE_RAISED`, `corner_radius=RADIUS_CONTROL`)
+   and, beneath it, the step label on the left and the percentage on the right. Both are
+   hidden when nothing is running.
+10. A 1 px `BORDER` rule, then the button bar: `SecondaryButton` `Cancel` (hidden when
+    idle) and the `PrimaryButton`.
+
+Colour discipline: exactly one accent element on this screen at any moment. At rest it
+is the `Play` button. While a launch prepares, `play_button.set_enabled(False)` turns it
+`SURFACE_RAISED` / `TEXT_MUTED` and the progress bar's `ACCENT` fill becomes the pane's
+single accent — section 21.2's "the accent moves rather than multiplying". When the run
+ends the accent moves back.
+
+#### 22.4.2 Version and instance controls
+
+The version dropdown starts disabled with the single value `VERSION_PLACEHOLDER`
+(`Loading versions`) and the status line `STATUS_LOADING_VERSIONS`. This is a text state,
+not a spinner. `on_show` submits `TASK_VERSIONS` once per session:
+`app.runner.submit(TASK_VERSIONS, versions_worker, app.http, app.paths,
+cancel=app.runner.token(TASK_VERSIONS))`.
+
+On `TaskFinished` for `TASK_VERSIONS`:
+
+1. `manifest` is cast from `result`; the screen keeps it for `Show snapshots`.
+2. The dropdown's values become `manifest.ids(app.config.include_snapshots)` —
+   **manifest order, newest first**, never sorted (section 9). Releases only until the
+   snapshot switch is on, which is exactly what `ids(include_snapshots)` means.
+3. The selected value is `core.pipeline.resolve_version_id(manifest, app.config,
+   instance)` when an instance exists, else `manifest.latest_release`. A `ManifestError`
+   from a stale `selected_version` falls back to `manifest.latest_release` and rewrites
+   the config.
+4. `app.set_game_version(selected)`, which is what unblocks both Mods screens.
+5. The status line becomes `STATUS_READY.format(version=selected)`.
+6. If `app.bootstrap_bundled` is set and the current instance's `version_id` is empty,
+   the screen writes the resolved version into the instance, saves it, and submits
+   `TASK_BUNDLED_MODS` — the first-run bundled install (section 23.4). It cannot happen
+   any earlier, because `install_bundled_mods` refuses an empty `version_id`
+   (section 17.4) and the version is not known until the manifest arrives.
+
+On `TaskFailed` for `TASK_VERSIONS`: the banner shows `message.user_message` with the
+action `Try again`, which resubmits. The dropdown stays disabled. `fetch_manifest`
+already falls back to its on-disk cache (section 9.2), so this state means both the
+network and the cache failed.
+
+`Show snapshots` writes `config.include_snapshots`, calls `app.save_config()` and
+repopulates the dropdown from the manifest already in hand. Changing the version writes
+`config.selected_version`, saves, calls `app.set_game_version(...)` and updates the ready
+line.
+
+The instance dropdown's values are `app.instances.names()`. Selecting one writes
+`config.selected_instance`, saves, and calls `app.instance_changed()`. With no instances
+at all the dropdown is disabled with a single blank value and the status line reads
+`STATUS_NO_INSTANCE`.
+
+`New` calls `app.prompt(NEW_INSTANCE_TITLE, NEW_INSTANCE_BODY,
+confirm_label=NEW_INSTANCE_CONFIRM, placeholder=NEW_INSTANCE_PLACEHOLDER,
+validate=<validator>)`, where the validator calls `core.instances.validate_name` and
+returns the `InstanceError`'s `user_message` — so the six messages in section 17.2's
+table are the ones shown, written once. A confirmed name is submitted as
+`TASK_INSTANCE` running `instance_create_worker`. On `TaskFinished` the new instance is
+selected, `app.save_config()` runs, `app.instance_changed()` fires, and
+`TASK_BUNDLED_MODS` is submitted for it — a new instance gets Fabric API and Sodium
+exactly as the first-run one does (spec section 9).
+
+`Rename` prompts with `RENAME_INSTANCE_TITLE.format(name=…)`, the same body and
+validator, `initial=` the current name, and submits `instance_rename_worker`. On finish
+`config.selected_instance` is updated to the new name and saved — section 17.3 is
+explicit that `InstanceManager` never touches `config.json` and that this screen does.
+
+`Delete` asks `app.confirm(DELETE_INSTANCE_TITLE.format(name=…),
+DELETE_INSTANCE_BODY.format(name=…), confirm_label=DELETE_INSTANCE_CONFIRM,
+cancel_label=DELETE_INSTANCE_CANCEL)` and, when confirmed, submits
+`instance_delete_worker` with the status line `STATUS_DELETING.format(name=…)` and the
+instance dropdown disabled. On finish, `config.selected_instance` becomes the first
+remaining name or `""`, the config is saved and `app.instance_changed()` fires. A
+`TaskFailed` shows the `InstanceError`'s `user_message` in the banner.
+
+`New`, `Rename` and `Delete` are all disabled while a launch is preparing or a game is
+running: renaming the directory the game is reading from would break it.
+
+#### 22.4.3 Memory
+
+The slider is `CTkSlider(from_=MIN_MEMORY_GB, to=cap, number_of_steps=cap -
+MIN_MEMORY_GB)` where `cap = core.config.max_memory_gb()` — spec section 7's
+`min(system_ram_gb - 4, 12)` with a floor of 2, computed in `core/config.py` and never
+recomputed here. When `cap == MIN_MEMORY_GB` the slider is disabled and the value label
+still reads `2 GB`; a machine that small has one choice.
+
+- `command=` updates the value label only. It fires on every pixel and must not write a
+  file.
+- `<ButtonRelease-1>` on the slider's focus target commits: `config.memory_gb =
+  int(round(value))`, `app.save_config()`.
+- `<Left>` and `<Right>` on the focus target step the value by 1 GiB and commit. This is
+  what makes the slider keyboard-reachable; `CTkSlider` binds no arrow keys of its own.
+- The `FocusFrame` around the slider paints the focus ring, because a `CTkSlider` has no
+  border to swap (section 21.6).
+
+The note beneath is `MEMORY_NOTE`, always visible, never a tooltip. It is the argument
+spec section 7 asks the interface to make, and it is made where the control is.
+
+#### 22.4.4 Launching
+
+`start_launch`, normative:
+
+1. No account → `set_banner(STATUS_NO_ACCOUNT, action_label=LABEL_SIGN_IN,
+   on_action=lambda: app.show(SCREEN_ACCOUNT))` and stop. Nothing is submitted.
+2. No instance → `set_banner(STATUS_NO_INSTANCE, action_label=LABEL_NEW, …)` and stop.
+3. `client_id = core.config.require_client_id(app.config)`; a `ConfigError` puts its
+   `user_message` in the banner with the action `Sign in` and stops.
+4. `clear_banner()`; `crash_panel.hide()`; `app.runner.reset_token(TASK_LAUNCH)`.
+5. `app.runner.submit(TASK_LAUNCH, launch_worker, app.http, app.paths, app.config,
+   instance, app.account, client_id, app.store, version_id=selected,
+   progress=app.runner.progress_fn(TASK_LAUNCH),
+   cancel=app.runner.token(TASK_LAUNCH))`.
+6. The button bar enters the preparing state: `play_button.set_enabled(False)` with its
+   label still `Play` — **the verb survives the flow**; the `Cancel` button appears; the
+   progress bar and its two labels are shown with the bar `set(0.0)`.
+
+Messages, and what each does:
+
+| Message | Effect |
+|---|---|
+| `Progress` for `TASK_LAUNCH` or `TASK_BUNDLED_MODS` | The step label shows `message.label` verbatim — section 18's ten step labels, or the finer labels a child reporter forwards such as `Assets — 132.4 MB of 480.1 MB` (section 14). When `total > 0` the bar is `set(done / total)` and the right-hand label shows `f"{round(100 * done / total)}%"`. When `total == 0` the bar is left exactly where it is and only the label changes, per section 4. **The scale is never assumed**; see the section 0 amendment dated 2026-09-04 for why the wireframe's `1,284 of 3,140 files` is a percentage instead. |
+| `TaskFinished` for `TASK_LAUNCH` | `result` is cast to `LaunchResult`; `app.set_account(result.account)` adopts the possibly-refreshed account; then the game is started (below). |
+| `TaskFailed` for `TASK_LAUNCH` | A `CancelledError` returns the screen to the ready state with no banner and no dialog. Anything else puts `message.user_message` in the banner with the action `Try again`. The bar and `Cancel` are hidden, `play_button.set_enabled(True)`. |
+| `TaskFinished` for `TASK_BUNDLED_MODS` | `result` is cast to `BundledResult`. When `result.missing` is non-empty the banner shows `result.banner` — `"Sodium isn't available for 26.2 yet."` (section 17) — with the action `Dismiss`, which calls `app.instances.clear_banner(instance)` and hides it. `app.instance_changed()` fires so the Mods screen's Installed pane picks up the new jars. |
+| `TaskFailed` for `TASK_BUNDLED_MODS` | The banner shows `message.user_message` with `Try again`. The instance is usable either way: a failed bundled install is vanilla Fabric, not a broken instance. |
+| `TaskFinished` / `TaskFailed` for `TASK_INSTANCE` | As described in 22.4.2. |
+| `LogLine` | Appended to a `collections.deque(maxlen=LOG_TAIL_LINES)`. **There is no live log view in v1** — section 21 shows none, and inventing one is an amendment. The deque exists so the crash panel has a tail even in the case where `GameExited.log_tail` arrives empty because the reader thread was abandoned after `JOIN_TIMEOUT_SECONDS` (section 19). |
+| `GameStarted` | The button becomes `Stop` and `set_enabled(True)`; the status label reads `Running`; the progress bar and `Cancel` are hidden. This is the section 0 amendment dated 2026-09-03: **`Stop` is the button and `Running` is a separate status label**, never one button captioned "Running — Stop". |
+| `GameExited` | See below. |
+
+Starting the game, on the Tk thread, when `TASK_LAUNCH` finishes:
+
+`GameProcess(result.plan, app.instances.paths_for(instance.name), app.runner.queue,
+TASK_GAME)` then `start()`. `start()` spawns and returns the pid without blocking
+(section 19), so calling it from the event handler is correct and the window never
+freezes. `LaunchError` and `InstanceError` are caught and shown in the banner with
+`message` = the error's `user_message`; the screen returns to the ready state. The
+launcher window stays fully usable for the whole life of the game, and the launcher does
+not exit when the game starts — both follow from `start()` returning immediately and from
+`on_close` never killing the child (section 22.2.7).
+
+`stop_game` calls `GameProcess.stop()`, which sets `stopped` first and never blocks the
+Tk thread waiting for the supervisor (section 19). The button is disabled while the stop
+is in flight and the transition completes when `GameExited` arrives — there is exactly one
+`GameExited` per `start()`, whatever ended the process.
+
+Handling `GameExited`:
+
+1. The button returns to `Play`, enabled; `Cancel` and the progress bar stay hidden.
+2. `process.stopped` is True → status `STATUS_READY.format(version=…)`. A stop the user
+   asked for is not a crash, and the exit code is not consulted: on Windows a terminated
+   process reports 1 and on POSIX -15, and neither means anything to a player.
+3. Otherwise `exit_code == 0` → status `STATUS_CLOSED` (`Minecraft closed.`).
+4. Otherwise → `crash_panel.show(message.exit_code, message.log_tail or tuple(self._log),
+   message.hint)` and the status label is cleared; the crash panel carries the wording.
+
+#### 22.4.5 `CrashPanel`
+
+Section 21.8's third wireframe, built from the single `GameExited` message.
+
+| Element | Content |
+|---|---|
+| Title row | `CRASH_TITLE` (`Minecraft stopped unexpectedly.`) in `fonts.body_bold` / `TEXT`, and `CRASH_EXIT_CODE.format(code=…)` right-aligned in `fonts.small` / `TEXT_MUTED`. |
+| Hint | `GameExited.hint` in `fonts.body` / `TEXT`, wrapped at `TEXT_COLUMN_MAX`. Shown only when the hint is not `None`; `crash_hint` returns `None` rather than guessing (section 19.1), and the panel then shows the tail with no sentence above it. |
+| Log box | `CTkTextbox`, `height=CRASH_LOG_HEIGHT`, `font=fonts.mono`, `fg_color=SURFACE_RAISED`, `border_width=BORDER_WIDTH`, `border_color=BORDER`, `corner_radius=RADIUS_CONTAINER`, `wrap="none"`, holding `log_tail` joined with `"\n"` — at most 200 lines, oldest first. It is set to `state="disabled"` after insertion so it is read-only but still scrollable and still keyboard-reachable through `attach_focus_ring`. |
+| `Copy log` | A `SecondaryButton`. It copies the same joined tail with `copy_to_clipboard`, and its label becomes `Copied` for `COPIED_FEEDBACK_MS` then returns. On a clipboard failure the label does not change. |
+
+The lines were redacted once, by `process.py`'s reader thread, before they reached the
+queue (section 19). The access token is an ordinary element of the game's argv, so this
+is what keeps it out of the panel and out of the clipboard. `CrashPanel` re-redacts
+nothing and un-redacts nothing.
+
+The panel carries **no accent**: the pane's one accent element is the `Play` button
+below it, which reads `Play` and is enabled — the invitation to try again is the same
+button it always was.
+
+### 22.5 `ui/mods.py`
+
+One class renders two sidebar entries. Section 21.8: Mods and Texture Packs differ only
+in the search facet (section 16.1), the destination directory (`instance.mods` versus
+`instance.resourcepacks`), the loader filter, and the absence of an on/off switch. This
+is the screen that carries the application's visual weight, and it is the one place where
+the layout is a real two-pane catalogue rather than a form.
+
+```python
+SEARCH_DEBOUNCE_MS: Final[int] = 300      # spec section 12
+PAGE_SIZE: Final[int] = SEARCH_LIMIT      # 20, from core.modrinth
+INSTALL_PHASE_PLAN: Final[str] = "plan"
+INSTALL_PHASE_FILES: Final[str] = "files"
+
+HEADING: Final[dict[str, str]] = {KIND_MOD: "Mods", KIND_RESOURCEPACK: "Texture Packs"}
+SEARCH_PLACEHOLDER: Final[dict[str, str]] = {
+    KIND_MOD: "Search mods",
+    KIND_RESOURCEPACK: "Search texture packs",
+}
+FILTER_LINE: Final[dict[str, str]] = {
+    KIND_MOD: "For {version}, Fabric",
+    KIND_RESOURCEPACK: "For {version}",
+}
+SORT_LABELS: Final[tuple[tuple[str, str], ...]] = (
+    (SORT_DOWNLOADS, "Most downloads"),
+    (SORT_RELEVANCE, "Most relevant"),
+    (SORT_UPDATED, "Recently updated"),
+)
+LABEL_INSTALL: Final[str] = "Install"
+LABEL_INSTALLING: Final[str] = "Installing"
+LABEL_INSTALLED: Final[str] = "Installed"
+LABEL_REMOVE: Final[str] = "Remove"
+LABEL_REMOVING: Final[str] = "Removing"
+LABEL_KEEP: Final[str] = "Keep it"
+LABEL_KEEP_ON: Final[str] = "Keep it on"
+LABEL_ON: Final[str] = "On"
+LABEL_OFF: Final[str] = "Off"
+LABEL_SHOW_MORE: Final[str] = "Show {n} more"
+LABEL_UPDATE_ONE: Final[str] = "Update 1 mod"
+LABEL_UPDATE_MANY: Final[str] = "Update {n} mods"
+LABEL_INSTALLED_PANE: Final[str] = "Installed"
+LABEL_SEARCHING: Final[str] = "Searching"
+LABEL_LOADING: Final[str] = "Loading"
+LABEL_CHECKING_UPDATES: Final[str] = "Checking for updates"
+LABEL_TRY_AGAIN: Final[str] = "Try again"
+SHOWING: Final[str] = "Showing {shown} of {total}"
+UPDATE_READY: Final[str] = "{installed} → {available} ready"
+NO_RESULTS: Final[dict[str, str]] = {
+    KIND_MOD: (
+        "No mods match {query} for {version}. Try a shorter word, or change the "
+        "version on the Play screen."
+    ),
+    KIND_RESOURCEPACK: (
+        "No texture packs match {query} for {version}. Try a shorter word, or change "
+        "the version on the Play screen."
+    ),
+}
+EMPTY_INSTALLED: Final[dict[str, str]] = {
+    KIND_MOD: "No mods yet. Search on the left and press Install.",
+    KIND_RESOURCEPACK: (
+        "No texture packs yet. Search above and install one. Packs turn on inside "
+        "Minecraft, under Options then Resource Packs."
+    ),
+}
+PACK_PANE_NOTE: Final[str] = (
+    "Turn packs on inside Minecraft, under Options then Resource Packs."
+)
+NO_VERSION_STATE: Final[str] = (
+    "Pick a Minecraft version on the Play screen and this list fills in."
+)
+NO_INSTANCE_STATE: Final[str] = (
+    "Make an instance on the Play screen and this list fills in."
+)
+CONFIRM_INSTALL_TITLE: Final[str] = "Install {title}"
+CONFIRM_INSTALL_ONE: Final[str] = (
+    "{title} needs one more file. Both go into the {instance} instance."
+)
+CONFIRM_INSTALL_MANY: Final[str] = (
+    "{title} needs {deps} more files. All {total} go into the {instance} instance."
+)
+CONFIRM_INSTALL_BUTTON: Final[str] = "Install {n} files"
+CONFIRM_REMOVE_TITLE: Final[str] = "Remove {name}"
+CONFIRM_REMOVE_BODY: Final[str] = (
+    "{name} will be deleted from the {instance} instance. Your worlds are not affected."
+)
+PROTECTED_REMOVE_TITLE: Final[str] = "Remove Fabric API"
+PROTECTED_DISABLE_TITLE: Final[str] = "Turn off Fabric API"
+```
+
+`NO_RESULTS`, `EMPTY_INSTALLED[KIND_MOD]`, `PACK_PANE_NOTE` and
+`EMPTY_INSTALLED[KIND_RESOURCEPACK]` are section 21.8's exact strings; the `*sdium*` in
+that table is Markdown emphasis around the example query, so the literal here
+interpolates `{query}` unquoted. `UPDATE_READY` is the wireframe's `0.9.1 → 0.9.2 ready`;
+its arrow denotes a version transition and is not the banned decorative arrow on a button
+(section 21.10, item 5).
+
+#### 22.5.1 Task ids
+
+Both `ModsScreen` instances use the same six task kinds, so the `ProjectKind` travels in
+the item key and `MaestroApp.dispatch` reads it back (section 22.2.4).
+
+```python
+def mods_task_id(base: str, kind: ProjectKind, item: str = "") -> str:
+    """`{base}:{kind}` or `{base}:{kind}/{item}` — one Mods view's task-id namespace.
+
+    Raises:
+        nothing.
+    """
+
+def mods_task_parts(task_id: str) -> tuple[str, str]:
+    """The `(kind, item)` pair encoded in a mods task id; `("", "")` when there is none.
+
+    Raises:
+        nothing.
+    """
+```
+
+The ids this screen uses, exhaustively:
+
+| Purpose | Task id |
+|---|---|
+| Search or a page of one | `mods_task_id(TASK_MOD_SEARCH, kind)` |
+| One project icon | `mods_task_id(TASK_MOD_ICON, kind, project_id)` |
+| Resolve an install plan | `mods_task_id(TASK_MOD_INSTALL, kind, f"{INSTALL_PHASE_PLAN}/{project_id}")` |
+| Download an install plan | `mods_task_id(TASK_MOD_INSTALL, kind, f"{INSTALL_PHASE_FILES}/{project_id}")` |
+| List what is installed | `mods_task_id(TASK_MOD_LIST, kind)` |
+| Sweep for updates | `mods_task_id(TASK_MOD_UPDATES, kind)` |
+| Delete one file | `mods_task_id(TASK_MOD_DELETE, kind, filename)` |
+
+Install is two tasks because the confirm dialog sits between resolution and download:
+`resolve_install_plan` has to finish before the dialog can list what it found, and the
+dialog is modal on the Tk thread. Section 4's item-key convention carries both the kind
+and the phase.
+
+#### 22.5.2 The class
+
+```python
+class ModsScreen(ctk.CTkFrame):
+    """The mod browser and its Installed pane. One instance per `ProjectKind`."""
+
+    def __init__(
+        self,
+        master: Any,
+        app: AppShell,
+        fonts: Fonts,
+        *,
+        kind: ProjectKind = KIND_MOD,
+    ) -> None:
+        """Build the two-pane catalogue for one project kind. Nothing is fetched until `on_show`.
+
+        Raises:
+            ValueError: `kind` is neither `KIND_MOD` nor `KIND_RESOURCEPACK`.
+        """
+
+    def on_show(self) -> None:
+        """Run the default search once, and reload the Installed pane when it is stale.
+
+        Raises:
+            nothing.
+        """
+
+    def on_hide(self) -> None:
+        """Cancel a pending search debounce. In-flight tasks keep running.
+
+        Raises:
+            nothing.
+        """
+
+    def handle(self, message: UIMessage) -> None:
+        """Act on the search, icon, install, list, update and delete messages for this kind.
+
+        Raises:
+            nothing.
+        """
+
+    def set_banner(
+        self, text: str, *, action_label: str = "",
+        on_action: Callable[[], None] | None = None,
+    ) -> None:
+        """Show this screen's banner under the heading."""
+
+    def clear_banner(self) -> None:
+        """Hide this screen's banner."""
+
+    def instance_changed(self) -> None:
+        """Mark the Installed pane stale and refilter for the current version.
+
+        Raises:
+            nothing.
+        """
+
+    @property
+    def kind(self) -> ProjectKind:
+        """`KIND_MOD` or `KIND_RESOURCEPACK` — everything else on the screen follows from it."""
+
+    @property
+    def dest_dir(self) -> Path | None:
+        """`instance.mods` or `instance.resourcepacks` for the selected instance; None when
+        there is no instance."""
+```
+
+Module-level workers:
+
+```python
+def search_worker(
+    client: ModrinthClient,
+    serial: int,
+    query: str,
+    kind: ProjectKind,
+    game_version: str,
+    offset: int,
+    sort: str,
+    *,
+    cancel: CancelToken | None = None,
+) -> SearchResult:
+    """One page of `/search`, tagged with the serial that lets the screen drop a stale page.
+
+    Raises:
+        RateLimitedError, ModrinthError, NetworkError, CancelledError.
+    """
+
+def icon_worker(
+    client: ModrinthClient, project_id: str, url: str,
+    *, cancel: CancelToken | None = None,
+) -> IconBytes:
+    """Fetch one project icon as raw bytes. Never builds an image.
+
+    Raises:
+        ModrinthError, NetworkError, CancelledError.
+    """
+
+def plan_worker(
+    client: ModrinthClient,
+    project: str,
+    game_version: str,
+    installed: Mapping[str, str],
+    loader: str | None,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> InstallPlan:
+    """Resolve everything an install will write, before anything downloads.
+
+    Raises:
+        NoCompatibleVersionError, DependencyResolutionError, RateLimitedError,
+        ModrinthError, NetworkError, CancelledError.
+    """
+
+def install_worker(
+    client: ModrinthClient,
+    plan: InstallPlan,
+    dest_dir: Path,
+    game_version: str,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> list[Path]:
+    """Download and verify every file in the plan, recording each in the sidecar.
+
+    Raises:
+        ChecksumError, ModrinthError, InstanceError, NetworkError, HttpStatusError,
+        CancelledError, OSError.
+    """
+
+def list_worker(dest_dir: Path) -> list[InstalledMod]:
+    """Every jar or pack in the directory, described by its own metadata.
+
+    Raises:
+        InstanceError: the directory exists but cannot be listed.
+    """
+
+def updates_worker(
+    client: ModrinthClient,
+    installed: Sequence[InstalledMod],
+    game_version: str,
+    loader: str | None,
+    *,
+    progress: ProgressFn = null_progress,
+    cancel: CancelToken | None = None,
+) -> dict[str, ModVersion]:
+    """Filename → the newer version available for it; absent means up to date.
+
+    Raises:
+        RateLimitedError, CancelledError.
+    """
+
+def delete_worker(path: Path, *, confirm_protected: bool = False) -> str:
+    """Delete one installed file and forget its sidecar record; returns its base filename.
+
+    Raises:
+        InstanceError: the file cannot be deleted, or it is protected and
+            `confirm_protected` is False.
+    """
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class SearchResult:
+    """A search page plus what the screen needs to decide whether it is still wanted."""
+    serial: int
+    query: str
+    offset: int
+    page: SearchPage
+
+
+@dataclass(frozen=True, slots=True)
+class IconBytes:
+    """Raw icon bytes on their way to the UI thread. Never a PIL image, never a CTkImage."""
+    project_id: str
+    data: bytes
+```
+
+`icon_worker` returns `IconBytes`, never an image. Spec section 12 is explicit: icons are
+fetched by workers as raw bytes and `CTkImage` objects are constructed **only** on the UI
+thread. `IconCache.put` is where that happens, and its thread guard (section 22.1.6)
+turns a mistake into an immediate `RuntimeError` instead of an intermittent crash.
+
+#### 22.5.3 Layout
+
+Three columns inside the screen: the browse list (`weight=1`), a `SPACE_16` gutter, and
+the Installed pane at `INSTALLED_PANE_WIDTH` (`weight=0`). Widgets in creation order,
+which is Tab order:
+
+1. Heading — `Mods` or `Texture Packs`, `fonts.display` / `TEXT`.
+2. `Banner` (hidden).
+3. `CTkEntry` with `placeholder_text=SEARCH_PLACEHOLDER[kind]`, `border_width=BORDER_WIDTH`,
+   `border_color=BORDER`, `fg_color=SURFACE_RAISED`, `corner_radius=RADIUS_CONTROL`,
+   `height=CONTROL_HEIGHT`, `font=fonts.body`.
+4. Filter row: the sort `CTkOptionMenu` whose values are the labels of `SORT_LABELS` in
+   order (so `Most downloads` is the default), and the filter sentence
+   `FILTER_LINE[kind].format(version=…)` in `fonts.small` / `TEXT_MUTED`. It is a
+   sentence, not a join: no `·` appears anywhere in this package.
+5. A status `CTkLabel` at the right of the filter row: `Searching` while a search is in
+   flight, empty otherwise. **Not a spinner** — a word.
+6. `CTkScrollableFrame` for the results, `fg_color="transparent"`,
+   `scrollbar_button_color=BORDER`, `scrollbar_button_hover_color=TEXT_MUTED`
+   (section 21.12).
+7. The pagination row beneath it: `SHOWING.format(shown=…, total=…)` in `fonts.small` /
+   `TEXT_MUTED` and a `SecondaryButton` reading `LABEL_SHOW_MORE.format(n=…)`.
+8. The Installed pane: a `CTkFrame` at `RADIUS_CONTAINER` in `SURFACE_RAISED`, holding
+   the header (`Installed` in `fonts.body_bold` / `TEXT` with the count right-aligned in
+   `fonts.small` / `TEXT_MUTED`), the update `PrimaryButton` when there are updates, the
+   pack note for `KIND_RESOURCEPACK`, and a `CTkScrollableFrame` of entries.
+
+A results row, matching the wireframe exactly: a `CTkFrame` at `corner_radius=0`,
+`fg_color="transparent"`, `height=MOD_ROW_HEIGHT` (72 = `SPACE_12` + 48 + `SPACE_12`),
+gridded with four cells —
+
+| Cell | Content |
+|---|---|
+| icon | a `CTkLabel` sized `MOD_ICON_SIZE`; `fg_color=SURFACE_RAISED`, `corner_radius=RADIUS_CONTROL` until the image arrives, then the `CTkImage` from `IconCache` |
+| title and description | the title in `fonts.body_bold` / `TEXT` over the description in `fonts.small` / `TEXT_MUTED`; this is the one elastic column and both truncate with an ellipsis |
+| downloads | `format_count(hit.downloads)` in `fonts.small` / `TEXT_MUTED`, right-aligned in its own cell |
+| action | a `SecondaryButton` reading `Install`, or an inline `CTkProgressBar` while one runs |
+
+**No cards, no rules between rows, and no accent at rest.** Separation comes from the
+icon rhythm and `SPACE_12`. The row under the pointer or under keyboard focus fills with
+`SURFACE_RAISED`, which is where the raised surface does its work on this screen
+(section 21.11, item 3). The whole row is wrapped in a `FocusFrame` so it is
+Tab-reachable and Return activates its Install button.
+
+#### 22.5.4 Search, debounced
+
+Normative:
+
+1. Every `<KeyRelease>` on the entry cancels the pending `after` id (when there is one)
+   and schedules `after(SEARCH_DEBOUNCE_MS, …)`. `SEARCH_DEBOUNCE_MS` is 300, from spec
+   section 12. `on_hide` cancels the pending id; a screen the user has left does not
+   fire a search at them when they come back.
+2. When the timer fires, the screen increments `self._serial`, cancels the in-flight
+   search with `app.runner.cancel(mods_task_id(TASK_MOD_SEARCH, kind))`, calls
+   `reset_token` on the same id, and submits `search_worker` with the new serial,
+   `offset=0` and the current query and sort.
+3. A `TaskFinished` whose `SearchResult.serial` is not `self._serial` is **dropped**.
+   This is what makes fast typing correct: pages for abandoned queries never reach the
+   list, and the screen never has to reason about arrival order.
+4. `offset == 0` replaces the rows; `offset > 0` appends them — that is the
+   `Show 20 more` path.
+5. The status label reads `LABEL_SEARCHING` from submission until a result or a failure
+   arrives, and the previous results stay on screen underneath. Nothing animates.
+6. Pagination is `offset` / `total_hits` and nothing else (section 16.3). The row reads
+   `SHOWING.format(shown=len(rows), total=page.total_hits)`; the button is shown only
+   when `page.has_more` and reads
+   `LABEL_SHOW_MORE.format(n=min(PAGE_SIZE, page.total_hits - shown))`, so the last page
+   offers `Show 7 more` rather than lying about twenty.
+7. An empty query is legal and is the screen's opening state: `on_show` runs one search
+   with `query=""` and the sort menu's default `Most downloads`, which produces "the
+   mods most people install for this version" (section 16.3). The browser is therefore
+   never blank before the first keystroke, and `NO_RESULTS` is only ever seen after a
+   query that genuinely matched nothing.
+8. `game_version()` returning `""` replaces the results area with an `EmptyState` reading
+   `NO_VERSION_STATE` and submits nothing. No instance replaces the Installed pane with
+   `NO_INSTANCE_STATE`.
+
+Search failures: `TaskFailed` puts `message.user_message` in the banner with the action
+`Try again`. `NetworkError`'s message is already
+"Couldn't reach the server. Check your connection and try again." and `ModrinthError`'s
+is "Couldn't reach Modrinth. Check your connection and try again." — section 21.9's
+example sentence, defined once in `errors.py`.
+
+#### 22.5.5 Icons, asynchronously
+
+For each hit in a page, in order: if `hit.icon_url` is empty the row keeps its
+placeholder block and nothing is submitted. If `app.icons.has(hit.project_id)` the image
+is set immediately from the cache. Otherwise the screen submits `icon_worker` under
+`mods_task_id(TASK_MOD_ICON, kind, hit.project_id)`.
+
+On `TaskFinished` for an icon task the screen — **on the Tk thread** — calls
+`image = app.icons.put(result.project_id, result.data)` and, when it is not `None`,
+`row.icon_label.configure(image=image, text="", fg_color="transparent")`. A row that has
+scrolled out of existence by then is simply absent from the row index and the image stays
+in the cache for the next time it appears.
+
+On `TaskFailed` for an icon task: logged at DEBUG, the row keeps its placeholder, and
+**no banner and no dialog**. A missing thumbnail is not a failure a player needs to act
+on, and `fetch_icon_bytes` already converts every non-2xx into a `ModrinthError` so an
+`HttpStatusError` can never reach here (section 16.3).
+
+The cache is `MaestroApp`'s single `IconCache`, shared by both screens, so switching to
+Texture Packs and back refetches nothing, and scrolling a results list back up refetches
+nothing — spec section 12's requirement, met by construction.
+
+#### 22.5.6 Installing, one click
+
+The section 0 amendment dated 2026-09-03 reconciles spec section 12's "one-click Install"
+with spec section 9's "show the user the full list of what will be installed before
+downloading": a single-file plan installs immediately; a plan with dependencies opens a
+confirm dialog first.
+
+1. `Install` pressed. The row button becomes `LABEL_INSTALLING`, disabled, and an inline
+   `CTkProgressBar` in `ACCENT` appears in the action cell. That bar is the running row's
+   one accent element and it is the only accent in the browse pane (section 21.2).
+2. `plan_worker` is submitted under the `INSTALL_PHASE_PLAN` id with
+   `installed=core.modrinth.installed_index(dest_dir)` and
+   `loader=FABRIC_LOADER` for `KIND_MOD`, `loader=None` for `KIND_RESOURCEPACK` — a
+   resource pack has no loader and sending one returns zero results (section 16.1).
+3. `Progress` for that id drives the inline bar. `resolve_install_plan` reports
+   `(f"Checking {name}", resolved, resolved + pending)` (section 16.4), a growing total,
+   which is honest and never zero — so the bar is determinate from the first tick.
+4. `TaskFinished` gives an `InstallPlan`.
+   - `plan.is_single` → `install_worker` is submitted straight away under the
+     `INSTALL_PHASE_FILES` id. No dialog: a confirm for one file is noise.
+   - otherwise → `app.confirm(...)` with `lines=plan.describe()` (section 16.2 owns the
+     per-line format), the title `CONFIRM_INSTALL_TITLE.format(title=…)`, the body
+     `CONFIRM_INSTALL_ONE` when the plan holds exactly two files and
+     `CONFIRM_INSTALL_MANY` otherwise — with `deps=count_word(n - 1)` and
+     `total=count_word(n)`, so the wireframe's "needs two more files. All three go into
+     the default instance." is produced by the same format string that produces "needs
+     four more files. All five …". The confirm button is
+     `CONFIRM_INSTALL_BUTTON.format(n=len(plan.versions_in_install_order))`, always
+     plural because this branch only runs for two or more files. `True` submits
+     `install_worker`; `False` returns the row button to `Install`.
+   - a plan whose `versions_in_install_order` is empty (everything already on disk at the
+     right version) skips straight to the installed state without downloading anything.
+   - Texture packs have no dependencies, so this dialog never appears on that screen; the
+     branch is not special-cased away, it simply never triggers.
+5. `Progress` for the `INSTALL_PHASE_FILES` id drives the same inline bar. `install`
+   reports through a `Reporter` (section 16.4 step 6) so the scale is permille; the bar
+   computes `done / total` and does not care.
+6. `TaskFinished` → the row button becomes `LABEL_INSTALLED`, disabled; the inline bar is
+   removed; `TASK_MOD_LIST` is resubmitted so the Installed pane picks the file up.
+   **The verb survived the flow**: `Install` produced `Installing` produced `Installed`.
+7. `TaskFailed` on either phase → the row button returns to `Install`, the inline bar is
+   removed, and `message.user_message` goes in the banner. `NoCompatibleVersionError`
+   already says "{project} isn't available for Minecraft {version} yet." and
+   `DependencyResolutionError` already says "One of the mods this needs isn't available
+   for Minecraft {version}. Nothing was installed." — both from section 2, unchanged.
+   A `CancelledError` shows nothing.
+8. A row whose `project_id` is a key of `installed_index(dest_dir)` renders its button as
+   `LABEL_INSTALLED`, disabled, from the moment the page is drawn. That is why
+   `TASK_MOD_LIST` runs before or alongside the first search.
+
+#### 22.5.7 The Installed pane
+
+`TASK_MOD_LIST` runs `list_worker(dest_dir)` on `on_show`, after any install or delete,
+and whenever `instance_changed()` marked the pane stale. The header count is
+`len(installed)`; the pane reads `LABEL_LOADING` while the task runs. `list_installed`
+lists `.jar`, `.jar.disabled`, `.zip` and `.zip.disabled` children (section 16.6 and the
+section 0 amendment dated 2026-09-04), so the Texture Packs pane lists what it installed.
+
+An entry, for `KIND_MOD`:
+
+| Element | Content |
+|---|---|
+| name | `mod.name` in `fonts.body_bold` / `TEXT` |
+| version | `mod.version` in `fonts.small` / `TEXT_MUTED`, or `UPDATE_READY.format(installed=mod.version, available=candidate.version_number)` when the update sweep found one |
+| switch | a `CTkSwitch` inside a `FocusFrame`, text `LABEL_ON` when enabled and `LABEL_OFF` when not |
+| remove | a `SecondaryButton` reading `Remove`, at least `MIN_TARGET` in both dimensions |
+
+separated from the next entry by a 1 px `BORDER` rule.
+
+For `KIND_RESOURCEPACK` the switch is **absent** — Minecraft turns resource packs on
+itself, `.disabled` renaming means nothing there, and `set_enabled` is never called on a
+pack (section 0 amendment, 2026-09-04). The pane instead carries `PACK_PANE_NOTE` above
+the list, which is what the wireframe shows.
+
+Empty pane: an `EmptyState` reading `EMPTY_INSTALLED[kind]` — an invitation, not a blank
+panel.
+
+**Toggling.** The switch's command calls `core.modrinth.set_enabled(mod.path, enabled)`
+directly on the Tk thread: it is a single `os.rename` and completes in well under a
+millisecond, so it is not a long operation and does not go through `TaskRunner`. On
+success the entry is rebuilt with the returned path. On `InstanceError` the switch is
+put back to its previous position and the error is handled:
+
+- When `mod.protected` is true the refusal is the protected one (section 16.6 raises it
+  with `user_message=PROTECTED_WARNING` before touching the filesystem). The screen calls
+  `app.confirm(PROTECTED_DISABLE_TITLE, PROTECTED_WARNING,
+  confirm_label=PROTECTED_DISABLE_TITLE, cancel_label=LABEL_KEEP_ON)` and, when
+  confirmed, calls `set_enabled(path, enabled, confirm_protected=True)`.
+- Any other `InstanceError` goes in the banner with its `user_message` — a rename that
+  collided with an existing twin, for instance.
+
+**Removing.** `Remove` asks first, always:
+
+- Not protected → `app.confirm(CONFIRM_REMOVE_TITLE.format(name=mod.name),
+  CONFIRM_REMOVE_BODY.format(name=mod.name, instance=instance.name),
+  confirm_label=LABEL_REMOVE, cancel_label=LABEL_KEEP)`.
+- Protected → `app.confirm(PROTECTED_REMOVE_TITLE, PROTECTED_WARNING,
+  confirm_label=PROTECTED_REMOVE_TITLE, cancel_label=LABEL_KEEP)`, which is section
+  21.8's dialog verbatim: the accent button reads `Remove Fabric API` and the quiet one
+  reads `Keep it`.
+
+A confirmed removal submits `delete_worker` under
+`mods_task_id(TASK_MOD_DELETE, kind, mod.filename)` with
+`confirm_protected=mod.protected`, and the button reads `LABEL_REMOVING` until it
+finishes. `TaskFinished` resubmits `TASK_MOD_LIST`; `TaskFailed` restores the button and
+banners the `user_message`.
+
+**Fabric API can never be turned off or deleted without a warning first.** Section 16.6
+enforces that in `core/modrinth.py` — both functions refuse without
+`confirm_protected=True` — and this screen is the only caller that ever passes it, always
+after the dialog above. There is no keyboard shortcut, no context menu and no bulk action
+that reaches either function by another route.
+
+**Updates.** When `TASK_MOD_LIST` finishes with a non-empty list, the screen submits
+`updates_worker` under `mods_task_id(TASK_MOD_UPDATES, kind)` with the same `loader` rule
+as installs. The pane header reads `LABEL_CHECKING_UPDATES` while it runs.
+`TaskFinished` gives `dict[str, ModVersion]` keyed by `InstalledMod.filename`
+(section 16.7), so each entry looks its own badge up with no re-derivation; every entry
+with a badge gets the `UPDATE_READY` version line, and the pane's `PrimaryButton` appears
+reading `LABEL_UPDATE_ONE` or `LABEL_UPDATE_MANY.format(n=len(updates))`. That button is
+the Installed pane's one accent element, and it exists only while there is something to
+update — the pane at rest has no accent.
+
+Pressing it installs each update through the ordinary path: for each entry, the
+`INSTALL_PHASE_FILES` task for that project, one after another. `install` deletes the
+superseded filename recorded in the sidecar after the new file is verified on disk
+(section 16.4 step 5), so an update is never a delete-then-download.
+
+`TaskFailed` for `TASK_MOD_UPDATES` sets no badges and shows the banner **only** when
+`message.exc` is a `RateLimitedError` — that one is worth telling the user about because
+it is temporary and self-correcting. Every other failure is logged and swallowed: a
+delisted project or a dropped connection during a background sweep is not something to
+interrupt a player over, and `check_updates` already swallows the per-project errors
+itself (section 16.7).
+
+### 22.6 Message ownership, in one table
+
+Every `messages.py` type (section 4), the screen that handles it, and what it does. An
+implementer building one screen reads only its own rows; a reviewer checks that no type
+is unhandled and no type has two owners.
+
+| Message | `AccountScreen` | `PlayScreen` | `ModsScreen` |
+|---|---|---|---|
+| `AuthCode` | shows the code, the link and `Waiting for you to finish in your browser.` | — | — |
+| `Progress` | status line = `label`, for `TASK_SIGN_IN` and `TASK_REFRESH`; no bar on this screen | drives the determinate bar and the percentage, for `TASK_LAUNCH` and `TASK_BUNDLED_MODS` | drives a row's inline bar, for both `TASK_MOD_INSTALL` phases; `TASK_MOD_UPDATES` progress is ignored |
+| `TaskFinished` | `TASK_SIGN_IN`, `TASK_REFRESH` → adopt the `Account` | `TASK_VERSIONS`, `TASK_LAUNCH`, `TASK_INSTANCE`, `TASK_BUNDLED_MODS` | `TASK_MOD_SEARCH`, `TASK_MOD_ICON`, `TASK_MOD_INSTALL`, `TASK_MOD_LIST`, `TASK_MOD_UPDATES`, `TASK_MOD_DELETE` |
+| `TaskFailed` | status line = `user_message` | banner = `user_message`, action `Try again` | banner = `user_message`, except icon failures (silent) and non-rate-limit update failures (silent) |
+| `LogLine` | — | appended to the 200-line deque that backs the crash panel | — |
+| `GameStarted` | — | button `Stop`, status `Running` | — |
+| `GameExited` | — | ready line, `Minecraft closed.`, or the crash panel | — |
+
+Task ids each screen owns, so no id is claimed twice:
+
+| Screen | Task ids |
+|---|---|
+| `AccountScreen` | `TASK_SIGN_IN`, `TASK_REFRESH` |
+| `PlayScreen` | `TASK_VERSIONS`, `TASK_LAUNCH`, `TASK_GAME`, `TASK_INSTANCE`, `TASK_BUNDLED_MODS` |
+| `ModsScreen` (`KIND_MOD`) | the six mod kinds with `:mod` in the item key |
+| `ModsScreen` (`KIND_RESOURCEPACK`) | the six mod kinds with `:resourcepack` in the item key |
+
+`TASK_GAME` never carries a `Progress`, `TaskFinished` or `TaskFailed`: `GameProcess` is
+not run through `TaskRunner.submit`. It is given the runner's `queue` directly
+(section 19) and posts `GameStarted`, `LogLine` and `GameExited` under that id.
+
+### 22.7 The complete interface copy
+
+Every string a user can read, in the voice section 21.9 established: active voice,
+sentence case, no filler, no apology, buttons that name what happens. `Texture Packs` is
+the one title-cased label, because that is how Minecraft names it.
+
+**Buttons.** Each one is a bare verb phrase; none has an arrow glued to it.
+
+| Where | Label(s) |
+|---|---|
+| Sidebar | `Play`, `Mods`, `Texture Packs`, and the account row (the player's name, or `Sign in`) |
+| Account | `Sign in`, `Sign out`, `Switch account`, `Copy code` → `Copied`, `Cancel`, `Use Minecraft sign-in` |
+| Play | `Play` (disabled but still `Play` while preparing), `Stop`, `Cancel`, `New`, `Rename`, `Delete`, `Copy log` → `Copied`, `Dismiss`, `Try again` |
+| Instance dialogs | `Create instance`, `Rename instance`, `Delete instance` / `Keep it` |
+| Mods | `Install` → `Installing` → `Installed`, `Remove` → `Removing`, `Show 20 more`, `Update 1 mod` / `Update 2 mods`, `On` / `Off` |
+| Mod dialogs | `Install 3 files` / `Cancel`, `Remove` / `Keep it`, `Remove Fabric API` / `Keep it`, `Turn off Fabric API` / `Keep it on` |
+| Dialogs generally | `Close` (error), `Cancel` (default quiet label) |
+| Closing with a game running | `Close launcher` / `Keep it open` |
+
+**Status and prose.**
+
+| Situation | The string |
+|---|---|
+| Ready to launch | `Ready to play {version} with Fabric.` |
+| Preparing | the step's own label — `Checking versions`, `Reading the version file`, `Installing Java`, `Downloading the game`, `Downloading libraries`, `Setting up Fabric`, `Downloading Fabric`, `Downloading assets`, `Unpacking natives`, `Building the command` (section 18), or a child's finer label such as `Assets — 132.4 MB of 480.1 MB` (section 14) — with the percentage right-aligned |
+| Game running | button `Stop`, status `Running` |
+| Game closed cleanly | `Minecraft closed.` |
+| Game crashed | `Minecraft stopped unexpectedly.` + `Exit code {code}` + `GameExited.hint` when there is one |
+| Memory note | `More memory is not more speed. 4–8 GB suits Sodium and a normal modlist; a bigger heap makes pauses longer.` |
+| Not signed in | `Sign in before you play.` with a `Sign in` button |
+| No instance | `No instance yet. Press New to make one.` |
+| Loading the version list | `Loading versions` |
+| Deleting an instance | `Deleting {name}` |
+| Sign-in lead | `Sign in with your Microsoft account to play.` |
+| Sign-in steps | `1  Open  {link}` and `2  Enter this code` |
+| Sign-in wait | `Waiting for you to finish in your browser.` |
+| Sign-in progress | `Waiting for you to sign in`, `Signing in to Xbox Live`, `Checking your Xbox profile`, `Signing in to Minecraft`, `Loading your profile` (section 10.8) |
+| Signed in | `Signed in as {name}` over the dashed UUID |
+| No Entra client id | `MaestroLauncher needs an application id before it can sign you in. Register one in Azure, or switch to the Minecraft launcher's own sign-in.` |
+| Clipboard refused | `Couldn't reach the clipboard. Type the code by hand.` |
+| Browser refused | `Couldn't open your browser. Go to {url} by hand.` |
+| Mods filter line | `For {version}, Fabric` — Texture Packs: `For {version}` |
+| Searching | `Searching` |
+| Pagination | `Showing {shown} of {total}` and `Show {n} more` |
+| Installed pane | `Installed` with the count; `Checking for updates` while the sweep runs |
+| Update badge | `{installed} → {available} ready` |
+| Texture-pack pane note | `Turn packs on inside Minecraft, under Options then Resource Packs.` |
+| Sodium unavailable | `Sodium isn't available for {version} yet.` (section 17's `MISSING_BANNER`) |
+| Closing with a game running | `Minecraft is still running. It keeps running if you close the launcher.` |
+
+**Empty states — invitations, never blank panels.**
+
+| Where | The string |
+|---|---|
+| Search matched nothing (Mods) | `No mods match {query} for {version}. Try a shorter word, or change the version on the Play screen.` |
+| Search matched nothing (Texture Packs) | `No texture packs match {query} for {version}. Try a shorter word, or change the version on the Play screen.` |
+| Installed pane, mods | `No mods yet. Search on the left and press Install.` |
+| Installed pane, texture packs | `No texture packs yet. Search above and install one. Packs turn on inside Minecraft, under Options then Resource Packs.` |
+| No version resolved yet | `Pick a Minecraft version on the Play screen and this list fills in.` |
+| No instance yet, on a Mods screen | `Make an instance on the Play screen and this list fills in.` |
+
+**Errors.** Every error line a user sees is a `LauncherError.user_message` from
+section 2, shown verbatim. `ui/` never rewrites one, never prefixes it with an apology
+and never appends a stack trace. The four the user will meet most often, quoted from
+section 2 so an implementer can check them without leaving this page:
+
+- `Couldn't reach Modrinth. Check your connection and try again.` (`ModrinthError`)
+- `Couldn't reach the server. Check your connection and try again.` (`NetworkError`)
+- `This Microsoft account doesn't own Minecraft: Java Edition. If you play through Game
+  Pass, open the official Minecraft Launcher once with this account, then try again.`
+  (`NoJavaEditionError`)
+- `Fabric API is what your other mods run on. Turning it off or removing it will stop
+  them loading. Confirm that you want to do this.` (`PROTECTED_WARNING`, section 16)
+
+**Dialog bodies.**
+
+| Dialog | Body |
+|---|---|
+| Install with dependencies (two files) | `{title} needs one more file. Both go into the {instance} instance.` |
+| Install with dependencies (three or more) | `{title} needs {deps} more files. All {total} go into the {instance} instance.` |
+| Remove a mod | `{name} will be deleted from the {instance} instance. Your worlds are not affected.` |
+| Remove or disable Fabric API | `PROTECTED_WARNING`, unchanged |
+| New / rename instance | `Name it something you'll recognise. Letters, numbers, spaces, dots, dashes and underscores.` plus, on a bad name, the matching `user_message` from section 17.2 |
+| Delete instance | `The {name} instance and everything in it — mods, worlds and settings — will be removed. This can't be undone.` |
+
+### 22.8 The quality floor, and where each part of it lives
+
+Spec section 13's floor, mapped to the code that guarantees it, so a reviewer can check
+each claim rather than take it:
+
+| Requirement | Where it is enforced |
+|---|---|
+| Full keyboard navigation with a visible focus indicator on every control | `attach_focus_ring` (22.1.1) is called by every constructor in `ui/widgets.py` and by every screen for the widgets it builds directly; `FocusFrame` covers `CTkSwitch`, `CTkSlider` and the mod row. Tab order is creation order, and every screen creates in reading order. |
+| Text contrast at 4.5:1 | Section 21.3's computed table; `tests/test_theme.py` (section 24) recomputes it. `ui/` uses only those pairs. |
+| Clickable targets no smaller than 32 × 32 | `CONTROL_HEIGHT` (36) on every button, entry and option menu; `MIN_TARGET` (32) as the clamped floor for any caller-supplied width, including the Installed pane's `Remove`. |
+| Determinate progress for anything over ~200 ms, never a bare spinner | Rule 2 of section 22, and the fact that the only three bars in the app (`PlayScreen`'s, the mod row's inline bar, and nothing else) are all `mode="determinate"`. Operations with no measurable total show the words `Searching`, `Loading` or `Loading versions`. |
+| No window resize below a stated minimum | `MaestroApp` calls `self.minsize(*MIN_WINDOW)`; section 21.7 does the arithmetic that shows the layout survives 960 × 600. |
+| No raw hex anywhere in `ui/` | Rule 4 of section 22; enforced mechanically by `tests/test_theme.py`. |
+| Workers never touch a widget | Rule 1 of section 22; enforced at runtime by `IconCache`'s thread guard, and by every worker in this package being a module-level function that takes and returns plain data. |
+
+---
+
+## 23. `main.py`
+
+Module 23 in the map, and the only module that may import everything. It does five
+things in a fixed order and then hands control to the window: parse the command line,
+check that the dependencies are installed, set up logging, load the configuration, and
+bootstrap the first run.
+
+```python
+EXIT_OK: Final[int] = 0
+EXIT_FAILURE: Final[int] = 1
+PROG: Final[str] = "maestrolauncher"
+VERSION_TEXT: Final[str] = f"{LAUNCHER_NAME} {LAUNCHER_VERSION}"   # from paths.py
+LOG_LEVELS: Final[dict[str, int]] = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+DEFAULT_LOG_LEVEL: Final[str] = "info"
+REQUIRED_MODULES: Final[tuple[tuple[str, str], ...]] = (
+    ("customtkinter", "customtkinter"),
+    ("requests", "requests"),
+    ("PIL", "Pillow"),
+)
+MISSING_DEPENDENCY_MESSAGE: Final[str] = (
+    "MaestroLauncher needs some Python packages that aren't installed here: {missing}.\n"
+    "\n"
+    "Install them with:\n"
+    "\n"
+    "    pip install -r requirements.txt\n"
+)
+MISSING_TK_MESSAGE: Final[str] = (
+    "MaestroLauncher needs Tk, and this Python was built without it.\n"
+    "\n"
+    "On Linux, install your distribution's python3-tk package. On Windows and macOS,\n"
+    "reinstall Python from python.org with the Tcl/Tk option enabled.\n"
+)
+```
+
+`LAUNCHER_NAME` and `LAUNCHER_VERSION` come from `paths.py` (section 3), which is
+stdlib-only and therefore safe to import before the dependency check.
+
+### 23.1 The command line
+
+```python
+def build_parser() -> argparse.ArgumentParser:
+    """The launcher's argument parser: `--home`, `--log-level`, `--version`.
+
+    Raises:
+        nothing.
+    """
+```
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `--home PATH` | string | unset | Use `PATH` as the launcher directory instead of the platform default. Everything — `config.json`, `accounts.json`, `runtimes/`, `libraries/`, `assets/`, `versions/`, `instances/`, `launcher.log` — moves with it, because every path in the launcher comes from one `Paths` (section 3). A relative path is resolved against the current working directory. |
+| `--log-level LEVEL` | one of `LOG_LEVELS` | `info` | The level passed to `configure_logging`. |
+| `--version` | flag | — | Print `VERSION_TEXT` and exit 0. Handled by `argparse` itself. |
+
+`main` calls `parser.parse_args(argv)` with `argv=None` meaning `sys.argv[1:]`, which is
+what makes `main(["--home", str(tmp_path)])` a complete end-to-end test entry point. A
+parse error makes `argparse` print its own usage and raise `SystemExit(2)`; `main` lets
+that through, because an unusable command line is the shell's business and not a dialog.
+
+### 23.2 The dependency check
+
+```python
+def check_dependencies(
+    modules: Sequence[tuple[str, str]] = REQUIRED_MODULES,
+) -> list[str]:
+    """The distribution names of the required modules that are not importable here.
+
+    Raises:
+        nothing.
+    """
+
+def check_tk() -> bool:
+    """True when `tkinter` can be imported — a Python built without Tk cannot run the UI.
+
+    Raises:
+        nothing.
+    """
+```
+
+Normative, and the reason `main.py`'s module-level imports are stdlib-only:
+
+1. `check_dependencies` uses `importlib.util.find_spec(module)` on each pair and collects
+   the second element — the **distribution** name, which is what `pip` understands — for
+   every module whose spec is `None` or whose lookup raised `ModuleNotFoundError` or
+   `ValueError`. It imports nothing, so a package that is installed but broken is not
+   reported as missing here; that surfaces later as a real traceback in the log.
+2. When the list is non-empty, `main` writes
+   `MISSING_DEPENDENCY_MESSAGE.format(missing=", ".join(missing))` to `sys.stderr` and
+   returns `EXIT_FAILURE` (1). **No traceback**: a user who has just cloned the
+   repository and typed `python main.py` gets one paragraph and the exact command to run,
+   not forty lines of import machinery.
+3. `check_tk` is a separate check with a separate message, because
+   `pip install -r requirements.txt` cannot fix a Python built without Tk and telling the
+   user to run it would waste their time. It is checked first, and
+   `MISSING_TK_MESSAGE` is printed on its own.
+4. **Everything third-party is imported after this check.** `main.py`'s module-level
+   imports are `argparse`, `logging`, `os`, `sys`, `pathlib` and the launcher's own
+   stdlib-only modules (`errors`, `paths`, `logsetup`); `core`, `auth`, `tasks`, `theme`
+   and `ui` are imported inside `main()` after `check_dependencies` returns empty. That
+   ordering is the whole point of the check — an import at the top of the file would
+   raise `ModuleNotFoundError` before a single line of guidance could be printed.
+
+### 23.3 Paths, logging and config
+
+```python
+def resolve_paths(home: str | None) -> Paths:
+    """`Paths.for_root(home)` when `--home` was given, else `Paths.default()`.
+
+    Raises:
+        ConfigError: the directories cannot be created.
+    """
+```
+
+Normative order, each step depending on the one before:
+
+1. `paths = resolve_paths(args.home)`, then `paths.ensure()`. A `ConfigError` here —
+   a read-only disk, a `--home` inside a directory the user cannot write — is caught in
+   `main`, its `user_message` is printed to `sys.stderr`, and `main` returns
+   `EXIT_FAILURE`. There is no window yet, so there is nothing to show a dialog in.
+2. `logger = logsetup.configure_logging(paths, LOG_LEVELS[args.log_level])`. It never
+   raises: a launcher that cannot write `launcher.log` still starts, with a console
+   handler only (section 5.2). It is called **before** anything else so that every later
+   failure is in the log, and its `RedactingFilter` is installed on every handler from
+   the first line.
+3. `config = core.config.load_config(paths)`. It never raises and repairs or creates the
+   file itself (section 8.4), so spec section 11's "must start cleanly with a corrupt or
+   absent config.json" needs no handling here at all.
+4. `logger.info` records the launcher version, the Python version, the platform and the
+   resolved root — never a token, because the redactor is already in place.
+
+### 23.4 First-run bootstrap
+
+```python
+def bootstrap(
+    paths: Paths,
+    config: Config,
+    instances: InstanceManager,
+) -> bool:
+    """Make sure a usable instance exists and say whether it was created just now.
+
+    Raises:
+        InstanceError: the default instance cannot be created.
+    """
+```
+
+Normative, in this order:
+
+1. `existing = instances.names()`.
+2. When `existing` is empty: `created = True`, and
+   `instances.ensure_default(config.selected_version or "")` creates
+   `instances/default/` with its seven directories and a `DEFAULT_OPTIONS_TXT`
+   (section 17.3). The version id is allowed to be `""` — section 17.1 says that means
+   "not decided yet", and it is genuinely not decided, because the manifest has not been
+   fetched and fetching it on this thread would block the window before it opens.
+   `"default"` is written here and **nowhere else in the launcher** (spec section 10).
+3. When `existing` is non-empty but `config.selected_instance` names none of them (the
+   user deleted a directory by hand), `config.selected_instance` is set to `existing[0]`
+   and `created` is `False`.
+4. `core.config.save_config(paths, config)` when anything changed; a `ConfigError` is
+   logged at WARNING and swallowed — the launcher runs fine with an unwritable config
+   for one session.
+5. Returns `created`.
+
+`bootstrap` does **not** schedule the bundled-mod install, and this is deliberate.
+`InstanceManager.install_bundled_mods` refuses an empty `version_id` (section 17.4) and
+the version is not known until `TASK_VERSIONS` returns the manifest. So `bootstrap`'s
+return value is passed to `MaestroApp(..., bootstrap_bundled=created)` and `PlayScreen`
+submits `TASK_BUNDLED_MODS` the moment the manifest resolves a version, writing it into
+the instance first (section 22.4.2). Fabric API and Sodium are installed on a fresh
+instance either way — spec section 9 — through exactly the same code path a user's own
+Install click uses.
+
+### 23.5 `main`
+
+```python
+def main(argv: list[str] | None = None) -> int:
+    """Run the launcher; returns a process exit code and never raises.
+
+    Raises:
+        nothing. Every `LauncherError` is logged, reported and turned into an exit code.
+    """
+```
+
+Normative, in this order:
+
+1. `args = build_parser().parse_args(argv)`.
+2. `check_tk()`; on failure print `MISSING_TK_MESSAGE` and return `EXIT_FAILURE`.
+3. `check_dependencies()`; on a non-empty result print `MISSING_DEPENDENCY_MESSAGE` and
+   return `EXIT_FAILURE`.
+4. Import `core`, `auth`, `tasks`, `theme` and `ui` — the first point in the program where
+   a third-party module is loaded.
+5. `paths`, `configure_logging`, `load_config`, as in section 23.3.
+6. `theme.apply_theme()`. It must run **before** the `CTk` root is constructed
+   (section 21.12), which is why it is here and not inside `MaestroApp`.
+7. Build the long-lived collaborators, in dependency order:
+   `http = core.net.Http()`; `runner = tasks.TaskRunner()`;
+   `store = auth.AccountStore(paths)`; `instances = core.instances.InstanceManager(paths)`;
+   `modrinth = core.modrinth.ModrinthClient(http)`.
+8. `accounts = store.load()` (never raises); the starting account is
+   `store.get(config.last_account)` when `config.last_account` is set and found, else
+   `accounts[0]` when there is one, else `None`.
+9. `created = bootstrap(paths, config, instances)`; an `InstanceError` here is logged,
+   its `user_message` printed to `sys.stderr`, and `main` returns `EXIT_FAILURE` — a
+   launcher with nowhere to put a game cannot usefully open a window.
+10. `app = MaestroApp(paths, config, http=http, runner=runner, store=store,
+    instances=instances, modrinth=modrinth, account=account,
+    bootstrap_bundled=created)`.
+11. `app.show(SCREEN_PLAY if account is not None else SCREEN_ACCOUNT)` — spec section 12
+    and section 21.8: on a first run with no account the app opens on Account.
+12. `app.run()`, which returns when the window closes.
+13. A `finally` block calls `runner.shutdown(wait=False, cancel_futures=True)` and
+    `http.close()`, each guarded, so the collaborators are released even when `run()`
+    raised. Both are idempotent, and `MaestroApp.on_close` has usually called them
+    already.
+14. Return `EXIT_OK`.
+
+Failure handling around steps 10 to 12:
+
+| Escaping exception | What `main` does |
+|---|---|
+| `LauncherError` | `logger.exception`, print `exc.user_message` to `sys.stderr`, return `EXIT_FAILURE`. |
+| `KeyboardInterrupt` | `logger.info("interrupted")`, return `EXIT_OK`. Ctrl-C in the terminal that launched the window is a normal way to stop it. |
+| any other `Exception` | `logger.exception`, print `LauncherError.default_user_message` to `sys.stderr`, return `EXIT_FAILURE`. The traceback is in `launcher.log`, redacted; the terminal gets one sentence. |
+
+```python
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+`main` returning an `int` rather than calling `sys.exit` is what lets
+`tests/test_main.py` call it directly with `--home` pointed at a `tmp_path` and assert
+the exit code, the created directory tree and the written `config.json` without starting
+a window. The whole thing runs from `python main.py` on a clean machine with no Java
+installed and no environment variables set — spec section 14 — because the Java runtime
+is provisioned on the first Play (section 11) and every path comes from `Paths.default()`
+(section 3).
+
+---
+
+## 24. Test conventions
+
+`tests/` holds one module per contract section, named `test_<module>.py`
+(`tests/test_net.py` for section 7, `tests/test_modrinth.py` for section 16, and so on).
+`tests/conftest.py` holds the fixtures below and nothing else. **No test in the default
+run touches the network or opens a window.**
+
+### 24.1 `pytest.ini`
+
+The file at the repository root, in full:
+
+```ini
+[pytest]
+testpaths = tests
+addopts = -m "not live"
+markers =
+    live: needs network access; deselected by default
+    display: needs a Tk display; skipped when one cannot be opened
+```
+
+`addopts = -m "not live"` means a bare `pytest` never makes a real request. Running the
+network tests is an explicit `pytest -m live`. The `display` marker is not deselected by
+default — those tests are *skipped at runtime* when Tk cannot open a window, so they run
+on a developer's machine and skip in a headless CI container without anyone editing this
+file.
+
+### 24.2 `FakeAdapter`
+
+The whole HTTP stack is exercised offline by mounting an adapter on the `Http` session.
+`Http.__init__` takes an `adapter` parameter for exactly this reason (section 7.1), and
+because the adapter sits *below* `requests`, everything above it is the real code:
+`Session`, the default headers, `params` encoding, `stream=True`, `iter_content`, and the
+retry policy.
+
+```python
+Route: TypeAlias = (
+    requests.Response
+    | Callable[[requests.PreparedRequest], requests.Response]
+    | list[requests.Response | Callable[[requests.PreparedRequest], requests.Response]]
+)
+
+
+@dataclass(slots=True)
+class RecordedCall:
+    """One `BaseAdapter.send` the launcher made, with everything a test asserts on."""
+    method: str                      # upper-cased
+    url: str                         # the full URL, query string included
+    path: str                        # scheme://netloc/path — the routing key's url half
+    query: dict[str, list[str]]      # `urllib.parse.parse_qs` of the query string
+    headers: dict[str, str]          # the PreparedRequest's headers
+    body: bytes | str | None         # the PreparedRequest's body
+    kwargs: dict[str, Any]           # exactly what `send` received
+
+    @property
+    def timeout(self) -> Any:
+        """`kwargs["timeout"]` — assert it equals `(10, 60)`."""
+
+    @property
+    def stream(self) -> bool:
+        """`kwargs["stream"]`."""
+
+
+class FakeAdapter(requests.adapters.BaseAdapter):
+    """Serves canned responses by (METHOD, url-without-query) and records every call."""
+
+    calls: list[RecordedCall]
+
+    def __init__(
+        self,
+        routes: Mapping[tuple[str, str], Route] | None = None,
+        *,
+        default: Route | None = None,
+    ) -> None:
+        """Build an adapter; `default` answers any request no route matches.
+
+        Raises:
+            nothing.
+        """
+
+    def add(self, method: str, url: str, route: Route) -> "FakeAdapter":
+        """Register or replace one route; returns self so calls chain.
+
+        Raises:
+            nothing.
+        """
+
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: Any = None,
+        verify: bool | str = True,
+        cert: Any = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        """Record the call and return the routed response.
+
+        Raises:
+            AssertionError: no route and no default matches this request.
+            Exception: whatever a callable route chose to raise.
+        """
+
+    def close(self) -> None:
+        """Required by `BaseAdapter`; does nothing."""
+
+    def calls_for(self, method: str, url: str) -> list[RecordedCall]:
+        """Every recorded call whose `(method, path)` matches, in order."""
+
+    @property
+    def urls(self) -> list[str]:
+        """`[c.url for c in self.calls]` — the request sequence, for an order assertion."""
+```
+
+Normative:
+
+1. **The routing key is `(method.upper(), url without its query string or fragment)`.**
+   Query parameters are recorded, not routed on, because a caller builds them through
+   `params` and a test asserts on `RecordedCall.query` afterwards. One route therefore
+   serves every page of a paginated search.
+2. Resolution order: the exact key, then `default`, then `AssertionError` naming the
+   method and URL. An unrouted request is a **test failure with a readable message**, not
+   a real connection: `BaseAdapter` is mounted on both `http://` and `https://`, so
+   nothing can escape to the network by accident.
+3. A route that is a `Response` is returned for every matching call.
+4. A route that is a **callable** receives the `PreparedRequest` and returns a
+   `Response`. It may instead **raise** — `requests.ConnectionError`,
+   `requests.ConnectTimeout`, `requests.ReadTimeout` — which is how the `NetworkError`
+   and retry paths of section 7 are tested without waiting for a real timeout.
+5. A route that is a **list** is consumed in order, one entry per matching call. When the
+   list is exhausted the **last entry is reused** for every later call. That is what makes
+   a retry test read naturally: `[error_500, error_500, ok]` produces two failures then
+   success for ever after.
+6. Every call is appended to `self.calls` as a `RecordedCall` **before** the route is
+   resolved, so a call that raises is still recorded. `kwargs` holds exactly the keyword
+   arguments `send` received, which is where `timeout` lives.
+7. `send` sets `response.request = request` and, when `response.url` is empty,
+   `response.url = request.url`, so `HttpStatusError.url` and `response.url` are correct
+   in every test.
+
+The single most valuable assertion this enables, and the one spec section 11 asks for:
+
+```python
+assert all(call.timeout == (10, 60) for call in adapter.calls)
+```
+
+`Http` is the only place a timeout is written (section 7.1) and no method there takes a
+`timeout` parameter, so this one line over any test's recorded calls covers every request
+the launcher makes.
+
+### 24.3 `make_response`
+
+```python
+def make_response(
+    status: int = 200,
+    *,
+    json: Any = None,
+    content: bytes = b"",
+    headers: Mapping[str, str] | None = None,
+    url: str = "",
+    encoding: str = "utf-8",
+    reason: str = "",
+) -> requests.Response:
+    """Build a real `requests.Response` with a readable, streamable body.
+
+    Raises:
+        ValueError: both `json` and a non-empty `content` were given.
+        TypeError: `json` is not JSON-serialisable — `json.dumps` is left unwrapped.
+    """
+```
+
+Normative:
+
+1. It returns a genuine `requests.Response`, not a stand-in. `status_code`, `url`,
+   `encoding` and `reason` are set from the arguments; `headers` becomes a
+   `requests.structures.CaseInsensitiveDict`, so `X-Ratelimit-Remaining` and
+   `x-ratelimit-remaining` both read (section 16.8 depends on that).
+2. The body is `json.dumps(json).encode(encoding)` when `json is not None`, else
+   `content`. In the JSON case `Content-Type: application/json` is added unless the
+   caller supplied one. Passing both is a `ValueError`.
+3. `response.raw` is an `io.BytesIO` over the body and `response._content` is left unset,
+   so **`.content`, `.text`, `.json()` and `iter_content(chunk_size)` all work**. That
+   last one is what makes `Http.download` (section 7.1) testable end to end: a test can
+   hand it 200 KB of bytes and assert the `.part` file, the digest, the `os.replace` and
+   the per-chunk progress calls.
+4. `Content-Length` is **not** added automatically. A test that wants `Http.download` to
+   discover a total from the header sets it explicitly, and a test that wants the
+   `total == 0` path leaves it off.
+
+### 24.4 Fixtures
+
+```python
+@pytest.fixture
+def adapter() -> FakeAdapter:
+    """An empty `FakeAdapter`; tests add routes with `adapter.add(...)`."""
+
+@pytest.fixture
+def tmp_paths(tmp_path: Path) -> Paths:
+    """`Paths.for_root(tmp_path / "MaestroLauncher")`, already `ensure()`d."""
+
+@pytest.fixture
+def tk_root() -> Iterator["ctk.CTk"]:
+    """A withdrawn `CTk` root for `display` tests; destroyed on teardown."""
+
+@pytest.fixture
+def fonts(tk_root: "ctk.CTk") -> Fonts:
+    """`theme.make_fonts(tk_root)` — the six fonts, resolved against this machine."""
+```
+
+The `http` fixture is **added by Task 3, not Task 2**, and this is stated explicitly so
+neither task writes it twice: Task 2 creates `tests/conftest.py` with `FakeAdapter`,
+`make_response`, `adapter` and `tmp_paths`, because those depend only on `paths.py` and
+`requests`; Task 3 implements `core/net.py` and appends the fixture that constructs an
+`Http` around the adapter, because until then there is nothing to construct.
+
+```python
+# Added by Task 3, alongside core/net.py. Not present in Task 2's conftest.py.
+@pytest.fixture
+def http(adapter: FakeAdapter) -> Iterator[Http]:
+    """An `Http` served entirely by `adapter`, with instant, deterministic retries."""
+```
+
+`http` builds `Http(adapter=adapter, sleep=lambda _seconds: None,
+rng=random.Random(0))` and closes it on teardown. The injected `sleep` is what makes a
+four-attempt retry test finish in microseconds instead of 3.5 seconds, and the seeded
+`rng` makes the jitter (section 7's ±25 %) reproducible, so a test can assert the exact
+delays that *would* have been slept by recording the calls to the injected `sleep`.
+
+`tmp_paths` is what keeps every filesystem test off the real launcher directory. Because
+`Paths` is injected everywhere and no module reads `os.environ` or `Path.home()` for
+itself (section 3), passing `tmp_paths` is sufficient isolation — there is no global to
+monkeypatch and no `--home` to remember.
+
+### 24.5 Markers, and how `display` tests skip
+
+```python
+def tk_available() -> bool:
+    """True when a `Tk()` can actually be created here. The probe runs at most once."""
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skip a `display`-marked test when Tk cannot open a window."""
+```
+
+Normative:
+
+1. `tk_available` imports `tkinter`, constructs a `Tk()`, calls `withdraw()` and
+   `destroy()`, and returns `True`. `ImportError` (a Python built without Tk) and
+   `tkinter.TclError` (no `DISPLAY`, no window station, a headless container) both return
+   `False`. Every other exception also returns `False` and is not re-raised: a probe must
+   never be the reason a test session fails.
+2. The result is cached in a module-level variable, so the probe creates at most one
+   window per session no matter how many `display` tests there are.
+3. `pytest_runtest_setup` looks for the `display` marker on the item and calls
+   `pytest.skip("no Tk display")` when `tk_available()` is `False`. It is a runtime skip,
+   not a collection-time one, so the tests are still *collected* and reported as skipped
+   with a reason rather than vanishing.
+4. The probe is **not** run at import time. Creating a `Tk()` during collection would
+   flash a window on every developer's screen for every `pytest --collect-only`.
+5. `live` needs no hook: `addopts = -m "not live"` deselects it, and `pytest -m live`
+   selects it. A `live` test is the only kind allowed to make a real request, and there is
+   no `FakeAdapter` in one.
+
+Which tests carry which marker:
+
+| Marker | Applies to |
+|---|---|
+| `display` | every test that constructs a `CTk`, a `CTkFont` or a `CTkImage` — the whole of `tests/test_widgets.py`, `tests/test_app.py` and the screen tests, plus the parts of `tests/test_theme.py` that call `resolve_font_family` or `make_fonts`. |
+| `live` | the handful of tests that hit the real Mojang, Adoptium, Fabric and Modrinth endpoints to confirm the contract's URLs and response shapes are still true. |
+| neither | everything else, which is most of the suite: it runs offline, headless, in seconds. |
+
+`tests/test_theme.py` is named in section 21.12 and its contrast and colour-literal
+assertions carry **no** marker — parsing `ui/` with `ast` and recomputing the ratios of
+section 21.3 needs neither a network nor a window.
+
+---
+
+## 25. `requirements.txt`
+
+The file at the repository root, in full — five lines, every version pinned exactly:
+
+```
+customtkinter==6.0.0
+requests==2.34.2
+Pillow==12.3.0
+pytest==9.1.1
+pywin32==312; sys_platform == "win32"
+```
+
+| Requirement | Why it is here, and why it is pinned |
+|---|---|
+| `customtkinter==6.0.0` | The whole interface. Verified working on the development machine (Windows 11, Tk 9.0) for every widget this contract uses: `CTk`, `CTkToplevel`, `CTkFrame(corner_radius, border_width, border_color)`, `CTkLabel`, `CTkButton`, `CTkEntry(placeholder_text)`, `CTkSlider(from_, to, number_of_steps)`, `CTkProgressBar(mode="determinate").set(x)`, `CTkOptionMenu(values)`, `CTkCheckBox`, `CTkSwitch`, `CTkTextbox`, `CTkScrollableFrame`, `CTkFont(family, size, weight)` and `CTkImage(light_image, dark_image, size)`. It has no shadows, gradients, transitions, flexbox or arbitrary font loading, which is what section 21 designed around. `ui/widgets.py` reaches one private attribute per widget class (section 22.1.1), so the pin is load-bearing rather than conventional. |
+| `requests==2.34.2` | Every outbound request, through the one `Http` class (section 7). `requests.adapters.BaseAdapter` is the seam the whole offline test suite hangs on (section 24.2), so the pin protects the tests as much as the launcher. |
+| `Pillow==12.3.0` | Decoding Modrinth's project icons, which are `.webp`, inside `IconCache.put` on the UI thread (section 22.1.6). It is imported nowhere else — `core/modrinth.py` returns raw bytes and never imports PIL (section 16). |
+| `pytest==9.1.1` | The test runner. It is listed here rather than in a separate `requirements-dev.txt` because the contract's test conventions (section 24) are part of the deliverable and `pytest.ini` sits beside this file. |
+| `pywin32==312; sys_platform == "win32"` | `win32crypt.CryptProtectData` / `CryptUnprotectData`, used by `auth.AccountStore` to encrypt `accounts.json` at rest (section 10.5). The environment marker means `pip install -r requirements.txt` succeeds unchanged on Linux and macOS, where the file is protected by `posix_chmod_600` instead. Every use of it is guarded by `dpapi_available()`, so a Windows machine without it falls back to plaintext rather than failing — the marker makes it *installed by default*, not *required*. |
+
+Not listed, deliberately: `tkinter` (part of CPython, checked at startup by
+`check_tk` in section 23.2 with its own message, because pip cannot install it), and any
+launcher library such as `minecraft-launcher-lib` — spec section 1 requires the protocol
+to be implemented rather than imported, and sections 9 to 19 of this contract are that
+implementation.
 
 ---

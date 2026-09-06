@@ -64,9 +64,9 @@ and it launches.
 
 **Done when:** search a term, get results, install one, and it appears in `mods/`.
 
-- [ ] `core/mods.py` — Modrinth search, version resolution, download
-- [ ] Filter by game version and loader
-- [ ] Resource packs go to `resourcepacks/`, not `mods/`
+- [x] `core/mods.py` — Modrinth search, version resolution, download
+- [x] Filter by game version and loader
+- [x] Resource packs go to `resourcepacks/`, not `mods/`
 
 ## M6 — GUI
 

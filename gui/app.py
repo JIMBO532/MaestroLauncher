@@ -1,15 +1,15 @@
 """MaestroLauncher's CustomTkinter shell.
 
-M6 slice 1: the window and its widgets, with the version dropdown wired to real
-data from ``core.installer``. Nothing else is connected yet -- Play is dead on
-purpose, and there is no install, launch, mods or login here.
+M6 slices 1 and 2: the window, and Play wired to a real install. The version
+dropdown is filled from ``core.installer``, and pressing Play downloads the
+selected version into the chosen folder with live progress. Launching, mods and
+login are still not connected.
 
-The one piece of machinery that is real is :class:`BackgroundWorker`. Every long
-operation this launcher will ever do -- downloading a version, installing Fabric,
-fetching mods, logging in -- takes seconds to minutes, and Tk gives us exactly
-one thread to draw on. Anything slow that runs on it freezes the window. So the
-pattern is set up now, before there is much to run through it, and the version
-fetch already goes through it.
+Every long operation this launcher will do -- downloading a version, installing
+Fabric, fetching mods, logging in -- takes seconds to minutes, and Tk gives us
+exactly one thread to draw on, so anything slow running on it freezes the window.
+:class:`BackgroundWorker` is how that is avoided: the version fetch and the
+install both go through it, and launching will too.
 
 Imports point one way only: ``gui`` may import ``core``, never the reverse.
 """
@@ -32,7 +32,11 @@ WINDOW_TITLE = "MaestroLauncher"
 WINDOW_SIZE = "620x460"
 POLL_INTERVAL_MS = 50
 
-PLAY_DISABLED_REASON = "Play needs an account; login is not wired up yet."
+# CustomTkinter keeps a disabled button's fill colour, so a disabled Play still
+# looks clickable unless the fill is changed too.
+PLAY_DISABLED_FILL = ("gray72", "gray30")
+
+READY_HINT = "Pick a version and press Play to install it. Launching comes later."
 
 
 class BackgroundWorker:
@@ -81,10 +85,31 @@ class BackgroundWorker:
 
         Hand the result to any ``core`` function that takes ``on_progress``; the
         ticks arrive on the UI thread.
+
+        Ticks are coalesced: an install fires thousands of them and the screen
+        can only show the latest, so at most one update is queued at a time and
+        newer ticks overwrite the pending one. Without this the queue fills with
+        tens of thousands of closures the UI would redraw for no benefit.
         """
+        lock = threading.Lock()
+        latest: list[Optional[Progress]] = [None]
+        queued = [False]
+
+        def deliver() -> None:
+            with lock:
+                progress = latest[0]
+                latest[0] = None
+                queued[0] = False
+            if progress is not None:
+                on_progress(progress)
 
         def bridge(progress: Progress) -> None:
-            self._post(lambda: on_progress(progress))
+            with lock:
+                latest[0] = progress
+                if queued[0]:
+                    return
+                queued[0] = True
+            self._post(deliver)
 
         return bridge
 
@@ -123,6 +148,7 @@ class MaestroApp(ctk.CTk):
 
         self.worker = BackgroundWorker(self)
         self.versions: list[str] = []
+        self.busy = False
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -173,8 +199,11 @@ class MaestroApp(ctk.CTk):
         self.browse_button.grid(row=0, column=1, padx=(8, 0))
 
         self.play_button = ctk.CTkButton(
-            body, text="Play", height=42, state="disabled", command=self._play_placeholder
+            body, text="Play", height=42, command=self.start_install
         )
+        # Remember the theme's own fill so the button can be greyed and restored.
+        self._play_fill = self.play_button.cget("fg_color")
+        self.set_play_enabled(False)
         self.play_button.grid(row=2, column=0, columnspan=2, padx=18, pady=(22, 8), sticky="ew")
 
         self.progress = ctk.CTkProgressBar(body)
@@ -220,7 +249,8 @@ class MaestroApp(ctk.CTk):
 
         self.version_menu.configure(values=versions, state="normal")
         self.version_menu.set(versions[0])
-        self.set_status(f"{len(versions)} releases available. {PLAY_DISABLED_REASON}")
+        self.set_play_enabled(True)
+        self.set_status(f"{len(versions)} releases available. {READY_HINT}")
 
     def _versions_failed(self, error: BaseException) -> None:
         self.progress.stop()
@@ -236,10 +266,60 @@ class MaestroApp(ctk.CTk):
         if chosen:
             self.directory_var.set(str(Path(chosen)))
 
-    def _play_placeholder(self) -> None:
-        # Unreachable while the button is disabled; here so the wiring is obvious
-        # when launching is connected.
-        self.set_status(PLAY_DISABLED_REASON)
+    def set_play_enabled(self, enabled: bool) -> None:
+        """Enable or disable Play, and make it *look* the way it behaves."""
+        self.play_button.configure(
+            state="normal" if enabled else "disabled",
+            fg_color=self._play_fill if enabled else PLAY_DISABLED_FILL,
+            hover=enabled,
+        )
+
+    def _set_busy(self, busy: bool) -> None:
+        """Lock the inputs while a long job runs, so nothing changes under it."""
+        self.busy = busy
+        state = "disabled" if busy else "normal"
+        self.version_menu.configure(state=state if self.versions else "disabled")
+        self.directory_entry.configure(state=state)
+        self.browse_button.configure(state=state)
+        self.set_play_enabled(not busy and bool(self.versions))
+
+    def start_install(self) -> None:
+        """Install the selected version, off the UI thread, with live progress."""
+        if self.busy:
+            return
+
+        version = self.version_menu.get()
+        directory = self.directory_var.get().strip()
+
+        if version not in self.versions:
+            self.set_status("Pick a version first.")
+            return
+        if not directory:
+            self.set_status("Choose a game folder first.")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.set_status(f"Installing Minecraft {version}...")
+
+        # The one call this whole pattern was built for.
+        report = self.worker.progress_bridge(self.show_progress)
+        self.worker.submit(
+            lambda: installer.install_version(version, directory, on_progress=report),
+            on_success=lambda path: self._install_finished(version, path),
+            on_error=self._install_failed,
+        )
+
+    def _install_finished(self, version: str, path: Path) -> None:
+        self.progress.set(1.0)
+        self._set_busy(False)
+        self.set_status(f"Minecraft {version} is installed in {path}. Launching comes later.")
+
+    def _install_failed(self, error: BaseException) -> None:
+        self.progress.set(0)
+        self._set_busy(False)
+        detail = str(error) if isinstance(error, InstallError) else f"{error}"
+        self.set_status(f"Install failed: {detail}")
 
     def _on_close(self) -> None:
         self.worker.stop()

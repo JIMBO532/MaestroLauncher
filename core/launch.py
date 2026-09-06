@@ -14,7 +14,6 @@ without running it through :func:`redact` first.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +21,8 @@ from pathlib import Path
 from typing import IO, Optional, Sequence
 
 import minecraft_launcher_lib as mll
+
+from core.installer import find_java_executable
 
 DEFAULT_MEMORY_MB = 2048
 
@@ -84,36 +85,19 @@ def redact(command: Sequence[str], token: str) -> list[str]:
 
 
 def resolve_java_executable(version_id: str, directory: Path | str) -> str:
-    """Find a Java runtime for this version.
+    """Find a Java runtime for this version, or raise ``LaunchError``.
 
-    Prefers the runtime Mojang ships for the version, which
-    ``install_minecraft_version`` already downloaded into the game directory, and
-    falls back to whatever is on PATH. Raises ``LaunchError`` if there is neither.
+    The search itself lives in ``installer.find_java_executable`` because the
+    Fabric installer needs exactly the same lookup; this only turns "nothing
+    found" into the error type launching callers expect.
     """
-    path = Path(directory).expanduser()
-
-    try:
-        information = mll.runtime.get_version_runtime_information(version_id, str(path))
-    except Exception:
-        information = None
-
-    if information:
-        try:
-            executable = mll.runtime.get_executable_path(information["name"], str(path))
-        except Exception:
-            executable = None
-        if executable and Path(executable).is_file():
-            return executable
-
-    for candidate in ("java", "javaw"):
-        found = shutil.which(candidate)
-        if found:
-            return found
-
-    raise LaunchError(
-        f"No Java runtime found for {version_id}. Reinstall the version so its "
-        "bundled runtime is downloaded, or put a JRE on PATH."
-    )
+    executable = find_java_executable(directory, version_id)
+    if executable is None:
+        raise LaunchError(
+            f"No Java runtime found for {version_id}. Reinstall the version so its "
+            "bundled runtime is downloaded, or put a JRE on PATH or in JAVA_HOME."
+        )
+    return executable
 
 
 def _memory_arguments(memory_mb: int, jvm_arguments: Sequence[str]) -> list[str]:

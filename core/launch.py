@@ -22,7 +22,7 @@ from typing import IO, Optional, Sequence
 
 import minecraft_launcher_lib as mll
 
-from core.installer import find_java_executable
+from core.installer import find_java_executable, is_installed
 
 DEFAULT_MEMORY_MB = 2048
 
@@ -136,7 +136,7 @@ def build_command(
         raise LaunchError("username, uuid and token are all required to launch.")
     if memory_mb < MINIMUM_MEMORY_MB:
         raise LaunchError(f"memory_mb must be at least {MINIMUM_MEMORY_MB}.")
-    if not mll.utils.is_version_valid(version_id, str(path)):
+    if not is_installed(version_id, path):
         raise LaunchError(
             f"Minecraft {version_id} is not installed in {path}. Install it first."
         )

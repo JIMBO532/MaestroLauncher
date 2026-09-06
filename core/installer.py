@@ -163,8 +163,13 @@ def latest_release() -> str:
 
 
 def is_installed(version_id: str, directory: Path | str) -> bool:
-    """True if this version is already present and usable in this directory."""
-    return mll.utils.is_version_valid(version_id, str(Path(directory).expanduser()))
+    """True if this version is really present in this directory.
+
+    Deliberately not ``mll.utils.is_version_valid``, which answers a different
+    question: it is True for any version Mojang offers for download, installed
+    here or not, so it can never tell you whether a launch would work.
+    """
+    return version_id in installed_versions(directory)
 
 
 def installed_versions(directory: Path | str) -> list[str]:

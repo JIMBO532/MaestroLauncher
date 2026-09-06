@@ -24,10 +24,10 @@ Approval is not instant. Submit it before writing any auth code.
 **Done when:** `python scripts/test_install.py` downloads 1.21.1 into `./test_mc/`
 with a live progress readout and exits 0.
 
-- [ ] `core/installer.py`: list versions, check if installed, install vanilla
-- [ ] Progress reported through a callback, not printed from inside core
-- [ ] Library errors wrapped in `InstallError`
-- [ ] `scripts/test_install.py` passes
+- [x] `core/installer.py`: list versions, check if installed, install vanilla
+- [x] Progress reported through a callback, not printed from inside core
+- [x] Library errors wrapped in `InstallError`
+- [x] `scripts/test_install.py` passes
 
 No auth required. Fully testable today.
 

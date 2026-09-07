@@ -246,6 +246,89 @@ def test_app_recovers() -> None:
     app.destroy()
 
 
+def test_version_is_single_sourced() -> None:
+    """The version must live in exactly one place and be read everywhere else.
+
+    This lives here because this is the only test that imports both ``core`` and
+    ``gui``, so it is the only one that can see every consumer at once.
+    """
+    print("\nVersion consistency\n")
+
+    import inspect
+
+    import core
+    from core import launch, mods
+    from gui import app as gui_app
+
+    version = core.__version__
+    print(f"  core.__version__          : {version}")
+
+    launcher_version = inspect.signature(launch.build_command).parameters[
+        "launcher_version"
+    ].default
+    consumers = {
+        "gui.app.APP_VERSION": gui_app.APP_VERSION,
+        "launch.build_command(launcher_version=)": launcher_version,
+    }
+    for name, value in consumers.items():
+        print(f"  {name:<41}: {value}")
+        check(f"{name} matches core.__version__", value == version, f"{value!r}")
+
+    print(f"  mods.USER_AGENT{'':<27}: {mods.USER_AGENT}")
+    check(
+        "the Modrinth User-Agent carries core.__version__",
+        f"/{version} " in mods.USER_AGENT,
+        mods.USER_AGENT,
+    )
+
+    # The check that actually bites: someone re-typing the number somewhere
+    # instead of importing it. Only the current version string is searched for,
+    # so Minecraft versions in the test scripts are not false positives.
+    root = Path(__file__).resolve().parent.parent
+    source = sorted(
+        path
+        for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts and "test_mc" not in path.parts
+    )
+    home = root / "core" / "__init__.py"
+    strays = [
+        path.relative_to(root).as_posix()
+        for path in source
+        if path != home and f'"{version}"' in path.read_text(encoding="utf-8")
+    ]
+    print(f"  scanned {len(source)} source files for a hardcoded {version!r}")
+    check(
+        "the version is not hardcoded anywhere but core/__init__.py",
+        not strays,
+        f"also found in: {', '.join(strays)}",
+    )
+
+    # And the number actually reaches the screen. The About labels are built
+    # inline rather than kept on the app, so read them off the tab itself.
+    about = MaestroApp()
+    about.withdraw()
+    about.update()
+    try:
+        # CustomTkinter widgets do not list "text" in keys(), so ask each one.
+        texts = []
+        for child in about.tabs.tab("About").winfo_children():
+            try:
+                texts.append(str(child.cget("text")))
+            except Exception:  # noqa: BLE001 -- not every child carries text
+                continue
+    finally:
+        about.worker.stop()
+        about.destroy()
+
+    shown = [t for t in texts if "Version" in t]
+    print(f"  About screen shows       : {shown}")
+    check(
+        "the About screen renders the single-sourced version",
+        any(version in t for t in shown),
+        f"About labels: {texts}",
+    )
+
+
 def main() -> int:
     print("MaestroLauncher GUI worker test")
     print("  the window is withdrawn; nothing is shown, focused or clicked\n")
@@ -253,6 +336,7 @@ def main() -> int:
     try:
         test_worker()
         test_app_recovers()
+        test_version_is_single_sourced()
     except Exception as exc:  # noqa: BLE001
         print(f"\nFAILED: the test itself blew up: {type(exc).__name__}: {exc}")
         raise

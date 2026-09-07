@@ -22,6 +22,7 @@ from typing import IO, Optional, Sequence
 
 import minecraft_launcher_lib as mll
 
+from core import __version__
 from core.installer import find_java_executable, is_installed
 
 DEFAULT_MEMORY_MB = 2048
@@ -120,7 +121,7 @@ def build_command(
     resolution: Optional[tuple[int, int]] = None,
     demo: bool = False,
     launcher_name: str = "MaestroLauncher",
-    launcher_version: str = "0.1.0",
+    launcher_version: str = __version__,
 ) -> list[str]:
     """Build the full command line that starts the game.
 

@@ -33,16 +33,15 @@ except Exception:  # noqa: BLE001 -- a missing or broken tkdnd must not stop the
     DND_FILES = None
     TkinterDnD = None
 
-from core import imports, installer, mods
+from core import __version__, imports, installer, mods
 from core.installer import InstallError, Progress
 from core.mods import ModError, SearchResult
 
 WINDOW_TITLE = "MaestroLauncher"
 
-# Shown on the About screen. core.launch sends its own launcher_version to the
-# game and core.auth and core.mods each carry one in their User-Agent, so this
-# is the fourth copy of the same number -- worth collapsing into one place.
-APP_VERSION = "0.1.0"
+# The version lives in core/__init__.py and is read from there, so the About
+# screen, the game and Modrinth can never be told three different numbers.
+APP_VERSION = __version__
 
 # The notice M7 asks for, kept as one string so the About screen and anything
 # else that needs it cannot drift apart.

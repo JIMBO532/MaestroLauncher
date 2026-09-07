@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 import requests
 
+from core import __version__
 from core.installer import Progress, ProgressCallback
 
 API_ROOT = "https://api.modrinth.com/v2"
@@ -33,7 +34,9 @@ API_ROOT = "https://api.modrinth.com/v2"
 # Modrinth's docs ask every client to identify itself and to include a contact.
 # An anonymous or stock python-requests UA is rate limited harder and may be
 # refused outright. Add a real contact URL here before this ships publicly.
-USER_AGENT = "MaestroLauncher/0.1.0 (custom Minecraft Java launcher; python-requests)"
+USER_AGENT = (
+    f"MaestroLauncher/{__version__} (custom Minecraft Java launcher; python-requests)"
+)
 
 # (connect, read) -- the CDN is usually quick, but a cold file can stall a while.
 TIMEOUT = (10.0, 30.0)

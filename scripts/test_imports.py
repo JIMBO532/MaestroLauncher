@@ -136,7 +136,11 @@ def main() -> int:
         check("every file produced a result", len(results) == 6, str(len(results)))
         check("the jar landed in mods/", (game_dir / "mods" / jar.name).is_file())
         check("the pack landed in resourcepacks/", (game_dir / "resourcepacks" / pack.name).is_file())
-        check("the shader landed in shaders/", (game_dir / "shaders" / shader.name).is_file())
+        check(
+            "the shader landed in shaderpacks/, where Iris looks",
+            (game_dir / "shaderpacks" / shader.name).is_file(),
+        )
+        check("and NOT in shaders/", not (game_dir / "shaders").exists())
         check("the unrecognised zip was refused", by_name[junk.name].error is not None)
         check(
             "its refusal explains itself",

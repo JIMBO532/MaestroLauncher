@@ -8,7 +8,7 @@ What a file is, is decided by looking inside it rather than by trusting its name
 
 * ``.jar``            -> ``mods/``
 * ``.zip`` containing ``pack.mcmeta`` at the root  -> ``resourcepacks/``
-* ``.zip`` containing a ``shaders/`` folder        -> ``shaders/``
+* ``.zip`` containing a ``shaders/`` folder        -> ``shaderpacks/``
 * anything else       -> refused, with a reason, rather than guessed at
 
 A zip is opened and checked before anything is copied, so a truncated or corrupt
@@ -61,7 +61,9 @@ class FileKind(Enum):
 DESTINATIONS: dict[FileKind, str] = {
     FileKind.MOD: "mods",
     FileKind.RESOURCE_PACK: "resourcepacks",
-    FileKind.SHADER_PACK: "shaders",
+    # shaderpacks/, not shaders/: shaders/ is what is inside the archive,
+    # but Iris and OptiFine both read shaderpacks/ in the game directory.
+    FileKind.SHADER_PACK: "shaderpacks",
 }
 
 

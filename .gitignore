@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 build/
 dist/
+
+# The built launcher, wherever it is dropped -- dist/ or the repo root.
+*.exe

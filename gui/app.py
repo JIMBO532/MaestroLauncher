@@ -1,8 +1,8 @@
 """MaestroLauncher's CustomTkinter shell.
 
-M6 slices 1 and 2: the window, and Play wired to a real install. The version
-dropdown is filled from ``core.installer``, and pressing Play downloads the
-selected version into the chosen folder with live progress. Launching, mods and
+M6 slices 1 to 3: the window, Play wired to a real install, and a second button
+that installs the Fabric loader with Sodium for the selected version. Both jobs
+run through the same worker with live progress. Launching, the mod browser and
 login are still not connected.
 
 Every long operation this launcher will do -- downloading a version, installing
@@ -29,14 +29,15 @@ from core import installer
 from core.installer import InstallError, Progress
 
 WINDOW_TITLE = "MaestroLauncher"
-WINDOW_SIZE = "620x460"
+WINDOW_SIZE = "620x500"
 POLL_INTERVAL_MS = 50
 
-# CustomTkinter keeps a disabled button's fill colour, so a disabled Play still
-# looks clickable unless the fill is changed too.
-PLAY_DISABLED_FILL = ("gray72", "gray30")
+# CustomTkinter keeps a disabled button's fill colour, so state alone leaves a
+# button looking clickable while it does nothing. Every button here is greyed
+# through set_button_enabled() instead.
+DISABLED_FILL = ("gray72", "gray30")
 
-READY_HINT = "Pick a version and press Play to install it. Launching comes later."
+READY_HINT = "Pick a version, then install it or add Fabric with Sodium."
 
 
 class BackgroundWorker:
@@ -201,19 +202,34 @@ class MaestroApp(ctk.CTk):
         self.play_button = ctk.CTkButton(
             body, text="Play", height=42, command=self.start_install
         )
-        # Remember the theme's own fill so the button can be greyed and restored.
-        self._play_fill = self.play_button.cget("fg_color")
-        self.set_play_enabled(False)
-        self.play_button.grid(row=2, column=0, columnspan=2, padx=18, pady=(22, 8), sticky="ew")
+        self.play_button.grid(row=2, column=0, columnspan=2, padx=18, pady=(22, 6), sticky="ew")
+
+        self.fabric_button = ctk.CTkButton(
+            body, text="Install Fabric + Sodium", height=36, command=self.start_fabric
+        )
+        self.fabric_button.grid(row=3, column=0, columnspan=2, padx=18, pady=(0, 8), sticky="ew")
+
+        # Each button's own fill, so greying one out can be undone with the colour
+        # it actually had rather than a single shared guess.
+        self._button_fills = {
+            button: button.cget("fg_color")
+            for button in (self.browse_button, self.play_button, self.fabric_button)
+        }
+        self._set_busy(False)
 
         self.progress = ctk.CTkProgressBar(body)
-        self.progress.grid(row=3, column=0, columnspan=2, padx=18, pady=(8, 8), sticky="ew")
+        self.progress.grid(row=4, column=0, columnspan=2, padx=18, pady=(8, 8), sticky="ew")
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(
-            body, text="Starting up...", anchor="w", text_color=("gray35", "gray70")
+            body, text="Starting up...", anchor="w", justify="left",
+            text_color=("gray35", "gray70"), wraplength=540,
         )
-        self.status_label.grid(row=4, column=0, columnspan=2, padx=18, pady=(0, 18), sticky="ew")
+        self.status_label.grid(row=5, column=0, columnspan=2, padx=18, pady=(0, 18), sticky="ew")
+
+        # Long statuses -- an install path, a Fabric profile id -- used to run off
+        # the window edge. Wrap them to whatever width the card currently has.
+        body.bind("<Configure>", self._fit_status_width)
 
     # -- actions --------------------------------------------------------------
 
@@ -247,9 +263,9 @@ class MaestroApp(ctk.CTk):
             self.set_status("Mojang returned no versions.")
             return
 
-        self.version_menu.configure(values=versions, state="normal")
+        self.version_menu.configure(values=versions)
         self.version_menu.set(versions[0])
-        self.set_play_enabled(True)
+        self._set_busy(False)
         self.set_status(f"{len(versions)} releases available. {READY_HINT}")
 
     def _versions_failed(self, error: BaseException) -> None:
@@ -266,22 +282,26 @@ class MaestroApp(ctk.CTk):
         if chosen:
             self.directory_var.set(str(Path(chosen)))
 
-    def set_play_enabled(self, enabled: bool) -> None:
-        """Enable or disable Play, and make it *look* the way it behaves."""
-        self.play_button.configure(
+    def _fit_status_width(self, event: tkinter.Event) -> None:
+        self.status_label.configure(wraplength=max(event.width - 40, 200))
+
+    def set_button_enabled(self, button: ctk.CTkButton, enabled: bool) -> None:
+        """Enable or disable a button, and make it *look* the way it behaves."""
+        button.configure(
             state="normal" if enabled else "disabled",
-            fg_color=self._play_fill if enabled else PLAY_DISABLED_FILL,
+            fg_color=self._button_fills[button] if enabled else DISABLED_FILL,
             hover=enabled,
         )
 
     def _set_busy(self, busy: bool) -> None:
         """Lock the inputs while a long job runs, so nothing changes under it."""
         self.busy = busy
-        state = "disabled" if busy else "normal"
-        self.version_menu.configure(state=state if self.versions else "disabled")
-        self.directory_entry.configure(state=state)
-        self.browse_button.configure(state=state)
-        self.set_play_enabled(not busy and bool(self.versions))
+        ready = not busy and bool(self.versions)
+        self.version_menu.configure(state="normal" if ready else "disabled")
+        self.directory_entry.configure(state="disabled" if busy else "normal")
+        self.set_button_enabled(self.browse_button, not busy)
+        self.set_button_enabled(self.play_button, ready)
+        self.set_button_enabled(self.fabric_button, ready)
 
     def start_install(self) -> None:
         """Install the selected version, off the UI thread, with live progress."""
@@ -314,6 +334,45 @@ class MaestroApp(ctk.CTk):
         self.progress.set(1.0)
         self._set_busy(False)
         self.set_status(f"Minecraft {version} is installed in {path}. Launching comes later.")
+
+    def start_fabric(self) -> None:
+        """Install Fabric plus Sodium for the selected version, off the UI thread."""
+        if self.busy:
+            return
+
+        version = self.version_menu.get()
+        directory = self.directory_var.get().strip()
+
+        if version not in self.versions:
+            self.set_status("Pick a version first.")
+            return
+        if not directory:
+            self.set_status("Choose a game folder first.")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.set_status(f"Installing Fabric and Sodium for {version}...")
+
+        report = self.worker.progress_bridge(self.show_progress)
+        self.worker.submit(
+            lambda: installer.install_fabric_with_sodium(
+                version, directory, on_progress=report
+            ),
+            on_success=self._fabric_finished,
+            on_error=self._fabric_failed,
+        )
+
+    def _fabric_finished(self, profile_id: str) -> None:
+        self.progress.set(1.0)
+        self._set_busy(False)
+        self.set_status(f"Ready: {profile_id}, with Sodium in mods/.")
+
+    def _fabric_failed(self, error: BaseException) -> None:
+        self.progress.set(0)
+        self._set_busy(False)
+        detail = str(error) if isinstance(error, InstallError) else f"{error}"
+        self.set_status(f"Fabric install failed: {detail}")
 
     def _install_failed(self, error: BaseException) -> None:
         self.progress.set(0)

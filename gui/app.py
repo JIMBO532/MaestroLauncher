@@ -1,9 +1,9 @@
 """MaestroLauncher's CustomTkinter shell.
 
-M6 slices 1 to 4: a Play tab that installs a version or adds Fabric with Sodium,
-and a Mods tab that searches Modrinth and installs what you pick into the game
-folder's mods/. Every job runs through the same worker with live progress and
-the inputs locked. Launching and login are still not connected.
+M6 slices 1 to 5: a Play tab that installs a version or adds Fabric with Sodium,
+and a Mods tab that searches Modrinth, installs what you pick, and imports files
+you already have on disk. Every job runs through the same worker with live
+progress and the inputs locked. Launching and login are still not connected.
 
 Every long operation this launcher will do -- downloading a version, installing
 Fabric, fetching mods, logging in -- takes seconds to minutes, and Tk gives us
@@ -21,11 +21,17 @@ import threading
 import tkinter
 from pathlib import Path
 from tkinter import filedialog
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import customtkinter as ctk
 
-from core import installer, mods
+try:  # drag and drop is a nice-to-have; the Add files button works without it
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:  # noqa: BLE001 -- a missing or broken tkdnd must not stop the app
+    DND_FILES = None
+    TkinterDnD = None
+
+from core import imports, installer, mods
 from core.installer import InstallError, Progress
 from core.mods import ModError, SearchResult
 
@@ -46,6 +52,11 @@ MOD_LOADER = "fabric"
 
 # Enough to fill the list without a scrollbar marathon.
 SEARCH_LIMIT = 10
+
+# tkinterdnd2 needs its wrapper mixed into the root window, so the base classes
+# have to be decided before the class body. When it is missing we are a plain
+# CTk and the drop zone simply is not built.
+_ROOT_BASES = (ctk.CTk,) if TkinterDnD is None else (ctk.CTk, TkinterDnD.DnDWrapper)
 
 
 class BackgroundWorker:
@@ -144,11 +155,49 @@ class BackgroundWorker:
             self._widget.after(self._poll_interval_ms, self._drain)
 
 
-class MaestroApp(ctk.CTk):
+def _split_braced(data: str) -> list[str]:
+    """Split a tkdnd payload on whitespace, honouring {braced paths}.
+
+    Deliberately does no backslash processing, so Windows paths survive intact.
+    """
+    items: list[str] = []
+    index = 0
+    while index < len(data):
+        char = data[index]
+        if char.isspace():
+            index += 1
+        elif char == "{":
+            end = data.find("}", index)
+            if end == -1:
+                items.append(data[index + 1:])
+                break
+            items.append(data[index + 1:end])
+            index = end + 1
+        else:
+            end = index
+            while end < len(data) and not data[end].isspace():
+                end += 1
+            items.append(data[index:end])
+            index = end
+    return [item for item in items if item]
+
+
+class MaestroApp(*_ROOT_BASES):
     """The launcher window."""
 
     def __init__(self) -> None:
         super().__init__()
+
+        # tkdnd has to be loaded into this interpreter before any widget can be
+        # registered as a drop target. If it will not load -- no binaries for
+        # this Tk, say -- carry on without it rather than failing to start.
+        self.dnd_ready = False
+        if TkinterDnD is not None:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self.dnd_ready = True
+            except Exception:  # noqa: BLE001
+                self.dnd_ready = False
 
         self.title(WINDOW_TITLE)
         self.geometry(WINDOW_SIZE)
@@ -260,7 +309,29 @@ class MaestroApp(ctk.CTk):
             mods_tab, text="Install selected mod", height=36,
             command=self.start_mod_install,
         )
-        self.install_mod_button.grid(row=2, column=0, padx=4, pady=(10, 12), sticky="ew")
+        self.install_mod_button.grid(row=2, column=0, padx=4, pady=(10, 6), sticky="ew")
+
+        self.add_files_button = ctk.CTkButton(
+            mods_tab, text="Add files from your computer...", height=32,
+            command=self.choose_files_to_import,
+        )
+        self.add_files_button.grid(row=3, column=0, padx=4, pady=(0, 6), sticky="ew")
+
+        self.drop_zone = ctk.CTkLabel(
+            mods_tab,
+            text=(
+                "...or drop jars and pack zips here"
+                if self.dnd_ready
+                else "Drag and drop is unavailable; use the button above."
+            ),
+            height=44, fg_color=("gray88", "gray20"), corner_radius=8,
+            text_color=("gray40", "gray65"),
+        )
+        self.drop_zone.grid(row=4, column=0, padx=4, pady=(0, 12), sticky="ew")
+
+        if self.dnd_ready:
+            self.drop_zone.drop_target_register(DND_FILES)
+            self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
 
         # -- shared footer: one progress bar and one status line for every job --
         footer = ctk.CTkFrame(self, fg_color="transparent")
@@ -283,7 +354,7 @@ class MaestroApp(ctk.CTk):
             button: button.cget("fg_color")
             for button in (
                 self.browse_button, self.play_button, self.fabric_button,
-                self.search_button, self.install_mod_button,
+                self.search_button, self.install_mod_button, self.add_files_button,
             )
         }
         self._set_busy(False)
@@ -368,6 +439,9 @@ class MaestroApp(ctk.CTk):
         self.set_button_enabled(
             self.install_mod_button, ready and bool(self.selected_mod.get())
         )
+        # Importing needs a folder, not a version, so it does not wait on the
+        # Mojang fetch the way the other buttons do.
+        self.set_button_enabled(self.add_files_button, not busy)
         for row in self._result_rows:
             row.configure(state="disabled" if busy else "normal")
 
@@ -563,6 +637,96 @@ class MaestroApp(ctk.CTk):
         self._set_busy(False)
         detail = str(error) if isinstance(error, ModError) else f"{error}"
         self.set_status(f"Mod install failed: {detail}")
+
+    def _parse_drop(self, data: str) -> list[str]:
+        """Turn tkdnd's payload into a list of existing file paths.
+
+        tkdnd hands over a Tcl list: paths containing spaces are brace-quoted,
+        the rest are bare. Bare Windows paths are the catch -- Tcl list parsing
+        treats their backslashes as escapes and quietly mangles them, so a
+        dropped drive-letter path disappears. Both readings are tried and
+        whichever finds more real files wins.
+        """
+        readings: list[list[str]] = []
+        try:
+            readings.append([str(item) for item in self.tk.splitlist(data)])
+        except Exception:  # noqa: BLE001
+            pass
+        readings.append(_split_braced(data))
+
+        best: list[str] = []
+        for reading in readings:
+            found = [path for path in reading if Path(path).is_file()]
+            if len(found) > len(best):
+                best = found
+        return best
+
+    def _on_drop(self, event: Any) -> None:
+        """Handle files dropped onto the drop zone."""
+        if self.busy:
+            return
+
+        directory = self.directory_var.get().strip()
+        if not directory:
+            self.set_status("Choose a game folder on the Play tab first.")
+            return
+
+        files = self._parse_drop(str(event.data))
+        if not files:
+            self.set_status("Nothing usable was dropped -- drop files, not folders.")
+            return
+
+        self.import_paths(files, directory)
+
+    def choose_files_to_import(self) -> None:
+        """Pick local jars or pack zips and file them into the game folder."""
+        if self.busy:
+            return
+
+        directory = self.directory_var.get().strip()
+        if not directory:
+            self.set_status("Choose a game folder on the Play tab first.")
+            return
+
+        chosen = filedialog.askopenfilenames(
+            title="Choose mods, resource packs or shader packs",
+            filetypes=[("Mods and packs", "*.jar *.zip"), ("All files", "*.*")],
+        )
+        if not chosen:
+            return
+
+        self.import_paths(chosen, directory)
+
+    def import_paths(self, paths: Sequence[str], directory: str) -> None:
+        """Import a list of local files off the UI thread.
+
+        Separate from the file picker so a drop zone, or a test, can hand files
+        in without going through a dialog.
+        """
+        if self.busy:
+            return
+
+        files = list(paths)
+        self._set_busy(True)
+        self.progress.set(0)
+        self.set_status(f"Importing {len(files)} file(s)...")
+
+        report = self.worker.progress_bridge(self.show_progress)
+        self.worker.submit(
+            lambda: imports.import_files(files, directory, on_progress=report),
+            on_success=self._import_finished,
+            on_error=self._import_failed_batch,
+        )
+
+    def _import_finished(self, results: list) -> None:
+        self.progress.set(1.0 if any(r.ok for r in results) else 0)
+        self._set_busy(False)
+        self.set_status(imports.describe(results))
+
+    def _import_failed_batch(self, error: BaseException) -> None:
+        self.progress.set(0)
+        self._set_busy(False)
+        self.set_status(f"Import failed: {error}")
 
     def _install_failed(self, error: BaseException) -> None:
         self.progress.set(0)

@@ -128,6 +128,100 @@ def main() -> int:
         print(f"FAILED: size is {size}, Modrinth said {file.size}.")
         return 1
 
+    # 5. The same pipeline for a resource pack: a different project type, a
+    #    different folder, and one Modrinth files under the "minecraft" loader,
+    #    so the Fabric filter must not be applied to it.
+    print("\n" + "-" * 60)
+    print("Resource packs\n")
+
+    try:
+        packs = search_projects(
+            "faithful", game_version=version, loader=LOADER,
+            project_type="resourcepack", limit=5,
+        )
+    except ModError as exc:
+        print(f"FAILED: resource pack search: {exc}")
+        return 1
+
+    if not packs:
+        print("FAILED: no resource packs found. The loader filter may be leaking.")
+        return 1
+
+    print(f"  {len(packs)} results even though loader={LOADER!r} was passed:")
+    for hit in packs:
+        print(f"    {hit.title[:30]:<30} {hit.project_type:<13} {hit.downloads:>12,} dl")
+
+    if any(hit.project_type != "resourcepack" for hit in packs):
+        print("FAILED: a non-resourcepack came back from a resourcepack search.")
+        return 1
+
+    # Take the smallest, so this does not download a 200MB 512x pack.
+    resolved = []
+    for hit in packs:
+        try:
+            resolved.append(
+                resolve_version(hit.slug, version, loader=LOADER, project_type="resourcepack")
+            )
+        except ModError:
+            continue
+    if not resolved:
+        print(f"FAILED: none of those packs has a {version} release.")
+        return 1
+
+    pack = min(resolved, key=lambda f: f.size or 1 << 40)
+    print(f"\n  Resolved: {pack.name}")
+    print(f"    file:    {pack.filename}  ({pack.size / 1024 / 1024:.1f} MB)")
+    print(f"    loaders: {', '.join(pack.loaders)}  <- what Modrinth reports")
+    print(f"    goes to: {subdirectory_for(pack.project_type)}/\n")
+
+    if subdirectory_for(pack.project_type) != "resourcepacks":
+        print("FAILED: a resource pack is not routed to resourcepacks/.")
+        return 1
+
+    try:
+        pack_path = download_file(pack, TARGET, on_progress=render)
+    except ModError as exc:
+        print(f"\n\nFAILED: resource pack download: {exc}")
+        return 1
+
+    print()
+    if not pack_path.exists():
+        print(f"FAILED: {pack_path} does not exist after download.")
+        return 1
+    if pack_path.parent != TARGET.resolve() / "resourcepacks":
+        print(f"FAILED: landed in {pack_path.parent}, expected resourcepacks/.")
+        return 1
+    if pack_path.stat().st_size == 0:
+        print("FAILED: the resource pack is empty.")
+        return 1
+    if (TARGET / "mods" / pack_path.name).exists():
+        print("FAILED: the resource pack also landed in mods/.")
+        return 1
+
+    print(f"  pack: {pack_path}")
+    print(f"  size: {pack_path.stat().st_size:,} bytes")
+
+    # 6. Shaders are a third type going to a third folder.
+    print("\nShaders\n")
+    try:
+        shaders = search_projects(
+            "shader", game_version=version, loader=LOADER,
+            project_type="shader", limit=3,
+        )
+    except ModError as exc:
+        print(f"FAILED: shader search: {exc}")
+        return 1
+
+    for hit in shaders:
+        print(f"    {hit.title[:30]:<30} {hit.project_type:<13} -> {subdirectory_for(hit.project_type)}/")
+    if any(subdirectory_for(hit.project_type) != "shaderpacks" for hit in shaders):
+        print("FAILED: a shader is not routed to shaderpacks/.")
+        return 1
+    if subdirectory_for("shader") != "shaderpacks":
+        print("FAILED: shader routing is wrong.")
+        return 1
+    print("\n  shaders route to shaderpacks/, which is what Iris and OptiFine read")
+
     print("\nMilestone 5 PASSED")
     return 0
 

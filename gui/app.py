@@ -20,6 +20,7 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter
+import traceback
 from pathlib import Path
 from tkinter import filedialog
 from typing import Any, Callable, Optional, Sequence
@@ -59,9 +60,20 @@ DISABLED_FILL = ("gray72", "gray30")
 
 READY_HINT = "Pick a version, then install it, add Fabric, or browse mods."
 
-# The launcher is Fabric-only for now, so every mod search and download is
-# filtered to it. Resource packs would need this dropped; see core.mods.
+# The launcher is Fabric-only for now, so mod searches and downloads are
+# filtered to it. core.mods drops the filter by itself for the types that
+# have no loader -- Modrinth files resource packs under "minecraft" -- so it
+# is safe to pass for every type.
 MOD_LOADER = "fabric"
+
+# What the Content tab can browse, in the order the picker shows them.
+# The values are Modrinth project types; core.mods routes each to its own
+# folder, so nothing here needs to know about mods/ or resourcepacks/.
+CONTENT_TYPES: dict[str, str] = {
+    "Mods": "mod",
+    "Resource packs": "resourcepack",
+    "Shaders": "shader",
+}
 
 # Enough to fill the list without a scrollbar marathon.
 SEARCH_LIMIT = 10
@@ -102,10 +114,14 @@ class BackgroundWorker:
                 result = work()
             except BaseException as exc:  # noqa: BLE001 -- handed to on_error
                 if on_error is not None:
-                    self._post(lambda: on_error(exc))
+                    # Bound as a default argument, not captured as a free
+                    # variable: Python deletes the name bound by "except ... as"
+                    # when the block ends, so a plain closure over it raises
+                    # NameError by the time the UI thread runs it.
+                    self._post(lambda error=exc: on_error(error))
             else:
                 if on_success is not None:
-                    self._post(lambda: on_success(result))
+                    self._post(lambda value=result: on_success(value))
 
         thread = threading.Thread(target=run, name="maestro-worker", daemon=True)
         thread.start()
@@ -161,11 +177,19 @@ class BackgroundWorker:
                 break
             try:
                 callback()
-            except tkinter.TclError:
-                # The window went away between posting and draining.
-                return
-        if not self._stopped:
+            except Exception:  # noqa: BLE001
+                # A callback that throws must not stop the pump. Returning here
+                # used to end the drain for good, so every later job sat with
+                # busy set and the inputs locked, with no way back.
+                traceback.print_exc()
+
+        if self._stopped:
+            return
+        try:
             self._widget.after(self._poll_interval_ms, self._drain)
+        except tkinter.TclError:
+            # The window is gone; there is nothing left to deliver to.
+            self._stopped = True
 
 
 def _split_braced(data: str) -> list[str]:
@@ -247,7 +271,7 @@ class MaestroApp(*_ROOT_BASES):
         self.tabs.grid(row=2, column=0, padx=24, pady=0, sticky="nsew")
         self.grid_rowconfigure(2, weight=1)
         play_tab = self.tabs.add("Play")
-        mods_tab = self.tabs.add("Mods")
+        mods_tab = self.tabs.add("Content")
         about_tab = self.tabs.add("About")
 
         # -- Play tab --
@@ -286,18 +310,25 @@ class MaestroApp(*_ROOT_BASES):
         )
         self.fabric_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 12), sticky="ew")
 
-        # -- Mods tab --
+        # -- Content tab --
         mods_tab.grid_columnconfigure(0, weight=1)
-        mods_tab.grid_rowconfigure(1, weight=1)
+        mods_tab.grid_rowconfigure(2, weight=1)
+
+        self.content_type = ctk.CTkSegmentedButton(
+            mods_tab, values=list(CONTENT_TYPES),
+            command=self._content_type_changed,
+        )
+        self.content_type.set("Mods")
+        self.content_type.grid(row=0, column=0, padx=4, pady=(12, 4), sticky="ew")
 
         search_row = ctk.CTkFrame(mods_tab, fg_color="transparent")
-        search_row.grid(row=0, column=0, padx=4, pady=(12, 8), sticky="ew")
+        search_row.grid(row=1, column=0, padx=4, pady=(4, 8), sticky="ew")
         search_row.grid_columnconfigure(0, weight=1)
 
         self.search_var = ctk.StringVar()
         self.search_entry = ctk.CTkEntry(
             search_row, textvariable=self.search_var,
-            placeholder_text="Search Modrinth for a mod...",
+            placeholder_text="Search Modrinth...",
         )
         self.search_entry.grid(row=0, column=0, sticky="ew")
         self.search_entry.bind("<Return>", lambda _event: self.start_search())
@@ -307,29 +338,29 @@ class MaestroApp(*_ROOT_BASES):
         self.search_button.grid(row=0, column=1, padx=(8, 0))
 
         self.results_frame = ctk.CTkScrollableFrame(mods_tab, fg_color=("gray92", "gray14"))
-        self.results_frame.grid(row=1, column=0, padx=4, pady=0, sticky="nsew")
+        self.results_frame.grid(row=2, column=0, padx=4, pady=0, sticky="nsew")
         self.results_frame.grid_columnconfigure(0, weight=1)
 
         self.selected_mod = ctk.StringVar(value="")
         self.results_hint = ctk.CTkLabel(
             self.results_frame,
-            text="Results appear here. Searches are filtered to the selected\n"
-                 "version and Fabric.",
+            text="Results appear here, filtered to the version picked on the\n"
+                 "Play tab.",
             justify="left", anchor="w", text_color=("gray45", "gray60"),
         )
         self.results_hint.grid(row=0, column=0, padx=8, pady=8, sticky="ew")
 
         self.install_mod_button = ctk.CTkButton(
-            mods_tab, text="Install selected mod", height=36,
+            mods_tab, text="Install selected", height=36,
             command=self.start_mod_install,
         )
-        self.install_mod_button.grid(row=2, column=0, padx=4, pady=(10, 6), sticky="ew")
+        self.install_mod_button.grid(row=3, column=0, padx=4, pady=(10, 6), sticky="ew")
 
         self.add_files_button = ctk.CTkButton(
             mods_tab, text="Add files from your computer...", height=32,
             command=self.choose_files_to_import,
         )
-        self.add_files_button.grid(row=3, column=0, padx=4, pady=(0, 6), sticky="ew")
+        self.add_files_button.grid(row=4, column=0, padx=4, pady=(0, 6), sticky="ew")
 
         self.drop_zone = ctk.CTkLabel(
             mods_tab,
@@ -341,7 +372,7 @@ class MaestroApp(*_ROOT_BASES):
             height=44, fg_color=("gray88", "gray20"), corner_radius=8,
             text_color=("gray40", "gray65"),
         )
-        self.drop_zone.grid(row=4, column=0, padx=4, pady=(0, 12), sticky="ew")
+        self.drop_zone.grid(row=5, column=0, padx=4, pady=(0, 12), sticky="ew")
 
         if self.dnd_ready:
             self.drop_zone.drop_target_register(DND_FILES)
@@ -419,6 +450,17 @@ class MaestroApp(*_ROOT_BASES):
     def set_status(self, text: str) -> None:
         self.status_label.configure(text=text)
 
+    def clear_progress(self) -> None:
+        """Put the bar back to empty.
+
+        The bar reports work in flight, so it sits empty whenever nothing is
+        running rather than staying full after the last job. What happened is
+        the status line's job, and it keeps saying so.
+        """
+        self.progress.stop()
+        self.progress.configure(mode="determinate")
+        self.progress.set(0)
+
     def show_progress(self, progress: Progress) -> None:
         """Render one progress tick. Wire real work to this through the worker."""
         self.progress.set(progress.fraction)
@@ -437,9 +479,7 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _versions_loaded(self, versions: list[str]) -> None:
-        self.progress.stop()
-        self.progress.configure(mode="determinate")
-        self.progress.set(0)
+        self.clear_progress()
 
         self.versions = versions
         if not versions:
@@ -452,9 +492,7 @@ class MaestroApp(*_ROOT_BASES):
         self.set_status(f"{len(versions)} releases available. {READY_HINT}")
 
     def _versions_failed(self, error: BaseException) -> None:
-        self.progress.stop()
-        self.progress.configure(mode="determinate")
-        self.progress.set(0)
+        self.clear_progress()
         message = str(error) if isinstance(error, InstallError) else f"{error}"
         self.set_status(f"Could not load versions: {message}")
 
@@ -483,6 +521,7 @@ class MaestroApp(*_ROOT_BASES):
         self.version_menu.configure(state="normal" if ready else "disabled")
         self.directory_entry.configure(state="disabled" if busy else "normal")
         self.search_entry.configure(state="disabled" if busy else "normal")
+        self.content_type.configure(state="disabled" if busy else "normal")
         self.set_button_enabled(self.browse_button, not busy)
         self.set_button_enabled(self.play_button, ready)
         self.set_button_enabled(self.fabric_button, ready)
@@ -524,7 +563,7 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _install_finished(self, version: str, path: Path) -> None:
-        self.progress.set(1.0)
+        self.clear_progress()
         self._set_busy(False)
         self.set_status(f"Minecraft {version} is installed in {path}. Launching comes later.")
 
@@ -557,12 +596,12 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _fabric_finished(self, profile_id: str) -> None:
-        self.progress.set(1.0)
+        self.clear_progress()
         self._set_busy(False)
         self.set_status(f"Ready: {profile_id}, with Sodium in mods/.")
 
     def _fabric_failed(self, error: BaseException) -> None:
-        self.progress.set(0)
+        self.clear_progress()
         self._set_busy(False)
         detail = str(error) if isinstance(error, InstallError) else f"{error}"
         self.set_status(f"Fabric install failed: {detail}")
@@ -573,6 +612,22 @@ class MaestroApp(*_ROOT_BASES):
             self.set_status("Pick a version on the Play tab first.")
             return None
         return version
+
+    def selected_content_type(self) -> str:
+        """The Modrinth project type the picker is currently on."""
+        return CONTENT_TYPES.get(self.content_type.get(), "mod")
+
+    def _content_type_changed(self, _label: str) -> None:
+        """Switching type invalidates the results, which were of the old type."""
+        if self.busy:
+            return
+        self._clear_results()
+        self.results_hint.configure(
+            text=f"Search Modrinth for {self.content_type.get().lower()}."
+        )
+        self.results_hint.grid()
+        self._set_busy(False)
+        self.set_status(f"Now browsing {self.content_type.get().lower()}.")
 
     def start_search(self) -> None:
         """Search Modrinth for the typed term, off the UI thread."""
@@ -590,11 +645,18 @@ class MaestroApp(*_ROOT_BASES):
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start()
-        self.set_status(f'Searching Modrinth for "{query}" ({version}, {MOD_LOADER})...')
+        project_type = self.selected_content_type()
+        self.set_status(
+            f'Searching Modrinth for "{query}" ({self.content_type.get().lower()}, '
+            f"{version})..."
+        )
 
+        # loader is passed for every type; core.mods drops it for the ones
+        # Modrinth files under "minecraft" rather than a mod loader.
         self.worker.submit(
             lambda: mods.search_projects(
-                query, game_version=version, loader=MOD_LOADER, limit=SEARCH_LIMIT
+                query, game_version=version, loader=MOD_LOADER,
+                project_type=project_type, limit=SEARCH_LIMIT,
             ),
             on_success=self._search_finished,
             on_error=self._search_failed,
@@ -608,9 +670,7 @@ class MaestroApp(*_ROOT_BASES):
         self.selected_mod.set("")
 
     def _search_finished(self, results: list[SearchResult]) -> None:
-        self.progress.stop()
-        self.progress.configure(mode="determinate")
-        self.progress.set(0)
+        self.clear_progress()
 
         self._clear_results()
         self.results = results
@@ -633,12 +693,13 @@ class MaestroApp(*_ROOT_BASES):
             self._result_rows.append(row)
 
         self._set_busy(False)
-        self.set_status(f"{len(results)} mods found. Pick one and install it.")
+        self.set_status(
+            f"{len(results)} {self.content_type.get().lower()} found. "
+            "Pick one and install it."
+        )
 
     def _search_failed(self, error: BaseException) -> None:
-        self.progress.stop()
-        self.progress.configure(mode="determinate")
-        self.progress.set(0)
+        self.clear_progress()
         self._set_busy(False)
         detail = str(error) if isinstance(error, ModError) else f"{error}"
         self.set_status(f"Search failed: {detail}")
@@ -654,7 +715,7 @@ class MaestroApp(*_ROOT_BASES):
         slug = self.selected_mod.get()
         hit = next((r for r in self.results if r.slug == slug), None)
         if hit is None:
-            self.set_status("Pick a mod from the results first.")
+            self.set_status("Pick something from the results first.")
             return
         version = self._selected_version()
         if version is None:
@@ -679,15 +740,16 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _mod_install_finished(self, hit: SearchResult, path: Path) -> None:
-        self.progress.set(1.0)
+        self.clear_progress()
         self._set_busy(False)
+        # path.parent.name is whichever folder core.mods routed it to.
         self.set_status(f"{hit.title} installed: {path.name} in {path.parent.name}/.")
 
     def _mod_install_failed(self, error: BaseException) -> None:
-        self.progress.set(0)
+        self.clear_progress()
         self._set_busy(False)
         detail = str(error) if isinstance(error, ModError) else f"{error}"
-        self.set_status(f"Mod install failed: {detail}")
+        self.set_status(f"Install failed: {detail}")
 
     def _parse_drop(self, data: str) -> list[str]:
         """Turn tkdnd's payload into a list of existing file paths.
@@ -770,17 +832,17 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _import_finished(self, results: list) -> None:
-        self.progress.set(1.0 if any(r.ok for r in results) else 0)
+        self.clear_progress()
         self._set_busy(False)
         self.set_status(imports.describe(results))
 
     def _import_failed_batch(self, error: BaseException) -> None:
-        self.progress.set(0)
+        self.clear_progress()
         self._set_busy(False)
         self.set_status(f"Import failed: {error}")
 
     def _install_failed(self, error: BaseException) -> None:
-        self.progress.set(0)
+        self.clear_progress()
         self._set_busy(False)
         detail = str(error) if isinstance(error, InstallError) else f"{error}"
         self.set_status(f"Install failed: {detail}")

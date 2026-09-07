@@ -170,6 +170,12 @@ class BackgroundWorker:
         self._queue.put(callback)
 
     def _drain(self) -> None:
+        # A drain may already be scheduled when stop() is called, and the window
+        # is usually being destroyed by then, so drop the queue rather than
+        # running callbacks against widgets on their way out.
+        if self._stopped:
+            return
+
         while True:
             try:
                 callback = self._queue.get_nowait()

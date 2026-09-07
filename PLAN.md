@@ -82,3 +82,49 @@ and it launches.
 
 - [x] PyInstaller one-file build
 - [x] "Not an official Minecraft product" notice in the README and About screen
+
+---
+
+## M8 — Web frontend
+
+Replace the CustomTkinter GUI with an HTML/CSS/JS frontend hosted by pywebview
+in a native window. `gui/` keeps working until M8 is finished; `core/` does not
+change at all. No frontend framework and no build step -- plain files.
+
+Window opens at 1280x760, resizable, minimum 1024x640.
+
+**Design brief** (reference: the Helios Launcher)
+
+Full-bleed dark background. No panels, boxes or borders -- content floats
+directly on the background. One large primary action; secondary items are small
+icons at the edges.
+
+- Background: pure black `#0a0a0a`, no photo.
+- The wireframe logo is black-on-white at source; it is inverted to
+  white-on-transparent and used as the hero image, top-left, large. It is the
+  main visual on the screen.
+- Type: white, thin weights, generous letter-spacing on small labels. All-caps
+  for small labels, as in the reference.
+- Royal blue `#2B4FD6` is the primary action colour -- PLAY and install buttons
+  only.
+- Minecraft grass green `#5CB85C` is for state only: progress bars, installed
+  ticks, online indicators. Never for buttons.
+- Everything else is white or grey on black.
+- Buttons: generous corner radius, subtle lift and brightening on hover, quick
+  scale-down on press. Rounded and tactile without being cartoonish -- it has to
+  sit alongside the sharp cinematic layout without fighting it.
+
+Measured contrast, so the palette is not re-litigated later: white on royal blue
+6.58:1, white on black 19.8:1, green on black 7.98:1, grey `#8A8A8A` on black
+5.73:1. Royal blue on black is 3.01:1, which is fine for a fill or a focus ring
+but not for text -- blue is never a text colour.
+
+Home screen: logo top-left, account placeholder top-right, large PLAY button
+bottom-centre with the version selector as small text beside it, and a vertical
+icon rail on the right edge for Content, Settings and About. Nothing else.
+
+- [x] Slice 1: static shell in `gui_web/`, nothing wired to `core/`
+- [ ] Slice 2: version list and install wired through to `core/`
+- [ ] Slice 3: content browsing and local file import
+- [ ] Slice 4: account and launching
+- [ ] Retire `gui/` once the web frontend covers everything it did

@@ -1,0 +1,249 @@
+/* MaestroLauncher web frontend -- M8 slice 1, static shell.
+
+   Full-bleed black. Nothing sits in a panel, a card or a border: every element
+   floats directly on the background, which is what makes the layout read as
+   cinematic rather than as an app chrome.
+
+   Colour discipline, and it is the whole point of the palette:
+     royal blue  = action        (PLAY and installs, nothing else)
+     grass green = state         (progress, installed, online -- never a button)
+     everything else is white or grey on black.
+
+   Blue on black measures 3.01:1, which is enough for a fill or a focus ring but
+   not for text, so blue is never used as a text colour here. White on the blue
+   fill is 6.58:1 and the grey used for labels is 5.73:1, both past 4.5:1.
+*/
+
+:root {
+  --bg: #0a0a0a;
+  --fg: #ffffff;
+
+  /* 5.73:1 on --bg. Do not darken this without re-checking small labels. */
+  --muted: #8a8a8a;
+  --muted-dim: #6e6e6e;      /* decorative only: 3.88:1, never body text */
+
+  --blue: #2b4fd6;
+  --blue-lift: #3a60ea;      /* hover only */
+  --green: #5cb85c;          /* state only */
+
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --fast: 90ms;
+  --base: 190ms;
+
+  --edge: clamp(36px, 4.4vw, 68px);   /* breathing room from the window edge */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  overflow: hidden;                    /* a launcher screen never scrolls */
+  font-family: "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  cursor: default;
+  user-select: none;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------------------------------------------------------------- the logo */
+
+.logo {
+  position: absolute;
+  top: clamp(28px, 4vh, 52px);
+  left: var(--edge);
+  width: clamp(330px, 33vw, 470px);
+  height: auto;
+  /* The artwork is fine white wireframe; at full strength it glares on black. */
+  opacity: 0.94;
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------- the account */
+
+.account {
+  position: absolute;
+  top: clamp(30px, 4vh, 50px);
+  right: var(--edge);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px 8px 8px;
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  cursor: pointer;
+  transition: color var(--base) var(--ease), background-color var(--base) var(--ease);
+}
+
+.account__avatar {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.07);
+  transition: background-color var(--base) var(--ease);
+}
+
+.account__avatar svg { width: 17px; height: 17px; }
+
+.account__label {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.account:hover { color: var(--fg); background-color: rgba(255, 255, 255, 0.04); }
+.account:hover .account__avatar { background: rgba(255, 255, 255, 0.13); }
+.account:active { transform: scale(0.98); }
+
+/* ---------------------------------------------------------------- the rail */
+
+.rail {
+  position: absolute;
+  top: 50%;
+  right: var(--edge);
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rail__item {
+  display: grid;
+  place-items: center;
+  width: 44px;                 /* 44x44 minimum touch/click target */
+  height: 44px;
+  background: none;
+  border: 0;
+  border-radius: 14px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color var(--base) var(--ease),
+              background-color var(--base) var(--ease),
+              transform var(--fast) var(--ease);
+}
+
+.rail__item svg { width: 20px; height: 20px; }
+
+.rail__item:hover {
+  color: var(--fg);
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.rail__item:active { transform: scale(0.94); }
+
+/* ---------------------------------------------------------------- the dock */
+
+/* PLAY holds the centre line of the window on its own. The version sits beside
+   it, positioned off the dock rather than laid out next to it -- centring the
+   two as a group would push the primary action off centre by half the version's
+   width, which is visible at this size. */
+.dock {
+  position: absolute;
+  left: 50%;
+  bottom: clamp(52px, 9vh, 92px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+}
+
+/* The one primary action on the screen. */
+.play {
+  min-width: clamp(230px, 21vw, 292px);
+  padding: 22px 56px;
+  background: var(--blue);
+  border: 0;
+  border-radius: 18px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.26em;
+  text-transform: uppercase;
+  text-indent: 0.26em;          /* re-centre against the trailing letter-space */
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease),
+              transform var(--base) var(--ease),
+              box-shadow var(--base) var(--ease);
+}
+
+.play:hover {
+  background: var(--blue-lift);
+  transform: translateY(-2px);
+  box-shadow: 0 14px 34px rgba(43, 79, 214, 0.34);
+}
+
+/* Press reads faster than release, so the button feels physical. */
+.play:active {
+  transform: translateY(0) scale(0.975);
+  transition-duration: var(--fast);
+  box-shadow: 0 6px 16px rgba(43, 79, 214, 0.28);
+}
+
+.version {
+  position: absolute;
+  left: calc(100% + clamp(18px, 2.2vw, 32px));
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 6px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: color var(--base) var(--ease);
+}
+
+.version__chevron { width: 13px; height: 13px; }
+.version:hover { color: var(--fg); }
+/* Keep the centring transform: a bare scale() here would replace it and
+   drop the label half its height on every press. */
+.version:active { transform: translateY(-50%) scale(0.98); }
+
+/* --------------------------------------------------------------- keyboard */
+
+:focus-visible {
+  outline: 2px solid var(--blue-lift);   /* 3:1+ against black, fine for a ring */
+  outline-offset: 4px;
+  border-radius: 6px;
+}
+
+/* ---------------------------------------------------- shorter windows only */
+
+@media (max-height: 700px) {
+  .logo { width: clamp(280px, 27vw, 380px); }
+  .play { padding: 18px 46px; }
+}
+
+/* ------------------------------------------------------- reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+  }
+  .play:hover, .play:active,
+  .account:active, .rail__item:active { transform: none; }
+  .version:active { transform: translateY(-50%); }
+}

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MaestroLauncher</title>
+<!-- Progressive enhancement: Inter if the machine is online, Segoe UI Variable
+     otherwise. The layout is designed to survive the fallback. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<main class="stage">
+
+  <!-- Top left: the logo is the main visual on the screen. -->
+  <img class="logo" src="assets/logo.png" alt="MaestroLauncher" draggable="false">
+
+  <!-- Top right: account placeholder. Not wired to anything in slice 1. -->
+  <button class="account" type="button" aria-label="Sign in to your Microsoft account">
+    <span class="account__avatar" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path>
+        <circle cx="12" cy="7" r="4"></circle>
+      </svg>
+    </span>
+    <span class="account__label">Sign in</span>
+  </button>
+
+  <!-- Right edge: secondary destinations, icons only. -->
+  <nav class="rail" aria-label="Sections">
+    <button class="rail__item" type="button" aria-label="Content" title="Content">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="12 2 2 7 12 12 22 7 12 2"></polyline>
+        <polyline points="2 17 12 22 22 17"></polyline>
+        <polyline points="2 12 12 17 22 12"></polyline>
+      </svg>
+    </button>
+    <button class="rail__item" type="button" aria-label="Settings" title="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <line x1="4" y1="7" x2="20" y2="7"></line>
+        <line x1="4" y1="12" x2="20" y2="12"></line>
+        <line x1="4" y1="17" x2="20" y2="17"></line>
+        <circle cx="9" cy="7" r="2.2" fill="#0a0a0a"></circle>
+        <circle cx="15" cy="12" r="2.2" fill="#0a0a0a"></circle>
+        <circle cx="8" cy="17" r="2.2" fill="#0a0a0a"></circle>
+      </svg>
+    </button>
+    <button class="rail__item" type="button" aria-label="About" title="About">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9.2"></circle>
+        <line x1="12" y1="11" x2="12" y2="16.5"></line>
+        <line x1="12" y1="7.6" x2="12.01" y2="7.6"></line>
+      </svg>
+    </button>
+  </nav>
+
+  <!-- Bottom centre: the one primary action, with the version beside it. -->
+  <div class="dock">
+    <button class="play" type="button">Play</button>
+
+    <button class="version" type="button" aria-label="Choose version. Currently 1.21.1 Fabric">
+      <span class="version__value">1.21.1 Fabric</span>
+      <svg class="version__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polyline points="6 15 12 9 18 15"></polyline>
+      </svg>
+    </button>
+  </div>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

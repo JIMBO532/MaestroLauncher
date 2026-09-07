@@ -7,9 +7,9 @@ so it stays testable without a login.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -163,8 +163,13 @@ def latest_release() -> str:
 
 
 def is_installed(version_id: str, directory: Path | str) -> bool:
-    """True if this version is already present and usable in this directory."""
-    return mll.utils.is_version_valid(version_id, str(Path(directory).expanduser()))
+    """True if this version is really present in this directory.
+
+    Deliberately not ``mll.utils.is_version_valid``, which answers a different
+    question: it is True for any version Mojang offers for download, installed
+    here or not, so it can never tell you whether a launch would work.
+    """
+    return version_id in installed_versions(directory)
 
 
 def installed_versions(directory: Path | str) -> list[str]:
@@ -196,58 +201,24 @@ def install_version(
     return path
 
 
-def _read_version_json(version_id: str, directory: Path) -> Optional[dict]:
-    """The profile json for an installed version, or None if unreadable."""
-    path = Path(directory) / "versions" / version_id / f"{version_id}.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def _fabric_profiles(minecraft_version: str, directory: Path) -> list[str]:
-    """Installed Fabric profiles for a game version, oldest first.
-
-    A profile is recognised by what its json says -- it inherits from the vanilla
-    version and boots Fabric's own launcher -- rather than by pattern-matching the
-    profile name, which Fabric has changed before. This reads the json only to
-    identify a profile; building the actual launch stays with the library.
-    """
-    try:
-        installed = mll.utils.get_installed_versions(str(directory))
-    except Exception:
-        return []
-
-    found: list[tuple[object, str]] = []
-    for entry in installed:
-        version_id = entry.get("id", "")
-        data = _read_version_json(version_id, directory)
-        if not data or data.get("inheritsFrom") != minecraft_version:
-            continue
-        if "fabric" not in str(data.get("mainClass", "")).lower():
-            continue
-        found.append((entry.get("releaseTime"), version_id))
-
-    # Newest last. releaseTime is what separates two loader versions of the same
-    # profile; string-sorting the ids would put 0.9 above 0.19.
-    found.sort(key=lambda pair: (pair[0] is None, pair[0]))
-    return [version_id for _, version_id in found]
-
-
 def install_fabric_loader(
     minecraft_version: str,
     directory: Path | str,
     loader_version: Optional[str] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> str:
-    """Install the Fabric loader for a version. Returns the new profile ID to launch.
+    """Install the Fabric loader for a version. Returns the profile ID to launch.
 
-    The profile ID is discovered by diffing installed versions rather than by
-    guessing Fabric's naming scheme, which has changed before.
+    Uses ``mll.mod_loader``, which reports the profile ID itself, so we neither
+    guess Fabric's naming scheme nor go looking for it afterwards. Calling this
+    for an already-installed profile re-runs the installer and returns the same
+    ID, so a launcher can call it on every press of play.
 
     Fabric's installer is a Java jar, so this needs a runtime -- see
-    :func:`find_java_executable` for where one is looked for. The vanilla version
-    must already be installed for Fabric to go on top of it.
+    :func:`find_java_executable`. The vanilla version must already be installed:
+    mod_loader's docstring says it will install a missing one, but its code
+    raises VersionNotFound before reaching that point. install_fabric_with_sodium
+    installs vanilla first for exactly this reason.
     """
     path = _prepare_directory(directory)
 
@@ -261,14 +232,24 @@ def install_fabric_loader(
             "downloaded, or put a JRE on PATH or in JAVA_HOME."
         )
 
-    if not mll.fabric.is_minecraft_version_supported(minecraft_version):
+    try:
+        loader = mll.mod_loader.get_mod_loader("fabric")
+    except Exception as exc:
+        raise InstallError(f"Could not load Fabric support: {exc}") from exc
+
+    try:
+        supported = loader.is_minecraft_version_supported(minecraft_version)
+    except Exception as exc:
+        raise InstallError(
+            f"Could not check whether Fabric supports {minecraft_version}: {exc}"
+        ) from exc
+    if not supported:
         raise InstallError(f"Fabric does not support Minecraft {minecraft_version}.")
 
-    before = set(installed_versions(path))
     callback = _build_callback(on_progress) if on_progress else None
 
     try:
-        mll.fabric.install_fabric(
+        return loader.install(
             minecraft_version,
             str(path),
             loader_version=loader_version,
@@ -282,23 +263,18 @@ def install_fabric_loader(
         ) from exc
     except mll.exceptions.UnsupportedVersion as exc:
         raise InstallError(f"Fabric rejected version '{minecraft_version}'.") from exc
-    except mll.exceptions.ExternalProgramError as exc:
-        raise InstallError(f"The Fabric installer failed: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        # mod_loader runs the installer with check=True, so a non-zero exit
+        # arrives as CalledProcessError rather than the old ExternalProgramError.
+        # It carries no captured output; the installer writes to our own stderr.
+        raise InstallError(
+            f"The Fabric installer exited with code {exc.returncode}. Its output is "
+            "above."
+        ) from exc
     except OSError as exc:
         raise InstallError(f"Failed writing Fabric files to {path}: {exc}") from exc
-
-    profiles = _fabric_profiles(minecraft_version, path)
-    if not profiles:
-        raise InstallError("Fabric reported success but created no launch profile.")
-
-    # Prefer the profile this call just created. When Fabric was already
-    # installed nothing is new, so fall back to the newest existing one and stay
-    # idempotent -- a launcher calls this every time someone presses play.
-    created = set(installed_versions(path)) - before
-    for candidate in reversed(profiles):
-        if candidate in created:
-            return candidate
-    return profiles[-1]
+    except Exception as exc:
+        raise InstallError(f"Installing Fabric failed unexpectedly: {exc}") from exc
 
 
 def install_fabric_with_sodium(

@@ -168,7 +168,11 @@ def main() -> int:
 
     # Bad input is our error type.
     for label, call in (
-        ("an uninstalled version", lambda: build_command("0.0.1-nope", TARGET, DUMMY_USERNAME, DUMMY_UUID, DUMMY_TOKEN)),
+        ("a nonexistent version", lambda: build_command("0.0.1-nope", TARGET, DUMMY_USERNAME, DUMMY_UUID, DUMMY_TOKEN)),
+        # A real version that simply is not installed here. This one used to slip
+        # through: the guard called mll.utils.is_version_valid, which is True for
+        # anything Mojang offers, installed or not.
+        ("a real but uninstalled version", lambda: build_command("1.20.4", TARGET, DUMMY_USERNAME, DUMMY_UUID, DUMMY_TOKEN)),
         ("an empty token", lambda: build_command(version, TARGET, DUMMY_USERNAME, DUMMY_UUID, "")),
         ("too little memory", lambda: build_command(version, TARGET, DUMMY_USERNAME, DUMMY_UUID, DUMMY_TOKEN, memory_mb=64)),
     ):

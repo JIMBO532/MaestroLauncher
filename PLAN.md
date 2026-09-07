@@ -9,9 +9,9 @@ one starts. Do not skip ahead to the GUI.
 
 Not a coding task. Runs in parallel with M1.
 
-- [ ] Create an Azure app registration, "Personal Microsoft accounts only"
-- [ ] Redirect URI: `http://localhost:8000/callback` (type: Web)
-- [ ] Submit the Minecraft API permission request form
+- [x] Create an Azure app registration, "Personal Microsoft accounts only"
+- [x] Redirect URI: `http://localhost:8000/callback` (type: Web)
+- [x] Submit the Minecraft API permission request form
 - [ ] Store the client ID in `.env` (gitignored), never commit it
 
 Without approval, `api.minecraftservices.com` returns 403 and login cannot work.

@@ -81,4 +81,4 @@ and it launches.
 ## M7 — Ship
 
 - [x] PyInstaller one-file build
-- [ ] "Not an official Minecraft product" notice in the README and About screen
+- [x] "Not an official Minecraft product" notice in the README and About screen

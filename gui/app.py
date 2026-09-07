@@ -1,9 +1,10 @@
 """MaestroLauncher's CustomTkinter shell.
 
-M6 slices 1 to 5: a Play tab that installs a version or adds Fabric with Sodium,
-and a Mods tab that searches Modrinth, installs what you pick, and imports files
-you already have on disk. Every job runs through the same worker with live
-progress and the inputs locked. Launching and login are still not connected.
+M6 slices 1 to 5 plus the M7 About screen: a Play tab that installs a version or
+adds Fabric with Sodium, a Mods tab that searches Modrinth, installs what you
+pick, and imports files you already have on disk, and an About tab carrying the
+name, version and trademark notice. Every job runs through the same worker with
+live progress and the inputs locked. Launching and login are still not connected.
 
 Every long operation this launcher will do -- downloading a version, installing
 Fabric, fetching mods, logging in -- takes seconds to minutes, and Tk gives us
@@ -36,6 +37,18 @@ from core.installer import InstallError, Progress
 from core.mods import ModError, SearchResult
 
 WINDOW_TITLE = "MaestroLauncher"
+
+# Shown on the About screen. core.launch sends its own launcher_version to the
+# game and core.auth and core.mods each carry one in their User-Agent, so this
+# is the fourth copy of the same number -- worth collapsing into one place.
+APP_VERSION = "0.1.0"
+
+# The notice M7 asks for, kept as one string so the About screen and anything
+# else that needs it cannot drift apart.
+DISCLAIMER = (
+    "Not an official Minecraft product. Not approved by or associated with "
+    "Mojang or Microsoft."
+)
 WINDOW_SIZE = "660x620"
 POLL_INTERVAL_MS = 50
 
@@ -225,7 +238,7 @@ class MaestroApp(*_ROOT_BASES):
 
         subtitle = ctk.CTkLabel(
             self,
-            text="Not an official Minecraft product.",
+            text=DISCLAIMER.split(".")[0] + ".",
             text_color=("gray45", "gray60"),
         )
         subtitle.grid(row=1, column=0, padx=24, pady=(0, 18), sticky="w")
@@ -235,6 +248,7 @@ class MaestroApp(*_ROOT_BASES):
         self.grid_rowconfigure(2, weight=1)
         play_tab = self.tabs.add("Play")
         mods_tab = self.tabs.add("Mods")
+        about_tab = self.tabs.add("About")
 
         # -- Play tab --
         play_tab.grid_columnconfigure(1, weight=1)
@@ -332,6 +346,43 @@ class MaestroApp(*_ROOT_BASES):
         if self.dnd_ready:
             self.drop_zone.drop_target_register(DND_FILES)
             self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
+
+        # -- About tab --
+        about_tab.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            about_tab, text=WINDOW_TITLE,
+            font=ctk.CTkFont(size=20, weight="bold"), anchor="w",
+        ).grid(row=0, column=0, padx=8, pady=(20, 2), sticky="ew")
+
+        ctk.CTkLabel(
+            about_tab, text=f"Version {APP_VERSION}", anchor="w",
+            text_color=("gray40", "gray65"),
+        ).grid(row=1, column=0, padx=8, pady=(0, 18), sticky="ew")
+
+        self.about_notice = ctk.CTkLabel(
+            about_tab, text=DISCLAIMER, justify="left", anchor="w",
+            wraplength=520, text_color=("gray35", "gray70"),
+        )
+        self.about_notice.grid(row=2, column=0, padx=8, pady=(0, 18), sticky="ew")
+
+        ctk.CTkLabel(
+            about_tab,
+            text=(
+                "Minecraft is a trademark of Mojang Studios. Game files come from\n"
+                "Mojang; mods and packs come from Modrinth."
+            ),
+            justify="left", anchor="w", text_color=("gray50", "gray55"),
+        ).grid(row=3, column=0, padx=8, pady=(0, 18), sticky="ew")
+
+        # Keep the notice readable when the window is resized, the same way the
+        # status line does.
+        about_tab.bind(
+            "<Configure>",
+            lambda event: self.about_notice.configure(
+                wraplength=max(event.width - 40, 200)
+            ),
+        )
 
         # -- shared footer: one progress bar and one status line for every job --
         footer = ctk.CTkFrame(self, fg_color="transparent")

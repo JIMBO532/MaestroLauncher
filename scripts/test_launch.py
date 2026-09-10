@@ -65,7 +65,11 @@ def declared_main_class(version: str) -> str:
 
 
 def main() -> int:
-    version = sys.argv[1] if len(sys.argv) > 1 else "1.21.1"
+    argv = [a for a in sys.argv[1:] if a != "--real"]
+    version = argv[0] if argv else "1.21.1"
+
+    if "--real" in sys.argv:
+        return real_launch(version, memory_mb=DEFAULT_MEMORY_MB, timeout=240.0)
 
     print("MaestroLauncher launch test")
     print(f"  version:   {version}")
@@ -227,6 +231,157 @@ def main() -> int:
         return 1
 
     print("\nMilestone 3 PASSED")
+    return 0
+
+
+# --- The real thing -------------------------------------------------------
+#
+# Everything above builds a command with dummy credentials and never starts the
+# game, which was all that was possible before M2 landed. With a real login there
+# is no longer an excuse for that: the milestone says "launches to the main
+# menu", so --real signs in, starts the game, and watches its log until the menu
+# is actually up.
+
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+# The game prints this once it has accepted the account.
+LOGIN_MARKER = "Setting user:"
+
+# Any one of these means rendering got as far as the main menu. The sound engine
+# and the GUI texture atlas are both built while the menu is constructed, so they
+# arrive together and either is enough on its own.
+MENU_MARKERS = ("Sound engine started", "OpenAL initialized", "textures/atlas")
+
+
+def _log_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def real_launch(version: str, memory_mb: int, timeout: float) -> int:
+    """Sign in for real, start the game, and wait for the main menu."""
+    from core.auth import AuthError, load_client_id, login_or_refresh
+    from core.launch import launch
+
+    print("Real launch")
+    print()
+
+    client_id = load_client_id(ENV_FILE)
+    if not client_id:
+        print(f"BLOCKED: no Azure client ID in {ENV_FILE}. See PLAN.md M0.")
+        return 1
+
+    try:
+        account = login_or_refresh(
+            client_id, TARGET, on_status=lambda text: print(f"  ... {text}")
+        )
+    except AuthError as exc:
+        print(f"FAILED: could not sign in: {exc}")
+        return 1
+
+    print(f"  signed in as {account.username} ({account.uuid})")
+
+    try:
+        game = launch(
+            version,
+            TARGET,
+            account.username,
+            account.uuid,
+            account.access_token,
+            memory_mb=memory_mb,
+        )
+    except LaunchError as exc:
+        print(f"FAILED: {exc}")
+        return 1
+
+    print(f"  pid {game.pid}, logging to {game.log_path}")
+    print(f"  waiting up to {timeout:.0f}s for the main menu")
+    print()
+
+    deadline = time.monotonic() + timeout
+    seen_login = False
+    reached_menu = False
+
+    while time.monotonic() < deadline:
+        text = _log_text(game.log_path)
+
+        if not seen_login and LOGIN_MARKER in text:
+            seen_login = True
+            print("  ... the game accepted the account")
+
+        if any(marker in text for marker in MENU_MARKERS):
+            reached_menu = True
+            break
+
+        if not game.is_running():
+            break
+
+        time.sleep(1.0)
+
+    text = _log_text(game.log_path)
+    running = game.is_running()
+    exit_code = None if running else game.process.poll()
+
+    check("the game process started", game.pid > 0)
+    check("the game accepted the account", seen_login or LOGIN_MARKER in text)
+    check(
+        "the game reached the main menu",
+        reached_menu,
+        f"still running={running}, exit code={exit_code}",
+    )
+    check("the game did not exit on its own", running, f"exit code={exit_code}")
+    check(
+        "the access token is not in the log",
+        account.access_token not in text,
+        "the log leaked the token",
+    )
+
+    if reached_menu and running:
+        print()
+        print("  main menu reached; closing the game")
+        game.terminate()
+        try:
+            game.wait(timeout=30)
+        except Exception:  # noqa: BLE001 -- best effort shutdown
+            pass
+    else:
+        game.terminate()
+
+        # Which renderer the game got is the first thing worth knowing, and it is
+        # easy to miss in the tail. Modern versions try OpenGL, fall back to
+        # Vulkan and carry on; versions that predate that fallback just die. So a
+        # launch that works and one that does not can differ only in the game
+        # version, with the launcher behaving identically in both.
+        backend = [
+            line for line in text.splitlines()
+            if "graphics backend" in line
+            or "Failed to create backend" in line
+            or "BackendCreationException" in line
+            or "GLFW error" in line
+            or "Backend library" in line
+        ]
+        if backend:
+            print()
+            print("  renderer:")
+            for line in backend:
+                print(f"    {line.strip()}")
+
+        print()
+        print("  last 25 log lines:")
+        print()
+        for line in text.splitlines()[-25:]:
+            print(f"    {line}")
+
+    print()
+    print(f"  {_passed} passed, {_failed} failed")
+    if _failed:
+        print()
+        print("FAILED")
+        return 1
+    print()
+    print(f"Real launch of {version} PASSED")
     return 0
 
 

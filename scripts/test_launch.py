@@ -348,6 +348,26 @@ def real_launch(version: str, memory_mb: int, timeout: float) -> int:
             pass
     else:
         game.terminate()
+
+        # Which renderer the game got is the first thing worth knowing, and it is
+        # easy to miss in the tail. Modern versions try OpenGL, fall back to
+        # Vulkan and carry on; versions that predate that fallback just die. So a
+        # launch that works and one that does not can differ only in the game
+        # version, with the launcher behaving identically in both.
+        backend = [
+            line for line in text.splitlines()
+            if "graphics backend" in line
+            or "Failed to create backend" in line
+            or "BackendCreationException" in line
+            or "GLFW error" in line
+            or "Backend library" in line
+        ]
+        if backend:
+            print()
+            print("  renderer:")
+            for line in backend:
+                print(f"    {line.strip()}")
+
         print()
         print("  last 25 log lines:")
         print()

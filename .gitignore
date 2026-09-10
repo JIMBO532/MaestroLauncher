@@ -5,5 +5,7 @@ __pycache__/
 build/
 dist/
 
-# The built launcher, wherever it is dropped -- dist/ or the repo root.
+# The built launcher. The spec builds straight into launcher/, so that folder is
+# the one place a binary lands; *.exe stays as a backstop for a stray build.
+launcher/
 *.exe

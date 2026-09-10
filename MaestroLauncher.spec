@@ -3,8 +3,13 @@
 
     pyinstaller MaestroLauncher.spec
 
-Produces a single dist/MaestroLauncher.exe. Two packages need their data files
-carried in by hand, because neither is found by following imports alone:
+Produces a single launcher/MaestroLauncher.exe. ``launcher/`` is gitignored, so
+the 38 MB binary has one place to live and no way to reach a commit. It used to
+build to dist/ and be copied to the repo root afterwards, which left the exe
+sitting next to the source and relying on a bare ``*.exe`` ignore rule.
+
+Two packages need their data files carried in by hand, because neither is found
+by following imports alone:
 
 * tkinterdnd2 loads its tkdnd Tcl package at runtime from
   ``os.path.dirname(__file__)/tkdnd/<platform>``, and on Tcl 9 from the
@@ -20,7 +25,19 @@ carried in by hand, because neither is found by following imports alone:
 from pathlib import Path
 
 import tkinterdnd2
+from PyInstaller.config import CONF
 from PyInstaller.utils.hooks import collect_data_files
+
+# Build into launcher/ instead of dist/.
+#
+# This has to go through CONF. EXE() reads CONF["distpath"] when it is
+# constructed, and it strips any directory off name= with os.path.basename, so
+# neither reassigning the DISTPATH global nor putting a path in the name works
+# -- DISTPATH is only a copy PyInstaller hands the spec, and writing to it
+# changes nothing. Set before EXE() below, which is what reads it.
+OUTPUT_DIR = Path(SPECPATH) / "launcher"  # noqa: F821 -- SPECPATH is injected
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CONF["distpath"] = str(OUTPUT_DIR)
 
 TKDND_SOURCE = Path(tkinterdnd2.__file__).parent / "tkdnd"
 

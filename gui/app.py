@@ -64,12 +64,17 @@ READY_HINT = "Pick a version, then press Play."
 
 # Where the Azure client ID lives when it is not in the environment. Beside the
 # project when running from source, and beside the exe once PyInstaller has
-# bundled it -- sys.frozen moves __file__ into the bundle, so the executable's
-# own folder is checked too.
+# bundled it -- freezing moves __file__ into the unpacked bundle under a temp
+# directory, so the executable's own folder is what counts there.
+#
+# The folder above the exe is checked too, because the build drops the exe in
+# launcher/ while the .env it needs sits in the project root one level up. A
+# shipped copy still finds a .env sitting next to it; this only adds the
+# development layout, and it stops one directory up rather than walking.
 def _env_file_candidates() -> list[Path]:
     here = Path(__file__).resolve().parent.parent
     beside_exe = Path(sys.executable).resolve().parent
-    return [here / ".env", beside_exe / ".env"]
+    return [here / ".env", beside_exe / ".env", beside_exe.parent / ".env"]
 
 
 SIGNED_OUT = "Not signed in"

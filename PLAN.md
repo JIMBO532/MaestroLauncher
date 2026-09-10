@@ -41,10 +41,10 @@ No auth required. Fully testable today.
 **Done when:** `python scripts/test_login.py` opens a browser, completes login,
 and prints the account username and UUID.
 
-- [ ] `core/auth.py` using `minecraft_launcher_lib.microsoft_account`
-- [ ] Local HTTP server on port 8000 to catch the redirect
-- [ ] Refresh token persisted to disk so login survives a restart
-- [ ] `AzureAppNotPermitted` surfaced as a clear message, not a traceback
+- [x] `core/auth.py` using `minecraft_launcher_lib.microsoft_account`
+- [x] Local HTTP server on port 8000 to catch the redirect
+- [x] Refresh token persisted to disk so login survives a restart
+- [x] `AzureAppNotPermitted` surfaced as a clear message, not a traceback
 
 ## M3 — First real launch
 

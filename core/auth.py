@@ -21,6 +21,7 @@ supports it.
 
 from __future__ import annotations
 
+import codecs
 import json
 import os
 import urllib.parse
@@ -254,13 +255,23 @@ def _exchange_code(
     except requests.RequestException as exc:
         raise AuthError(f"Could not reach the login servers: {exc}") from exc
     except KeyError as exc:
-        # Microsoft answered, but not with a token. The library indexes the
-        # response straight away, so a rejected request arrives as a bare
-        # KeyError('access_token') rather than as anything descriptive.
+        # Microsoft answered, but not with a token. complete_login() indexes the
+        # token response straight away, so a refusal arrives as a bare
+        # KeyError('access_token') and the real AADSTS code is thrown away.
+        #
+        # The Minecraft hop is not what failed here: complete_login() checks that
+        # one itself and raises AzureAppNotPermitted, which is caught above. So a
+        # KeyError means Microsoft's own token endpoint said no, and by far the
+        # most common reason is the Azure app being registered with a "Web"
+        # redirect URI. That makes it a confidential client, which Azure insists
+        # must send a client secret (AADSTS70002) -- but this is a PKCE public
+        # client and has no secret to send.
         raise AuthError(
-            f"Microsoft refused the login and returned no {exc}. Check that the "
-            "client ID is right and that the redirect URI registered on the Azure "
-            f"app is exactly {redirect_uri}."
+            f"Microsoft refused the login and returned no {exc}. The usual cause is "
+            "the redirect URI being registered under the wrong platform: it must be "
+            'under "Mobile and desktop applications", not "Web". A Web redirect URI '
+            "makes Azure demand a client secret that this PKCE login does not use. "
+            f"Also check the client ID, and that the URI is exactly {redirect_uri}."
         ) from exc
     except Exception as exc:
         # Belt and braces: the GUI must never see a library traceback.
@@ -422,17 +433,90 @@ def load_client_id(env_file: Path | str | None = None) -> Optional[str]:
     if env_file is None:
         return None
 
-    try:
-        text = Path(env_file).expanduser().read_text(encoding="utf-8")
-    except OSError:
+    text = _read_text_any_encoding(Path(env_file).expanduser())
+    if text is None:
         return None
 
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+
         key, _, value = line.partition("=")
-        if key.strip() in {"MAESTRO_CLIENT_ID", "AZURE_CLIENT_ID"}:
-            return value.strip().strip("\"'") or None
+        key = key.strip()
+        # ".env" files are often written to be sourced by a shell.
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+
+        if key in {"MAESTRO_CLIENT_ID", "AZURE_CLIENT_ID"}:
+            return _unquote(value) or None
 
     return None
+
+
+def _unquote(value: str) -> str:
+    """Trim whitespace and one matching pair of surrounding quotes."""
+    value = value.strip()
+    for quote in ('"', "'"):
+        if len(value) >= 2 and value.startswith(quote) and value.endswith(quote):
+            return value[1:-1].strip()
+    return value
+
+
+def _read_text_any_encoding(path: Path) -> Optional[str]:
+    """Read a text file whatever encoding it happens to be in.
+
+    A .env file is written by whatever the person had to hand, and on Windows
+    that is usually PowerShell, which does not write plain UTF-8:
+
+    * ``Out-File`` and ``>`` in Windows PowerShell 5.1 write UTF-16 LE with a
+      BOM. Decoding that as UTF-8 raises UnicodeDecodeError, which is a
+      ValueError and so slipped straight past a bare ``except OSError``.
+    * ``-Encoding utf8`` writes UTF-8 *with* a BOM. That decodes without
+      complaint, but leaves a zero-width no-break space on the front of the
+      first key, so ``MAESTRO_CLIENT_ID`` silently stops matching and the file
+      looks empty of anything useful.
+
+    So the bytes are sniffed for a BOM first, then tried as UTF-8, then as
+    UTF-16 but only if they contain a NUL to justify it, and finally as latin-1,
+    which cannot fail. Returns None only when the file cannot be read at all.
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+
+    # Longest BOMs first: the UTF-32 LE mark starts with the UTF-16 LE one.
+    for bom, encoding in (
+        (codecs.BOM_UTF32_LE, "utf-32-le"),
+        (codecs.BOM_UTF32_BE, "utf-32-be"),
+        (codecs.BOM_UTF8, "utf-8"),
+        (codecs.BOM_UTF16_LE, "utf-16-le"),
+        (codecs.BOM_UTF16_BE, "utf-16-be"),
+    ):
+        if raw.startswith(bom):
+            try:
+                return raw[len(bom):].decode(encoding)
+            except UnicodeDecodeError:
+                break
+
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
+    # No BOM and not UTF-8. Only try UTF-16 if the bytes actually look like it:
+    # ``bytes.decode("utf-16")`` accepts *any* even-length input and happily
+    # returns CJK nonsense, so trying it blind makes a single-byte file parse or
+    # not depending on whether its length happens to be even. Real UTF-16 text in
+    # the ASCII range is half NUL bytes; a NUL never appears in a single-byte
+    # .env, so their presence is the thing worth branching on.
+    if b"\x00" in raw:
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+
+    # latin-1 maps every byte to a character, so this always returns something.
+    # A binary file will produce nonsense, but nonsense that matches no key.
+    return raw.decode("latin-1")

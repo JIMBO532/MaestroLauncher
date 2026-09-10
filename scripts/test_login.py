@@ -17,6 +17,8 @@ Exits 0 when the milestone's acceptance criterion is met, 1 otherwise.
 
 from __future__ import annotations
 
+import codecs
+import os
 import sys
 import tempfile
 import threading
@@ -212,11 +214,124 @@ def selftest() -> bool:
         )
 
     # 6. The client ID reader.
+    #
+    # This used to be one check that wrote its own tidy UTF-8 file with a
+    # trailing newline and read it back. That is the single shape which already
+    # worked, so it kept passing while the function was broken for the files
+    # people actually produce: PowerShell's redirect writes UTF-16 with a BOM,
+    # and -Encoding utf8 writes UTF-8 *with* a BOM, which parsed as a key named
+    # "﻿MAESTRO_CLIENT_ID" and therefore matched nothing.
+    client_id = "11111111-2222-3333-4444-555555555555"
+
+    def as_utf8(text: str) -> bytes:
+        return text.encode("utf-8")
+
+    def as_utf8_bom(text: str) -> bytes:
+        return codecs.BOM_UTF8 + text.encode("utf-8")
+
+    def as_utf16le_bom(text: str) -> bytes:
+        return codecs.BOM_UTF16_LE + text.encode("utf-16-le")
+
+    def as_utf16be_bom(text: str) -> bytes:
+        return codecs.BOM_UTF16_BE + text.encode("utf-16-be")
+
+    def as_utf32le_bom(text: str) -> bytes:
+        return codecs.BOM_UTF32_LE + text.encode("utf-32-le")
+
+    def as_cp1252(text: str) -> bytes:
+        return text.encode("cp1252")
+
+    cases = [
+        ("plain utf-8, trailing newline", as_utf8, "MAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("no trailing newline", as_utf8, "MAESTRO_CLIENT_ID=<<V>>", client_id),
+        ("utf-8 WITH BOM, no trailing newline", as_utf8_bom, "MAESTRO_CLIENT_ID=<<V>>", client_id),
+        ("utf-16 LE with BOM (PowerShell default)", as_utf16le_bom, "MAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("utf-16 LE with BOM, no trailing newline", as_utf16le_bom, "MAESTRO_CLIENT_ID=<<V>>", client_id),
+        ("utf-16 BE with BOM", as_utf16be_bom, "MAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("utf-32 LE with BOM", as_utf32le_bom, "MAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("crlf line endings", as_utf8, "MAESTRO_CLIENT_ID=<<V>>\r\n", client_id),
+        # Not UTF-8 and no BOM to go on. Both parities, because a bare
+        # decode("utf-16") accepts any even-length input and returns nonsense,
+        # so this used to pass or fail on byte count alone.
+        ("cp1252, odd byte count", as_cp1252, "# Dimitris’ key\nMAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("cp1252, even byte count", as_cp1252, "# Dimitris’ keys\nMAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("whitespace around key and value", as_utf8, "   MAESTRO_CLIENT_ID   =   <<V>>   \n", client_id),
+        ("double quoted value", as_utf8, 'MAESTRO_CLIENT_ID="<<V>>"\n', client_id),
+        ("single quoted value", as_utf8, "MAESTRO_CLIENT_ID='<<V>>'\n", client_id),
+        ("quotes with padding inside", as_utf8, 'MAESTRO_CLIENT_ID = "  <<V>>  "\n', client_id),
+        ("export prefix", as_utf8, "export MAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("AZURE_CLIENT_ID fallback key", as_utf8, "AZURE_CLIENT_ID=<<V>>\n", client_id),
+        ("comments and blank lines first", as_utf8, "# a note\n\nMAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("other keys are skipped", as_utf8, "OTHER=nope\nMAESTRO_CLIENT_ID=<<V>>\n", client_id),
+        ("empty value reads as absent", as_utf8, "MAESTRO_CLIENT_ID=\n", None),
+        ("quoted empty value reads as absent", as_utf8, 'MAESTRO_CLIENT_ID=""\n', None),
+        ("wrong key only", as_utf8, "SOMETHING_ELSE=<<V>>\n", None),
+    ]
+
     with tempfile.TemporaryDirectory() as tmp:
-        env = Path(tmp) / ".env"
-        env.write_text('# comment\nMAESTRO_CLIENT_ID = "abc-123"\n', encoding="utf-8")
-        check("reads a client ID from .env", load_client_id(env) == "abc-123", str(load_client_id(env)))
-        check("returns None when there is no .env", load_client_id(Path(tmp) / "nope") is None)
+        # load_client_id reads the environment before the file, so if either key
+        # is set here every case below would pass without opening anything.
+        saved = {k: os.environ.pop(k, None) for k in ("MAESTRO_CLIENT_ID", "AZURE_CLIENT_ID")}
+        try:
+            os.environ["MAESTRO_CLIENT_ID"] = "from-the-environment"
+            precedence = Path(tmp) / "precedence.env"
+            precedence.write_bytes(as_utf8("MAESTRO_CLIENT_ID=" + client_id + "\n"))
+            check(
+                "the environment wins over the file",
+                load_client_id(precedence) == "from-the-environment",
+                str(load_client_id(precedence)),
+            )
+            del os.environ["MAESTRO_CLIENT_ID"]
+
+            # The sentinel is "<<V>>" and not "ID" because the key itself ends in
+            # ID -- a bare placeholder would rewrite MAESTRO_CLIENT_ID as well as
+            # its value. A row that forgets the sentinel writes a literal value
+            # and quietly asserts nothing, so refuse to run one.
+            for label, _encode, template, expected in cases:
+                if expected is not None and "<<V>>" not in template:
+                    check(f".env: {label}", False, "fixture never substitutes <<V>>")
+
+            for index, (label, encode, template, expected) in enumerate(cases):
+                if expected is not None and "<<V>>" not in template:
+                    continue
+                path = Path(tmp) / f"case{index}.env"
+                path.write_bytes(encode(template.replace("<<V>>", client_id)))
+                try:
+                    got = load_client_id(path)
+                except Exception as exc:  # noqa: BLE001
+                    check(f".env: {label}", False, f"raised {type(exc).__name__}: {exc}")
+                    continue
+                check(f".env: {label}", got == expected, f"got {got!r}, wanted {expected!r}")
+
+            check("returns None when there is no .env", load_client_id(Path(tmp) / "nope") is None)
+
+            binary = Path(tmp) / "binary.env"
+            binary.write_bytes(bytes(range(256)) * 4)
+            try:
+                check("a binary file reads as absent", load_client_id(binary) is None)
+            except Exception as exc:  # noqa: BLE001
+                check("a binary file reads as absent", False, f"raised {type(exc).__name__}")
+
+            check("no env_file given is None", load_client_id(None) is None)
+
+            # The fixtures above are all files this script wrote itself, which is
+            # exactly how the old single check stayed green while the function was
+            # broken for real input. So finish on the actual .env, whatever shape
+            # the person's shell left it in. Absent is fine -- that is a fresh
+            # clone, and main() reports it properly further down.
+            if ENV_FILE.exists():
+                real = load_client_id(ENV_FILE)
+                check(
+                    f"the real {ENV_FILE.name} on disk parses",
+                    bool(real),
+                    f"{ENV_FILE} is {ENV_FILE.stat().st_size} bytes but yielded {real!r}",
+                )
+        finally:
+            for key, value in saved.items():
+                if value is not None:
+                    os.environ[key] = value
+                else:
+                    os.environ.pop(key, None)
 
     print(f"\n  {_passed} passed, {_failed} failed\n")
     return _failed == 0

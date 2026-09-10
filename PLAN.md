@@ -10,9 +10,12 @@ one starts. Do not skip ahead to the GUI.
 Not a coding task. Runs in parallel with M1.
 
 - [x] Create an Azure app registration, "Personal Microsoft accounts only"
-- [x] Redirect URI: `http://localhost:8000/callback` (type: Web)
+- [x] Redirect URI: `http://localhost:8000/callback`, under **Mobile and
+      desktop applications** -- NOT "Web". A Web redirect URI makes the app a
+      confidential client and Azure then rejects the login with AADSTS70002,
+      demanding a client secret that this PKCE public-client flow does not use.
 - [x] Submit the Minecraft API permission request form
-- [ ] Store the client ID in `.env` (gitignored), never commit it
+- [x] Store the client ID in `.env` (gitignored), never commit it
 
 Without approval, `api.minecraftservices.com` returns 403 and login cannot work.
 Approval is not instant. Submit it before writing any auth code.

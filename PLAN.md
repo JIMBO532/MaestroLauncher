@@ -50,18 +50,18 @@ and prints the account username and UUID.
 
 **Done when:** vanilla 1.21.1 launches to the main menu, logged in.
 
-- [ ] `core/launch.py` builds the command and spawns the process
-- [ ] Configurable RAM allocation
-- [ ] Game stdout/stderr captured to a log file
+- [x] `core/launch.py` builds the command and spawns the process
+- [x] Configurable RAM allocation
+- [x] Game stdout/stderr captured to a log file
 
 ## M4 — Fabric + Sodium
 
 **Done when:** one function call produces a Fabric profile with Sodium installed
 and it launches.
 
-- [ ] `install_fabric_loader()` in `core/installer.py` (stub already written)
-- [ ] Sodium jar pulled from the Modrinth API, matched to the game version
-- [ ] Dropped into `<dir>/mods/`
+- [x] `install_fabric_loader()` in `core/installer.py` (stub already written)
+- [x] Sodium jar pulled from the Modrinth API, matched to the game version
+- [x] Dropped into `<dir>/mods/`
 
 ## M5 — Mod browser
 

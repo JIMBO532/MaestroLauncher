@@ -217,6 +217,7 @@ def test_app_recovers() -> None:
         ("a launch", app._play_failed, InstallError("disk full")),
         ("a sign in", app._login_failed, AuthError("Microsoft refused the login")),
         ("a Fabric install", app._fabric_failed, InstallError("fabric installer exited 1")),
+        ("the optimization pack", app._optimization_failed, ModError("modrinth returned 503")),
         ("a mod install", app._mod_install_failed, ModError("no version for 1.21.1")),
         ("a search", app._search_failed, ModError("modrinth returned 503")),
         ("a file import", app._import_failed_batch, OSError("permission denied")),

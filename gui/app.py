@@ -382,7 +382,23 @@ class MaestroApp(*_ROOT_BASES):
         self.fabric_button = ctk.CTkButton(
             play_tab, text="Install Fabric + Sodium", height=36, command=self.start_fabric
         )
-        self.fabric_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 12), sticky="ew")
+        self.fabric_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 8), sticky="ew")
+
+        self.optimize_button = ctk.CTkButton(
+            play_tab, text="Install optimization pack", height=36,
+            command=self.start_optimization_pack,
+        )
+        self.optimize_button.grid(row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
+
+        ctk.CTkLabel(
+            play_tab,
+            text=(
+                "Installs the Optimized Minecraft collection from Modrinth into mods/.\n"
+                "Needs Fabric; VulkanMod in the pack replaces Sodium."
+            ),
+            justify="left", anchor="w", text_color=("gray45", "gray60"),
+            font=ctk.CTkFont(size=11),
+        ).grid(row=5, column=0, columnspan=2, padx=6, pady=(0, 12), sticky="ew")
 
         # -- Content tab --
         mods_tab.grid_columnconfigure(0, weight=1)
@@ -511,7 +527,7 @@ class MaestroApp(*_ROOT_BASES):
             for button in (
                 self.browse_button, self.play_button, self.fabric_button,
                 self.search_button, self.install_mod_button, self.add_files_button,
-                self.signin_button, self.signout_button,
+                self.signin_button, self.signout_button, self.optimize_button,
             )
         }
         self._set_busy(False)
@@ -600,6 +616,7 @@ class MaestroApp(*_ROOT_BASES):
         self.set_button_enabled(self.browse_button, not busy)
         self.set_button_enabled(self.play_button, ready)
         self.set_button_enabled(self.fabric_button, ready)
+        self.set_button_enabled(self.optimize_button, ready)
         self.set_button_enabled(self.search_button, ready)
         self.set_button_enabled(
             self.install_mod_button, ready and bool(self.selected_mod.get())
@@ -854,6 +871,80 @@ class MaestroApp(*_ROOT_BASES):
 
         self._set_busy(False)
         self.set_status(f"Ready: {profile_id}, with Sodium in mods/. Press Play.")
+
+    def start_optimization_pack(self) -> None:
+        """Install every mod in the Modrinth optimization collection, off the UI thread.
+
+        The collection is fetched live rather than pinned in code, so editing it
+        on Modrinth changes what this button installs without a release here.
+        """
+        if self.busy:
+            return
+
+        version = self.version_menu.get()
+        directory = self.directory_var.get().strip()
+
+        if not directory:
+            self.set_status("Choose a game folder first.")
+            return
+        if version not in self.versions and not installer.is_installed(version, directory):
+            self.set_status("Pick a version first.")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.set_status("Fetching the optimization collection from Modrinth...")
+
+        report = self.worker.progress_bridge(self.show_progress)
+
+        def work() -> tuple[list, list[str]]:
+            # A Fabric profile is not a Minecraft version number, and Modrinth
+            # only knows the latter, so resolve the profile to what it inherits.
+            game_version = installer.base_game_version(version, directory)
+            entries = mods.install_collection(
+                mods.OPTIMIZATION_COLLECTION,
+                game_version,
+                directory,
+                on_progress=report,
+            )
+            return entries, mods.find_conflicts(entries, directory)
+
+        self.worker.submit(
+            work,
+            on_success=self._optimization_finished,
+            on_error=self._optimization_failed,
+        )
+
+    def _optimization_finished(self, outcome: tuple[list, list[str]]) -> None:
+        entries, conflicts = outcome
+        self.clear_progress()
+        self._set_busy(False)
+
+        installed = [entry for entry in entries if entry.installed]
+        failed = [entry for entry in entries if not entry.installed]
+        prerelease = [entry for entry in installed if not entry.stable]
+
+        parts = [f"Optimization pack: {len(installed)} of {len(entries)} installed"]
+        if prerelease:
+            # Worth naming rather than burying: these are the mods most likely to
+            # misbehave, and the person did not choose them individually.
+            parts.append(
+                f"{len(prerelease)} had no stable build and came from a prerelease "
+                f"({', '.join(entry.title for entry in prerelease)})"
+            )
+        if failed:
+            parts.append(
+                f"{len(failed)} could not be installed "
+                f"({', '.join(entry.title for entry in failed)})"
+            )
+        parts.extend(conflicts)
+
+        self.set_status(". ".join(parts) + ".")
+
+    def _optimization_failed(self, error: BaseException) -> None:
+        self.clear_progress()
+        self._set_busy(False)
+        self.set_status(f"Could not install the optimization pack: {error}")
 
     def _fabric_failed(self, error: BaseException) -> None:
         self.clear_progress()

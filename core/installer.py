@@ -7,6 +7,7 @@ so it stays testable without a login.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -177,6 +178,29 @@ def installed_versions(directory: Path | str) -> list[str]:
     if not path.exists():
         return []
     return [v["id"] for v in mll.utils.get_installed_versions(str(path))]
+
+
+def base_game_version(version_id: str, directory: Path | str) -> str:
+    """The Minecraft version a profile is built on -- "1.21.1" for a Fabric profile.
+
+    A modded profile is a thin JSON that inherits from a vanilla version, and its
+    ID is whatever the loader's installer chose to call it. Modrinth only knows
+    the vanilla number, so anything asking Modrinth "which game version is this?"
+    has to resolve the profile first.
+
+    The answer is read out of the profile's own ``inheritsFrom`` rather than
+    parsed out of its ID, because the ID is the loader's to name and not ours to
+    pattern-match. A vanilla version inherits from nothing and is its own answer,
+    as is a profile we cannot read.
+    """
+    path = Path(directory).expanduser() / "versions" / version_id / f"{version_id}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return version_id
+
+    inherits = payload.get("inheritsFrom") if isinstance(payload, dict) else None
+    return str(inherits) if inherits else version_id
 
 
 def install_version(

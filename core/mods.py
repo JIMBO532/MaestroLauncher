@@ -22,7 +22,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import requests
 
@@ -30,6 +30,18 @@ from core import __version__
 from core.installer import Progress, ProgressCallback
 
 API_ROOT = "https://api.modrinth.com/v2"
+
+# Collections exist only on v3, which Modrinth still calls experimental. Every
+# other call in this module stays on v2.
+API_ROOT_V3 = "https://api.modrinth.com/v3"
+
+# "Optimized Minecraft" -- the collection behind the launcher's one-click
+# optimization button. Fetched live, so editing the collection on Modrinth
+# changes what the button installs without a code change.
+OPTIMIZATION_COLLECTION = "MzYTXwDl"
+
+# Collections are mod lists, and this launcher is Fabric-only for now.
+MOD_LOADER_DEFAULT = "fabric"
 
 # Modrinth's docs ask every client to identify itself and to include a contact.
 # An anonymous or stock python-requests UA is rate limited harder and may be
@@ -119,9 +131,13 @@ def _get_session() -> requests.Session:
     return _session
 
 
-def _api_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
+def _api_get(
+    path: str,
+    params: Optional[dict[str, Any]] = None,
+    api_root: str = API_ROOT,
+) -> Any:
     """GET a Modrinth endpoint and return parsed JSON, or raise ModError."""
-    url = f"{API_ROOT}{path}"
+    url = f"{api_root}{path}"
     try:
         response = _get_session().get(url, params=params, timeout=TIMEOUT)
     except requests.RequestException as exc:
@@ -420,3 +436,211 @@ def install_project(
         project_type=project_type,
     )
     return download_file(file, directory, on_progress=on_progress)
+
+
+@dataclass(frozen=True)
+class Collection:
+    """A Modrinth collection: a named, ordered bag of projects."""
+
+    id: str
+    name: str
+    description: str
+    project_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CollectionEntry:
+    """What happened to one project when a collection was installed."""
+
+    project_id: str
+    title: str
+    path: Optional[Path] = None
+    filename: str = ""
+    version_number: str = ""
+    stable: bool = True
+    error: str = ""
+
+    @property
+    def installed(self) -> bool:
+        return self.path is not None
+
+
+def fetch_collection(collection: str) -> Collection:
+    """Look up a Modrinth collection by its ID.
+
+    Collections live only on the v3 API, which Modrinth still labels
+    experimental, so this is the one call here that does not go through v2. A
+    shape change there surfaces as ``ModError`` like any other failure.
+    """
+    payload = _api_get(f"/collection/{collection}", api_root=API_ROOT_V3)
+    if not isinstance(payload, dict):
+        raise ModError(f"Modrinth returned an unexpected collection '{collection}'.")
+
+    projects = payload.get("projects")
+    if not isinstance(projects, list):
+        raise ModError(f"Modrinth collection '{collection}' listed no projects.")
+
+    return Collection(
+        id=str(payload.get("id", collection)),
+        name=str(payload.get("name", collection)),
+        description=str(payload.get("description", "")),
+        project_ids=tuple(str(p) for p in projects),
+    )
+
+
+def project_titles(project_ids: Sequence[str]) -> dict[str, str]:
+    """Human-readable names for a batch of project IDs, in one request.
+
+    Used so a collection install can name what it is doing rather than reciting
+    IDs. A project that cannot be looked up simply keeps its ID as its name.
+    """
+    if not project_ids:
+        return {}
+
+    payload = _api_get("/projects", {"ids": json.dumps(list(project_ids))})
+    if not isinstance(payload, list):
+        return {}
+
+    titles: dict[str, str] = {}
+    for project in payload:
+        if not isinstance(project, dict):
+            continue
+        identifier = project.get("id")
+        if identifier:
+            titles[str(identifier)] = str(project.get("title") or identifier)
+    return titles
+
+
+def install_collection(
+    collection: str,
+    game_version: str,
+    directory: Path | str,
+    loader: Optional[str] = MOD_LOADER_DEFAULT,
+    allow_unstable: bool = True,
+    on_progress: Optional[ProgressCallback] = None,
+) -> list[CollectionEntry]:
+    """Install every project in a collection, and report on each one.
+
+    One project failing does not stop the rest: a collection is a list of
+    independent mods, and getting thirteen of sixteen is worth far more than
+    getting none because the fourteenth had no build for this version. Every
+    outcome, good or bad, comes back in the returned list for the caller to
+    report.
+
+    ``allow_unstable`` is on by default here, unlike elsewhere in this module.
+    An optimization collection routinely carries mods whose only build for a
+    given version is a beta -- C2ME and VMP both are on 1.21.1 -- and skipping
+    them silently would make "install everything" quietly untrue. Which ones
+    came from a prerelease is recorded per entry so the caller can say so.
+    """
+    found = fetch_collection(collection)
+    titles = project_titles(found.project_ids)
+
+    total = len(found.project_ids)
+    results: list[CollectionEntry] = []
+
+    for index, project_id in enumerate(found.project_ids):
+        title = titles.get(project_id, project_id)
+
+        if on_progress:
+            on_progress(Progress(f"Installing {title}", index, total))
+
+        try:
+            file = resolve_version(
+                project_id,
+                game_version,
+                loader=loader,
+                allow_unstable=False,
+                project_type="mod",
+            )
+        except ModError:
+            file = None
+
+        if file is None and allow_unstable:
+            # No stable build for this version. Take a prerelease rather than
+            # drop the mod, and remember that it was one.
+            try:
+                file = resolve_version(
+                    project_id,
+                    game_version,
+                    loader=loader,
+                    allow_unstable=True,
+                    project_type="mod",
+                )
+            except ModError as exc:
+                results.append(
+                    CollectionEntry(project_id=project_id, title=title, error=str(exc))
+                )
+                continue
+
+        if file is None:
+            results.append(
+                CollectionEntry(
+                    project_id=project_id,
+                    title=title,
+                    error=f"no build for Minecraft {game_version}",
+                )
+            )
+            continue
+
+        try:
+            path = download_file(file, directory)
+        except ModError as exc:
+            results.append(
+                CollectionEntry(project_id=project_id, title=title, error=str(exc))
+            )
+            continue
+
+        results.append(
+            CollectionEntry(
+                project_id=project_id,
+                title=title,
+                path=path,
+                filename=file.filename,
+                version_number=file.version_number,
+                stable=file.is_stable,
+            )
+        )
+
+    if on_progress:
+        on_progress(Progress(f"Installed {found.name}", total, total))
+
+    return results
+
+
+def find_conflicts(entries: Sequence[CollectionEntry], directory: Path | str) -> list[str]:
+    """Warnings about mods that cannot be loaded together.
+
+    Only one pair is worth checking here, and it is the one this launcher can
+    walk someone into by itself: the Fabric button installs Sodium, and this
+    collection installs VulkanMod. Both replace the renderer. VulkanMod's own
+    documentation lists Sodium as incompatible and says it "will never be
+    supported", so having both in mods/ means the game will not start properly.
+
+    Returns sentences to show the person. Nothing is deleted -- which jar to
+    keep is their call, not ours.
+    """
+    installed_vulkan = any(
+        entry.installed and "vulkanmod" in entry.filename.lower() for entry in entries
+    )
+    if not installed_vulkan:
+        return []
+
+    mods_directory = Path(directory).expanduser() / SUBDIRECTORY["mod"]
+    try:
+        sodium_jars = [
+            path.name
+            for path in mods_directory.glob("*.jar")
+            if path.name.lower().startswith("sodium")
+        ]
+    except OSError:
+        return []
+
+    if not sodium_jars:
+        return []
+
+    return [
+        "VulkanMod and Sodium are both installed and cannot run together -- "
+        "VulkanMod replaces the renderer and lists Sodium as incompatible. "
+        f"Remove {', '.join(sodium_jars)} from mods/, or remove VulkanMod."
+    ]

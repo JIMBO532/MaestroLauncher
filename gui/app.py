@@ -1,16 +1,17 @@
 """MaestroLauncher's CustomTkinter shell.
 
-M6 slices 1 to 5 plus the M7 About screen: a Play tab that installs a version or
-adds Fabric with Sodium, a Mods tab that searches Modrinth, installs what you
-pick, and imports files you already have on disk, and an About tab carrying the
-name, version and trademark notice. Every job runs through the same worker with
-live progress and the inputs locked. Launching and login are still not connected.
+All of M6 plus the M7 About screen: an account panel that signs in with Microsoft,
+a Play tab that installs a version -- or adds Fabric with Sodium -- and launches
+it, a Mods tab that searches Modrinth, installs what you pick, and imports files
+you already have on disk, and an About tab carrying the name, version and
+trademark notice. Every job runs through the same worker with live progress and
+the inputs locked, so the whole flow works without touching a terminal.
 
-Every long operation this launcher will do -- downloading a version, installing
+Every long operation this launcher does -- downloading a version, installing
 Fabric, fetching mods, logging in -- takes seconds to minutes, and Tk gives us
 exactly one thread to draw on, so anything slow running on it freezes the window.
-:class:`BackgroundWorker` is how that is avoided: the version fetch and the
-install both go through it, and launching will too.
+:class:`BackgroundWorker` is how that is avoided: the version fetch, the install,
+the login and the launch all go through it.
 
 Imports point one way only: ``gui`` may import ``core``, never the reverse.
 """
@@ -18,6 +19,7 @@ Imports point one way only: ``gui`` may import ``core``, never the reverse.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import tkinter
 import traceback
@@ -33,7 +35,8 @@ except Exception:  # noqa: BLE001 -- a missing or broken tkdnd must not stop the
     DND_FILES = None
     TkinterDnD = None
 
-from core import __version__, imports, installer, mods
+from core import __version__, auth, imports, installer, launch, mods
+from core.auth import Account, AuthError, LoginCancelled
 from core.installer import InstallError, Progress
 from core.mods import ModError, SearchResult
 
@@ -57,7 +60,19 @@ POLL_INTERVAL_MS = 50
 # through set_button_enabled() instead.
 DISABLED_FILL = ("gray72", "gray30")
 
-READY_HINT = "Pick a version, then install it, add Fabric, or browse mods."
+READY_HINT = "Pick a version, then press Play."
+
+# Where the Azure client ID lives when it is not in the environment. Beside the
+# project when running from source, and beside the exe once PyInstaller has
+# bundled it -- sys.frozen moves __file__ into the bundle, so the executable's
+# own folder is checked too.
+def _env_file_candidates() -> list[Path]:
+    here = Path(__file__).resolve().parent.parent
+    beside_exe = Path(sys.executable).resolve().parent
+    return [here / ".env", beside_exe / ".env"]
+
+
+SIGNED_OUT = "Not signed in"
 
 # The launcher is Fabric-only for now, so mod searches and downloads are
 # filtered to it. core.mods drops the filter by itself for the types that
@@ -161,6 +176,19 @@ class BackgroundWorker:
 
         return bridge
 
+    def status_bridge(self, on_status: Callable[[str], None]) -> Callable[[str], None]:
+        """Wrap a plain status callback so a worker thread can call it safely.
+
+        ``core.auth`` reports its progress as sentences rather than as
+        :class:`Progress` values, and it fires few enough of them that there is
+        nothing to coalesce -- each one is a distinct step worth showing.
+        """
+
+        def bridge(text: str) -> None:
+            self._post(lambda message=text: on_status(message))
+
+        return bridge
+
     def stop(self) -> None:
         """Stop draining. Called when the window is closing."""
         self._stopped = True
@@ -252,10 +280,17 @@ class MaestroApp(*_ROOT_BASES):
         self.results: list[SearchResult] = []
         self._result_rows: list[ctk.CTkRadioButton] = []
 
+        # The signed-in account, and the game we most recently started. The game
+        # is held so closing the launcher can leave it alone deliberately rather
+        # than by accident.
+        self.account: Optional[Account] = None
+        self.game: Optional[launch.RunningGame] = None
+
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.load_versions()
+        self.restore_account()
 
     # -- layout ---------------------------------------------------------------
 
@@ -272,8 +307,37 @@ class MaestroApp(*_ROOT_BASES):
         )
         subtitle.grid(row=1, column=0, padx=24, pady=(0, 18), sticky="w")
 
+        # -- account panel, top right --
+        #
+        # Signing in is the one job that cannot be hurried along: it opens a
+        # browser and waits for a person. It goes through the worker like
+        # everything else, so the window keeps drawing while it waits.
+        account_panel = ctk.CTkFrame(self, fg_color="transparent")
+        account_panel.grid(row=0, column=1, rowspan=2, padx=(0, 24), pady=(24, 18), sticky="ne")
+
+        self.account_label = ctk.CTkLabel(
+            account_panel, text=SIGNED_OUT, anchor="e",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        )
+        self.account_label.grid(row=0, column=0, sticky="e")
+
+        account_buttons = ctk.CTkFrame(account_panel, fg_color="transparent")
+        account_buttons.grid(row=1, column=0, pady=(6, 0), sticky="e")
+
+        self.signin_button = ctk.CTkButton(
+            account_buttons, text="Sign in", width=90, height=28,
+            command=self.start_login,
+        )
+        self.signin_button.grid(row=0, column=0)
+
+        self.signout_button = ctk.CTkButton(
+            account_buttons, text="Sign out", width=90, height=28,
+            command=self.sign_out,
+        )
+        self.signout_button.grid(row=0, column=1, padx=(8, 0))
+
         self.tabs = ctk.CTkTabview(self, anchor="w")
-        self.tabs.grid(row=2, column=0, padx=24, pady=0, sticky="nsew")
+        self.tabs.grid(row=2, column=0, columnspan=2, padx=24, pady=0, sticky="nsew")
         self.grid_rowconfigure(2, weight=1)
         play_tab = self.tabs.add("Play")
         mods_tab = self.tabs.add("Content")
@@ -306,7 +370,7 @@ class MaestroApp(*_ROOT_BASES):
         self.browse_button.grid(row=0, column=1, padx=(8, 0))
 
         self.play_button = ctk.CTkButton(
-            play_tab, text="Play", height=42, command=self.start_install
+            play_tab, text="Play", height=42, command=self.start_play
         )
         self.play_button.grid(row=2, column=0, columnspan=2, padx=4, pady=(22, 6), sticky="ew")
 
@@ -422,7 +486,7 @@ class MaestroApp(*_ROOT_BASES):
 
         # -- shared footer: one progress bar and one status line for every job --
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=3, column=0, padx=24, pady=(10, 18), sticky="ew")
+        footer.grid(row=3, column=0, columnspan=2, padx=24, pady=(10, 18), sticky="ew")
         footer.grid_columnconfigure(0, weight=1)
 
         self.progress = ctk.CTkProgressBar(footer)
@@ -442,6 +506,7 @@ class MaestroApp(*_ROOT_BASES):
             for button in (
                 self.browse_button, self.play_button, self.fabric_button,
                 self.search_button, self.install_mod_button, self.add_files_button,
+                self.signin_button, self.signout_button,
             )
         }
         self._set_busy(False)
@@ -537,40 +602,211 @@ class MaestroApp(*_ROOT_BASES):
         # Importing needs a folder, not a version, so it does not wait on the
         # Mojang fetch the way the other buttons do.
         self.set_button_enabled(self.add_files_button, not busy)
+
+        # Signing in needs neither a version nor anything downloaded, so it is
+        # available as soon as nothing else is running. Play stays enabled while
+        # signed out on purpose: a button that quietly does nothing teaches
+        # nothing, whereas pressing it says what is missing.
+        self.set_button_enabled(self.signin_button, not busy and self.account is None)
+        self.set_button_enabled(self.signout_button, not busy and self.account is not None)
         for row in self._result_rows:
             row.configure(state="disabled" if busy else "normal")
 
-    def start_install(self) -> None:
-        """Install the selected version, off the UI thread, with live progress."""
+    # -- account --------------------------------------------------------------
+
+    def _client_id(self) -> Optional[str]:
+        """The Azure client ID, from the environment or a .env beside us."""
+        for candidate in _env_file_candidates():
+            client_id = auth.load_client_id(candidate)
+            if client_id:
+                return client_id
+        return None
+
+    def _render_account(self) -> None:
+        """Put the account panel in step with what we are actually signed in as."""
+        if self.account is not None:
+            self.account_label.configure(text=self.account.username or "Signed in")
+        else:
+            self.account_label.configure(text=SIGNED_OUT)
+        self._set_busy(self.busy)
+
+    def restore_account(self) -> None:
+        """Bring back a saved login on startup, without opening a browser.
+
+        This deliberately calls ``refresh`` rather than ``login_or_refresh``: the
+        latter falls through to an interactive login when the saved token is
+        dead, and a browser opening by itself because the launcher started is not
+        something anyone asked for. A token that will not renew just leaves the
+        panel signed out, and the Sign in button is right there.
+        """
+        saved = auth.load_account(self.directory_var.get().strip() or ".")
+        if saved is None or not saved.refresh_token:
+            return
+
+        client_id = self._client_id()
+        if client_id is None:
+            # Show who was signed in, but there is no way to renew the session.
+            self.account_label.configure(text=f"{saved.username} (signed out)")
+            return
+
+        self.account_label.configure(text=f"{saved.username} (restoring...)")
+        directory = self.directory_var.get().strip()
+
+        def work() -> Account:
+            account = auth.refresh(client_id, saved.refresh_token)
+            auth.save_account(account, directory)
+            return account
+
+        self.worker.submit(
+            work,
+            on_success=self._restore_finished,
+            on_error=self._restore_failed,
+        )
+
+    def _restore_finished(self, account: Account) -> None:
+        self.account = account
+        self._render_account()
+        self.set_status(f"Signed in as {account.username}. {READY_HINT}")
+
+    def _restore_failed(self, error: BaseException) -> None:
+        # A saved login that will not renew is not an error worth shouting about;
+        # it is the normal end of a token's life. Say so once and move on.
+        self.account = None
+        self._render_account()
+        self.set_status("Your saved login expired. Sign in again to play.")
+
+    def start_login(self) -> None:
+        """Sign in with Microsoft, off the UI thread, browser and all."""
+        if self.busy:
+            return
+
+        client_id = self._client_id()
+        if client_id is None:
+            self.set_status(
+                "No Azure client ID. Put MAESTRO_CLIENT_ID=<the id> in a .env "
+                "file beside the launcher. See PLAN.md M0."
+            )
+            return
+
+        directory = self.directory_var.get().strip()
+        if not directory:
+            self.set_status("Choose a game folder first; the login is saved inside it.")
+            return
+
+        self._set_busy(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start()
+        self.set_status("Opening your browser to sign in with Microsoft...")
+
+        report = self.worker.status_bridge(self.set_status)
+        self.worker.submit(
+            lambda: auth.login_or_refresh(client_id, directory, on_status=report),
+            on_success=self._login_finished,
+            on_error=self._login_failed,
+        )
+
+    def _login_finished(self, account: Account) -> None:
+        self.clear_progress()
+        self.account = account
+        # Unlock before rendering: _render_account re-applies the current busy
+        # state to every button, so leaving it set here would lock the window
+        # for good on the one path where the login actually worked.
+        self._set_busy(False)
+        self._render_account()
+        self.set_status(f"Signed in as {account.username}. {READY_HINT}")
+
+    def _login_failed(self, error: BaseException) -> None:
+        self.clear_progress()
+        self.account = None
+        self._set_busy(False)
+        self._render_account()
+        if isinstance(error, LoginCancelled):
+            self.set_status("Sign in was cancelled.")
+        elif isinstance(error, AuthError):
+            self.set_status(f"Sign in failed: {error}")
+        else:
+            self.set_status(f"Sign in failed unexpectedly: {error}")
+
+    def sign_out(self) -> None:
+        """Forget the saved login. The game keeps running if one is up."""
+        if self.busy:
+            return
+        try:
+            auth.clear_account(self.directory_var.get().strip() or ".")
+        except AuthError as exc:
+            self.set_status(f"Could not remove the saved login: {exc}")
+            return
+        self.account = None
+        self._render_account()
+        self.set_status("Signed out.")
+
+    # -- playing --------------------------------------------------------------
+
+    def start_play(self) -> None:
+        """Install the selected version if it is missing, then launch it.
+
+        One button for the whole thing: the person who just picked a version
+        wants to play it, and whether the files happen to be on disk already is
+        not a decision worth making them take.
+        """
         if self.busy:
             return
 
         version = self.version_menu.get()
         directory = self.directory_var.get().strip()
 
-        if version not in self.versions:
-            self.set_status("Pick a version first.")
-            return
         if not directory:
             self.set_status("Choose a game folder first.")
             return
+        # A Fabric profile is installed but is not one of Mojang's releases, so
+        # accept anything already on disk as well as anything in the menu.
+        if version not in self.versions and not installer.is_installed(version, directory):
+            self.set_status("Pick a version first.")
+            return
+        if self.account is None or not self.account.access_token:
+            self.set_status("Sign in first -- Minecraft will not start without an account.")
+            return
 
+        account = self.account
         self._set_busy(True)
         self.progress.set(0)
-        self.set_status(f"Installing Minecraft {version}...")
 
-        # The one call this whole pattern was built for.
         report = self.worker.progress_bridge(self.show_progress)
+        status = self.worker.status_bridge(self.set_status)
+
+        def work() -> launch.RunningGame:
+            if not installer.is_installed(version, directory):
+                status(f"Installing Minecraft {version}...")
+                installer.install_version(version, directory, on_progress=report)
+            status(f"Starting Minecraft {version}...")
+            return launch.launch(
+                version,
+                directory,
+                account.username,
+                account.uuid,
+                account.access_token,
+            )
+
         self.worker.submit(
-            lambda: installer.install_version(version, directory, on_progress=report),
-            on_success=lambda path: self._install_finished(version, path),
-            on_error=self._install_failed,
+            work,
+            on_success=lambda game: self._play_started(version, game),
+            on_error=self._play_failed,
         )
 
-    def _install_finished(self, version: str, path: Path) -> None:
+    def _play_started(self, version: str, game: launch.RunningGame) -> None:
         self.clear_progress()
         self._set_busy(False)
-        self.set_status(f"Minecraft {version} is installed in {path}. Launching comes later.")
+        self.game = game
+        self.set_status(
+            f"Minecraft {version} is running (pid {game.pid}). Log: {game.log_path}"
+        )
+
+    def _play_failed(self, error: BaseException) -> None:
+        self.clear_progress()
+        self._set_busy(False)
+        # InstallError and LaunchError already read as sentences; anything else
+        # is a surprise and gets shown as-is rather than swallowed.
+        self.set_status(f"Could not start the game: {error}")
 
     def start_fabric(self) -> None:
         """Install Fabric plus Sodium for the selected version, off the UI thread."""
@@ -602,8 +838,17 @@ class MaestroApp(*_ROOT_BASES):
 
     def _fabric_finished(self, profile_id: str) -> None:
         self.clear_progress()
+
+        # The profile is not one of Mojang's releases, so it is not in the list
+        # the menu was filled from. Without adding it here the button that just
+        # built it would leave nothing able to launch it.
+        if profile_id not in self.versions:
+            self.versions.append(profile_id)
+            self.version_menu.configure(values=self.versions)
+        self.version_menu.set(profile_id)
+
         self._set_busy(False)
-        self.set_status(f"Ready: {profile_id}, with Sodium in mods/.")
+        self.set_status(f"Ready: {profile_id}, with Sodium in mods/. Press Play.")
 
     def _fabric_failed(self, error: BaseException) -> None:
         self.clear_progress()
@@ -845,12 +1090,6 @@ class MaestroApp(*_ROOT_BASES):
         self.clear_progress()
         self._set_busy(False)
         self.set_status(f"Import failed: {error}")
-
-    def _install_failed(self, error: BaseException) -> None:
-        self.clear_progress()
-        self._set_busy(False)
-        detail = str(error) if isinstance(error, InstallError) else f"{error}"
-        self.set_status(f"Install failed: {detail}")
 
     def _on_close(self) -> None:
         self.worker.stop()

@@ -35,9 +35,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import customtkinter as ctk  # noqa: E402
 
+from core import auth  # noqa: E402
+from core.auth import AuthError  # noqa: E402
 from core.installer import InstallError, Progress  # noqa: E402
 from core.mods import ModError  # noqa: E402
-from gui.app import BackgroundWorker, MaestroApp  # noqa: E402
+from gui.app import SIGNED_OUT, BackgroundWorker, MaestroApp  # noqa: E402
+
+# The install the other scripts use, so a login saved by test_login.py is found.
+TARGET = Path(__file__).resolve().parent.parent / "test_mc"
 
 _passed = 0
 _failed = 0
@@ -209,7 +214,8 @@ def test_app_recovers() -> None:
     locked_states = []
 
     for label, handler, error in (
-        ("an install", app._install_failed, InstallError("disk full")),
+        ("a launch", app._play_failed, InstallError("disk full")),
+        ("a sign in", app._login_failed, AuthError("Microsoft refused the login")),
         ("a Fabric install", app._fabric_failed, InstallError("fabric installer exited 1")),
         ("a mod install", app._mod_install_failed, ModError("no version for 1.21.1")),
         ("a search", app._search_failed, ModError("modrinth returned 503")),
@@ -329,14 +335,103 @@ def test_version_is_single_sourced() -> None:
     )
 
 
+def test_real_flow(version: str) -> None:
+    """Drive the real window: restore a login, press Play, watch the game start.
+
+    This is M6's actual acceptance -- "the whole flow works with zero terminal
+    use" -- so it goes through the widgets and their handlers rather than calling
+    core directly. It needs a signed-in account saved in test_mc/ and a working
+    graphics stack, which is why it is behind --real.
+    """
+    print("\nThe real flow, through the window\n")
+
+    app = MaestroApp()
+    app.withdraw()          # driven programmatically; never shown
+    app.update()
+
+    try:
+        # Point the app at the test install rather than %APPDATA%/.minecraft.
+        app.directory_var.set(str(TARGET))
+
+        # 1. The account panel restores a saved login without a browser.
+        app.restore_account()
+        restored = pump(app, lambda: app.account is not None, timeout=60)
+        check("the saved login is restored on startup", restored,
+              app.account_label.cget("text"))
+        if not restored:
+            print("\n  No saved login in test_mc/. Run scripts/test_login.py first.")
+            app.destroy()
+            return
+
+        check("the account panel shows the username",
+              app.account.username in app.account_label.cget("text"),
+              app.account_label.cget("text"))
+        check("Sign out is offered once signed in",
+              app.signout_button.cget("state") == "normal",
+              app.signout_button.cget("state"))
+
+        # 2. Pick the version the way a person would.
+        pump(app, lambda: bool(app.versions), timeout=30)
+        if version not in app.versions:
+            app.versions.append(version)
+            app.version_menu.configure(values=app.versions)
+        app.version_menu.set(version)
+        app._set_busy(False)
+
+        # 3. Press Play. Installing is part of it when the files are missing.
+        app.start_play()
+        check("pressing Play locks the window", app.busy, f"busy={app.busy}")
+
+        started = pump(app, lambda: not app.busy, timeout=600)
+        status = app.status_label.cget("text")
+        check("Play finishes and unlocks the window", started, f"busy={app.busy}")
+        check("a game process was started", app.game is not None, status)
+        check("the status line says it is running",
+              "running" in status.lower(), status)
+
+        if app.game is not None:
+            check("the game is still alive", app.game.is_running(), status)
+            check("the access token is not in the status line",
+                  app.account.access_token not in status)
+            app.game.terminate()
+
+        # 4. Signing out clears the panel without touching the running game.
+        #
+        # This really does delete the saved token, and that token is what lets
+        # every other run here skip the browser, so it is put back afterwards.
+        # Testing sign-out must not cost the person their login.
+        token_file = auth.account_path(TARGET)
+        saved_bytes = token_file.read_bytes() if token_file.exists() else None
+
+        app.sign_out()
+        check("signing out empties the account panel",
+              app.account is None and app.account_label.cget("text") == SIGNED_OUT,
+              app.account_label.cget("text"))
+        check("Sign in is offered again after signing out",
+              app.signin_button.cget("state") == "normal",
+              app.signin_button.cget("state"))
+
+        if saved_bytes is not None:
+            token_file.write_bytes(saved_bytes)
+            check("the saved login is put back after the sign-out check",
+                  auth.load_account(TARGET) is not None)
+    finally:
+        app.destroy()
+
+
 def main() -> int:
     print("MaestroLauncher GUI worker test")
     print("  the window is withdrawn; nothing is shown, focused or clicked\n")
+
+    argv = [a for a in sys.argv[1:] if a != "--real"]
+    version = argv[0] if argv else "1.21.1"
 
     try:
         test_worker()
         test_app_recovers()
         test_version_is_single_sourced()
+        if "--real" in sys.argv:
+            test_real_flow(version)
     except Exception as exc:  # noqa: BLE001
         print(f"\nFAILED: the test itself blew up: {type(exc).__name__}: {exc}")
         raise

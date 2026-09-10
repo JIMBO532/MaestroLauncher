@@ -75,7 +75,7 @@ and it launches.
 
 **Done when:** the whole flow above works with zero terminal use.
 
-- [ ] CustomTkinter shell: account, version picker, play button, progress bar
+- [x] CustomTkinter shell: account, version picker, play button, progress bar
 - [x] All long work off the UI thread
 - [x] Mod browser tab
 - [x] Slice 5: import local files -- drop a jar or pack zip in and it lands in the

@@ -444,25 +444,16 @@ class MaestroApp(*_ROOT_BASES):
         )
         self.version_menu.grid(row=0, column=1, padx=(0, 4), pady=(12, 8), sticky="w")
 
-        ctk.CTkLabel(play_tab, text="Game folder").grid(
-            row=1, column=0, padx=(4, 12), pady=8, sticky="w"
-        )
-        directory_row = ctk.CTkFrame(play_tab, fg_color="transparent")
-        directory_row.grid(row=1, column=1, padx=(0, 4), pady=8, sticky="ew")
-        directory_row.grid_columnconfigure(0, weight=1)
-
+        # The game folder lives on the About tab. It is picked once, defaults
+        # correctly for everyone on Windows, and every other control here reads
+        # it rather than changing it -- so it does not earn a row on the screen
+        # someone looks at every time they play.
         self.directory_var = ctk.StringVar(value=str(installer.default_directory()))
-        self.directory_entry = ctk.CTkEntry(directory_row, textvariable=self.directory_var)
-        self.directory_entry.grid(row=0, column=0, sticky="ew")
-        self.browse_button = ctk.CTkButton(
-            directory_row, text="Browse", width=80, command=self.choose_directory
-        )
-        self.browse_button.grid(row=0, column=1, padx=(8, 0))
 
         self.play_button = ctk.CTkButton(
             play_tab, text="Play", height=42, command=self.start_play
         )
-        self.play_button.grid(row=2, column=0, columnspan=2, padx=4, pady=(22, 6), sticky="ew")
+        self.play_button.grid(row=1, column=0, columnspan=2, padx=4, pady=(22, 6), sticky="ew")
 
         # One button, not two. Installing Fabric and installing the optimization
         # mods were always the same errand, and doing them separately is how a
@@ -471,7 +462,7 @@ class MaestroApp(*_ROOT_BASES):
             play_tab, text="Install optimizations", height=36,
             command=self.start_optimization_pack,
         )
-        self.optimize_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
+        self.optimize_button.grid(row=2, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
 
         # -- Content tab --
         mods_tab.grid_columnconfigure(0, weight=1)
@@ -554,11 +545,33 @@ class MaestroApp(*_ROOT_BASES):
             text_color=("gray40", "gray65"),
         ).grid(row=1, column=0, padx=8, pady=(0, 18), sticky="ew")
 
+        ctk.CTkLabel(
+            about_tab, text="Game folder", anchor="w",
+        ).grid(row=2, column=0, padx=8, pady=(0, 4), sticky="ew")
+
+        directory_row = ctk.CTkFrame(about_tab, fg_color="transparent")
+        directory_row.grid(row=3, column=0, padx=8, pady=(0, 4), sticky="ew")
+        directory_row.grid_columnconfigure(0, weight=1)
+
+        self.directory_entry = ctk.CTkEntry(directory_row, textvariable=self.directory_var)
+        self.directory_entry.grid(row=0, column=0, sticky="ew")
+        self.browse_button = ctk.CTkButton(
+            directory_row, text="Browse", width=80, command=self.choose_directory
+        )
+        self.browse_button.grid(row=0, column=1, padx=(8, 0))
+
+        ctk.CTkLabel(
+            about_tab,
+            text="Where versions, mods and the saved login are kept.",
+            anchor="w", text_color=("gray45", "gray60"),
+            font=ctk.CTkFont(size=11),
+        ).grid(row=4, column=0, padx=8, pady=(0, 18), sticky="ew")
+
         self.about_notice = ctk.CTkLabel(
             about_tab, text=DISCLAIMER, justify="left", anchor="w",
             wraplength=520, text_color=("gray35", "gray70"),
         )
-        self.about_notice.grid(row=2, column=0, padx=8, pady=(0, 18), sticky="ew")
+        self.about_notice.grid(row=5, column=0, padx=8, pady=(0, 18), sticky="ew")
 
         ctk.CTkLabel(
             about_tab,
@@ -567,7 +580,7 @@ class MaestroApp(*_ROOT_BASES):
                 "Mojang; mods and packs come from Modrinth."
             ),
             justify="left", anchor="w", text_color=("gray50", "gray55"),
-        ).grid(row=3, column=0, padx=8, pady=(0, 18), sticky="ew")
+        ).grid(row=6, column=0, padx=8, pady=(0, 18), sticky="ew")
 
         # Keep the notice readable when the window is resized, the same way the
         # status line does.

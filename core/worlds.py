@@ -214,3 +214,27 @@ def worlds_needing_upgrade(
         for world in list_worlds(saves_directory)
         if world.data_version < target
     ]
+
+
+def worlds_too_new(
+    saves_directory: Path | str,
+    version_id: str,
+    directory: Path | str,
+) -> list[World]:
+    """Worlds this version cannot open at all, because something newer made them.
+
+    The mirror of :func:`worlds_needing_upgrade`, and the reason it is worth
+    reporting separately: Minecraft refuses to load a world whose format is
+    ahead of the client, and it does so by leaving it out of the world list
+    entirely. Nothing is damaged and nothing is lost, but a missing world reads
+    exactly like a deleted one, so the launcher should say which worlds went
+    quiet and why before the game starts rather than after.
+    """
+    target = client_world_version(version_id, directory)
+    if target is None:
+        return []
+    return [
+        world
+        for world in list_worlds(saves_directory)
+        if world.data_version > target
+    ]

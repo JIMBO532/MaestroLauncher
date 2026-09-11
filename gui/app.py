@@ -996,18 +996,39 @@ class MaestroApp(*_ROOT_BASES):
 
     # -- playing --------------------------------------------------------------
 
-    def confirm_world_upgrade(self, version: str, directory: str) -> bool:
-        """Warn once if this version would upgrade a world, and let it happen anyway.
+    @staticmethod
+    def _world_listing(affected: list[worlds.World]) -> str:
+        """A short bulleted list of worlds, with the version each was made in."""
+        shown = "\n".join(
+            f"  - {world.name}"
+            + (f" (made in {world.version_name})" if world.version_name else "")
+            for world in affected[:8]
+        )
+        if len(affected) > 8:
+            shown += f"\n  ... and {len(affected) - 8} more"
+        return shown
 
-        Worlds are shared across versions now, so launching a newer version
-        reaches worlds that an older one made. Minecraft rewrites a world's
-        format on load and never writes it back, so the world cannot be opened
-        in the older version again. That is worth saying out loud before it
-        happens and is not worth blocking: upgrading is usually exactly what
-        someone wants, and it is their world.
+    def confirm_world_state(self, version: str, directory: str) -> bool:
+        """Warn once about what this version will do to the shared worlds.
 
-        Returns False only if they actively cancel. Once per version per session:
-        the first Play is the useful moment to hear it, the fifth is nagging.
+        Sharing saves across versions means a launch now reaches worlds that a
+        different version made, and the two directions go wrong in opposite
+        ways:
+
+        Older world, newer game -- Minecraft rewrites the world's format on load
+        and never writes it back, so it will not open in the older version
+        again. Permanent, usually wanted, and worth hearing about first.
+
+        Newer world, older game -- Minecraft refuses to load it and simply omits
+        it from the world list. Nothing is damaged, but a world that vanishes
+        from the list looks exactly like a world that was deleted, so the worry
+        it causes is the thing worth heading off. Naming the worlds and the
+        reason turns a scare into a version switch.
+
+        Neither blocks: returns False only if they actively cancel, which is the
+        useful escape when the answer is "then let me pick another version".
+        Once per version per session -- the first Play is the moment this helps,
+        the fifth is nagging.
         """
         if version in self._world_warned:
             return True
@@ -1015,26 +1036,37 @@ class MaestroApp(*_ROOT_BASES):
         base = installer.base_game_version(version, directory)
         saves = installer.shared_data_directory(directory) / "saves"
         try:
-            affected = worlds.worlds_needing_upgrade(saves, base, directory)
+            upgrading = worlds.worlds_needing_upgrade(saves, base, directory)
+            hidden = worlds.worlds_too_new(saves, base, directory)
         except Exception:  # noqa: BLE001 -- a warning must never stop a launch
             return True
 
         self._world_warned.add(version)
-        if not affected:
-            return True
 
-        listing = "\n".join(
-            f"  - {world.name}"
-            + (f" (made in {world.version_name})" if world.version_name else "")
-            for world in affected[:8]
-        )
-        if len(affected) > 8:
-            listing += f"\n  ... and {len(affected) - 8} more"
+        # Hidden worlds first: that is the one that gets mistaken for data loss,
+        # and the one where cancelling and picking a newer version is the fix.
+        if hidden:
+            proceed = messagebox.askokcancel(
+                "Some worlds will not appear",
+                f"{len(hidden)} world(s) were made in a version newer than {base}:\n\n"
+                f"{self._world_listing(hidden)}\n\n"
+                "Minecraft cannot open a world that is newer than the game, so "
+                "these will be missing from the world list.\n\n"
+                "Nothing is deleted or damaged -- they come back as soon as you "
+                "launch the newer version again. Continue?",
+                parent=self,
+                icon=messagebox.WARNING,
+            )
+            if not proceed:
+                return False
+
+        if not upgrading:
+            return True
 
         return messagebox.askokcancel(
             "World format will be upgraded",
-            f"{len(affected)} world(s) were made in an older version than {base}:\n\n"
-            f"{listing}\n\n"
+            f"{len(upgrading)} world(s) were made in an older version than {base}:\n\n"
+            f"{self._world_listing(upgrading)}\n\n"
             "Opening one in this version upgrades its format permanently. It will "
             "not open in the older version afterwards.\n\n"
             "Worlds you do not open are untouched. Continue?",
@@ -1067,7 +1099,7 @@ class MaestroApp(*_ROOT_BASES):
             self.set_status("Sign in first -- Minecraft will not start without an account.")
             return
 
-        if not self.confirm_world_upgrade(version, directory):
+        if not self.confirm_world_state(version, directory):
             return
 
         account = self.account

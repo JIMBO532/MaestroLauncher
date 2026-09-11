@@ -314,6 +314,7 @@ def main() -> int:
         list_worlds,
         read_world,
         worlds_needing_upgrade,
+        worlds_too_new,
     )
 
     print("\nShared data\n")
@@ -444,9 +445,33 @@ def main() -> int:
                 repr(names),
             )
 
+            # The mirror case. A world the game cannot open is left out of the
+            # world list silently, which looks like deletion, so it gets its
+            # own warning rather than being folded into the upgrade one.
+            hidden = {w.folder for w in worlds_too_new(saves, version, TARGET)}
+            check(
+                "a world newer than the version is flagged as unopenable",
+                "New" in hidden,
+                repr(hidden),
+            )
+            check(
+                "an older world is not flagged as unopenable",
+                "Old" not in hidden,
+                repr(hidden),
+            )
+            check(
+                "the two warnings never name the same world",
+                not (names & hidden),
+                repr(names & hidden),
+            )
+
     check(
         "an unknown version flags nothing rather than guessing",
         worlds_needing_upgrade(TARGET, "0.0.1-nope", TARGET) == [],
+    )
+    check(
+        "an unknown version hides nothing rather than guessing",
+        worlds_too_new(TARGET, "0.0.1-nope", TARGET) == [],
     )
 
     # core.launch must not drag in auth.

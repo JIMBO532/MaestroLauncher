@@ -60,7 +60,7 @@ POLL_INTERVAL_MS = 50
 # through set_button_enabled() instead.
 DISABLED_FILL = ("gray72", "gray30")
 
-READY_HINT = "Pick a version, then press Play."
+RESULT_DWELL_MS = 6000
 
 # Where the Azure client ID lives when it is not in the environment. Beside the
 # project when running from source, and beside the exe once PyInstaller has
@@ -372,6 +372,8 @@ class MaestroApp(*_ROOT_BASES):
         # Versions already warned about upgrading a world, so the warning is
         # shown once rather than on every press of Play.
         self._world_warned: set[str] = set()
+        # The pending "clear the result" callback, so a new message cancels it.
+        self._status_clear: Optional[str] = None
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -470,16 +472,6 @@ class MaestroApp(*_ROOT_BASES):
             command=self.start_optimization_pack,
         )
         self.optimize_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
-
-        ctk.CTkLabel(
-            play_tab,
-            text=(
-                "Asks which Minecraft version, installs Fabric and the Optimized\n"
-                "Minecraft mods, then adds a '<version>-optimized' profile to play them with."
-            ),
-            justify="left", anchor="w", text_color=("gray45", "gray60"),
-            font=ctk.CTkFont(size=11),
-        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 12), sticky="ew")
 
         # -- Content tab --
         mods_tab.grid_columnconfigure(0, weight=1)
@@ -596,7 +588,7 @@ class MaestroApp(*_ROOT_BASES):
         self.progress.set(0)
 
         self.status_label = ctk.CTkLabel(
-            footer, text="Starting up...", anchor="w", justify="left",
+            footer, text="", anchor="w", justify="left",
             text_color=("gray35", "gray70"), wraplength=560,
         )
         self.status_label.grid(row=1, column=0, sticky="ew")
@@ -620,7 +612,30 @@ class MaestroApp(*_ROOT_BASES):
     # -- actions --------------------------------------------------------------
 
     def set_status(self, text: str) -> None:
+        """Show text and leave it there.
+
+        For work in flight and for anything that went wrong: a problem stays on
+        screen until the next action replaces it, because a message that erases
+        itself is a message the person may never have read.
+        """
+        if self._status_clear is not None:
+            self.after_cancel(self._status_clear)
+            self._status_clear = None
         self.status_label.configure(text=text)
+
+    def flash_status(self, text: str) -> None:
+        """Show a result, then get out of the way.
+
+        The status line is for work happening now. A finished job is worth a
+        sentence, but leaving that sentence up turns the line into a log of the
+        last thing that happened, which is what made it read as clutter at rest.
+        """
+        self.set_status(text)
+        self._status_clear = self.after(RESULT_DWELL_MS, self._clear_status)
+
+    def _clear_status(self) -> None:
+        self._status_clear = None
+        self.status_label.configure(text="")
 
     def clear_progress(self) -> None:
         """Put the bar back to empty.
@@ -684,18 +699,10 @@ class MaestroApp(*_ROOT_BASES):
         self.version_menu.set(versions[0])
         self._set_busy(False)
 
-        directory = self.directory_var.get().strip()
-        installed = installer.installed_versions(directory) if directory else []
-        if installed:
-            self.set_status(
-                f"{len(installed)} installed, {len(versions)} available. {READY_HINT}"
-            )
-        else:
-            self.set_status(f"{len(versions)} versions available. {READY_HINT}")
-
-        # A shared mods folder holding several versions is the thing that breaks
-        # a launch, so say so before anything is pressed. This overwrites the
-        # line above deliberately: it matters more.
+        # Nothing to report: the version menu is the result. A shared mods
+        # folder holding several versions is the exception, because that is what
+        # stops a launch, and it stays up rather than clearing.
+        self.set_status("")
         self.warn_about_shared_mods()
 
         # And offer anything the selected version had to skip last time.
@@ -809,7 +816,7 @@ class MaestroApp(*_ROOT_BASES):
     def _restore_finished(self, account: Account) -> None:
         self.account = account
         self._render_account()
-        self.set_status(f"Signed in as {account.username}. {READY_HINT}")
+        self.set_status("")
 
     def _restore_failed(self, error: BaseException) -> None:
         # A saved login that will not renew is not an error worth shouting about;
@@ -856,7 +863,7 @@ class MaestroApp(*_ROOT_BASES):
         # for good on the one path where the login actually worked.
         self._set_busy(False)
         self._render_account()
-        self.set_status(f"Signed in as {account.username}. {READY_HINT}")
+        self.flash_status(f"Signed in as {account.username}.")
 
     def _login_failed(self, error: BaseException) -> None:
         self.clear_progress()
@@ -881,7 +888,7 @@ class MaestroApp(*_ROOT_BASES):
             return
         self.account = None
         self._render_account()
-        self.set_status("Signed out.")
+        self.flash_status("Signed out.")
 
     # -- catching up on mods that were skipped --------------------------------
 
@@ -938,7 +945,7 @@ class MaestroApp(*_ROOT_BASES):
             parent=self,
         )
         if not wanted:
-            self.set_status(f"Left {len(available)} newly available mod(s) uninstalled.")
+            self.flash_status(f"Left {len(available)} newly available mod(s) uninstalled.")
             return
 
         self._set_busy(True)
@@ -967,7 +974,8 @@ class MaestroApp(*_ROOT_BASES):
                 "still skipped: "
                 + "; ".join(f"{entry.title} ({entry.error})" for entry in failed)
             )
-        self.set_status(". ".join(parts) + ".")
+        show = self.set_status if failed else self.flash_status
+        show(". ".join(parts) + ".")
 
     def warn_about_shared_mods(self) -> None:
         """Say so when the old shared mods folder holds builds for several versions.
@@ -1149,7 +1157,7 @@ class MaestroApp(*_ROOT_BASES):
         self.clear_progress()
         self._set_busy(False)
         self.game = game
-        self.set_status(
+        self.flash_status(
             f"Minecraft {version} is running (pid {game.pid}). Log: {game.log_path}"
         )
 
@@ -1181,7 +1189,7 @@ class MaestroApp(*_ROOT_BASES):
         choices = [v for v in self.versions if not installer.is_optimized_profile(v)]
         chosen = VersionPrompt(self, choices).ask()
         if chosen is None:
-            self.set_status("Cancelled.")
+            self.flash_status("Cancelled.")
             return
 
         self.begin_optimization(chosen)
@@ -1278,7 +1286,10 @@ class MaestroApp(*_ROOT_BASES):
             parts.append(f"{len(failed)} skipped -- {reasons}")
         parts.extend(conflicts)
 
-        self.set_status(". ".join(parts) + ".")
+        # A clean install can go quiet. One that skipped something, or that has
+        # a conflict to report, is the whole reason the pack tells you anything.
+        show = self.set_status if (failed or conflicts) else self.flash_status
+        show(". ".join(parts) + ".")
 
     def _optimization_failed(self, error: BaseException) -> None:
         self.clear_progress()
@@ -1306,7 +1317,7 @@ class MaestroApp(*_ROOT_BASES):
         )
         self.results_hint.grid()
         self._set_busy(False)
-        self.set_status(f"Now browsing {self.content_type.get().lower()}.")
+        self.set_status("")
 
     def start_search(self) -> None:
         """Search Modrinth for the typed term, off the UI thread."""
@@ -1358,7 +1369,7 @@ class MaestroApp(*_ROOT_BASES):
             self.results_hint.configure(text="Nothing matched that search.")
             self.results_hint.grid()
             self._set_busy(False)
-            self.set_status("No mods matched. Try another term or another version.")
+            self.flash_status("No mods matched. Try another term or another version.")
             return
 
         self.results_hint.grid_remove()
@@ -1372,7 +1383,7 @@ class MaestroApp(*_ROOT_BASES):
             self._result_rows.append(row)
 
         self._set_busy(False)
-        self.set_status(
+        self.flash_status(
             f"{len(results)} {self.content_type.get().lower()} found. "
             "Pick one and install it."
         )
@@ -1426,7 +1437,7 @@ class MaestroApp(*_ROOT_BASES):
         self.clear_progress()
         self._set_busy(False)
         # path.parent.name is whichever folder core.mods routed it to.
-        self.set_status(f"{hit.title} installed: {path.name} in {path.parent.name}/.")
+        self.flash_status(f"{hit.title} installed: {path.name} in {path.parent.name}/.")
 
     def _mod_install_failed(self, error: BaseException) -> None:
         self.clear_progress()
@@ -1523,7 +1534,8 @@ class MaestroApp(*_ROOT_BASES):
     def _import_finished(self, results: list) -> None:
         self.clear_progress()
         self._set_busy(False)
-        self.set_status(imports.describe(results))
+        show = self.set_status if any(r.error for r in results) else self.flash_status
+        show(imports.describe(results))
 
     def _import_failed_batch(self, error: BaseException) -> None:
         self.clear_progress()

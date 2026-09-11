@@ -28,6 +28,7 @@ Exits 0 on success, 1 on failure.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from core.auth import AuthError  # noqa: E402
 from core import installer  # noqa: E402
 from core.installer import InstallError, Progress  # noqa: E402
 from core.mods import ModError  # noqa: E402
+from gui import app as gui_app  # noqa: E402
 from gui.app import SIGNED_OUT, BackgroundWorker, MaestroApp  # noqa: E402
 
 # The install the other scripts use, so a login saved by test_login.py is found.
@@ -485,6 +487,90 @@ def test_installed_versions_are_selectable() -> None:
         app.destroy()
 
 
+def test_status_line() -> None:
+    """The status line talks while work happens and is quiet the rest of the time.
+
+    It used to carry a standing hint about signing in and picking a version,
+    which the account panel and the version menu already say. Anything left on
+    screen at rest reads as something needing attention, so at rest it is empty.
+    """
+    print("\nThe status line\n")
+
+    app = MaestroApp()
+    app.withdraw()
+    app.update()
+
+    def line() -> str:
+        return app.status_label.cget("text")
+
+    # Opening the window starts a real job -- fetching Mojang's version list --
+    # and that job is meant to talk. "At rest" is what comes after it.
+    check("a job in flight announces itself", line().startswith("Fetching"), repr(line()))
+
+    # Opening the window fires two jobs -- the version list and the saved login
+    # -- and either can land mid-assertion and rewrite the line, which is the
+    # whole point of the line. Wait for both to be over before judging it.
+    def startup_over() -> bool:
+        busy = [
+            thread for thread in threading.enumerate()
+            if thread.name == "maestro-worker" and thread.is_alive()
+        ]
+        return not busy and (bool(app.versions) or "Could not load" in line())
+
+    pump(app, startup_over, timeout=45)
+    pump(app, lambda: False, timeout=0.4)   # drain the callbacks they queued
+    # Empty at rest -- unless a startup job has something to report. A saved
+    # login that would not renew is exactly that: the account panel says "not
+    # signed in" but not why, and the why is what stops the person hunting.
+    startup_problem = ("expired", "Could not load", "no versions")
+    if app.versions:
+        quiet = line() == "" or any(word in line() for word in startup_problem)
+        check("the line is empty once the job is done", quiet, repr(line()))
+        if line():
+            print(f"        (a startup job had something to say: {line()!r})")
+
+    # The percentage belongs next to the bar, and comes from the same tick.
+    app.show_progress(Progress(status="Downloading assets", current=45, total=100))
+    check(
+        "progress is reported as a percentage",
+        line() == "Downloading assets (45%)" and abs(app.progress.get() - 0.45) < 1e-6,
+        f"{line()!r} bar={app.progress.get()}",
+    )
+
+    # A finished job gets a sentence, then gets out of the way. Shorten the
+    # dwell rather than waiting out the real one.
+    real_dwell = gui_app.RESULT_DWELL_MS
+    gui_app.RESULT_DWELL_MS = 200
+    try:
+        app.flash_status("3 mods installed.")
+        check("a result is shown when a job finishes", line() == "3 mods installed.")
+        pump(app, lambda: line() == "", timeout=5)
+        check("and clears itself afterwards", line() == "", repr(line()))
+
+        # An error is not a result: it waits to be read.
+        app.set_status("Could not start the game: no such version")
+        pump(app, lambda: False, timeout=1)
+        check("an error stays put", line().startswith("Could not start"), repr(line()))
+        app.set_status("Installing optimizations...")
+        check("the next action replaces it", line() == "Installing optimizations...")
+
+        # The clear is scheduled, so it has to be cancellable: an error raised
+        # while a result was still on screen must not be wiped by that timer.
+        app.flash_status("done")
+        app.set_status("Install failed: network unreachable")
+        pump(app, lambda: False, timeout=1)
+        check(
+            "a pending clear cannot erase a later message",
+            line() == "Install failed: network unreachable",
+            repr(line()),
+        )
+    finally:
+        gui_app.RESULT_DWELL_MS = real_dwell
+
+    app.worker.stop()
+    app.destroy()
+
+
 def main() -> int:
     print("MaestroLauncher GUI worker test")
     print("  the window is withdrawn; nothing is shown, focused or clicked\n")
@@ -495,6 +581,7 @@ def main() -> int:
     try:
         test_worker()
         test_app_recovers()
+        test_status_line()
         test_version_is_single_sourced()
         test_installed_versions_are_selectable()
         if "--real" in sys.argv:

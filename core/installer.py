@@ -307,9 +307,31 @@ def install_fabric_loader(
 OPTIMIZED_SUFFIX = "optimized"
 
 
+# Generated profiles get their own game directory under here, one per profile.
+# Prism and MultiMC call these instances; the idea is the same and so is the
+# reason for it.
+INSTANCES_DIRNAME = "maestro-instances"
+
+
 def optimized_profile_id(minecraft_version: str) -> str:
     """The profile ID :func:`install_optimized_profile` creates for a version."""
     return f"{minecraft_version}-{OPTIMIZED_SUFFIX}"
+
+
+def instance_directory(profile_id: str, directory: Path | str) -> Path:
+    """The private game directory a generated profile runs in.
+
+    ``mods/`` is read from the *game* directory, not from the version, so every
+    profile sharing one ``.minecraft`` also shares one mods folder. Install for
+    two Minecraft versions and both sets of jars sit in it at once; Fabric then
+    finds a build for the wrong version and refuses to start the game. Giving
+    each profile its own directory is what makes "install optimizations for
+    26.2" unable to touch what 1.21.11 is using.
+
+    Versions, libraries and assets stay in the shared directory -- those are
+    keyed by version already and are far too big to duplicate per profile.
+    """
+    return Path(directory).expanduser() / INSTANCES_DIRNAME / profile_id
 
 
 def is_optimized_profile(version_id: str) -> bool:

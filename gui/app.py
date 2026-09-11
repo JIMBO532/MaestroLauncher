@@ -905,12 +905,22 @@ class MaestroApp(*_ROOT_BASES):
                 status(f"Installing Minecraft {version}...")
                 installer.install_version(version, directory, on_progress=report)
             status(f"Starting Minecraft {version}...")
+
+            # A generated profile keeps its mods in its own directory, so it has
+            # to be launched there. Pass the shared directory for anything else,
+            # which is where vanilla and hand-made profiles expect to live.
+            game_directory = None
+            if installer.is_optimized_profile(version):
+                game_directory = installer.instance_directory(version, directory)
+                game_directory.mkdir(parents=True, exist_ok=True)
+
             return launch.launch(
                 version,
                 directory,
                 account.username,
                 account.uuid,
                 account.access_token,
+                game_directory=game_directory,
             )
 
         self.worker.submit(
@@ -981,42 +991,36 @@ class MaestroApp(*_ROOT_BASES):
         report = self.worker.progress_bridge(self.show_progress)
         status = self.worker.status_bridge(self.set_status)
 
-        def work() -> tuple[str, list, list[str], Optional[str]]:
+        def work() -> tuple[str, Path, list, list[str]]:
             status(f"Installing Minecraft {minecraft_version} and Fabric...")
             profile_id = installer.install_optimized_profile(
                 minecraft_version, directory, on_progress=report
             )
 
+            # The mods go in this profile's own directory, not the shared one.
+            # Sharing is what let a 1.21.11 build sit beside a 26.2 build until
+            # Fabric refused to start.
+            instance = installer.instance_directory(profile_id, directory)
+
             status("Installing the optimization pack from Modrinth...")
+            # Sodium goes in as a candidate rather than as a fallback decided
+            # here. install_collection reads what the jars declare and drops
+            # whichever of a mutually exclusive pair came second, so the renderer
+            # ends up as an either/or without this code guessing which won.
             entries = mods.install_collection(
                 mods.OPTIMIZATION_COLLECTION,
                 minecraft_version,
-                directory,
+                instance,
+                extra_projects=("sodium",),
                 on_progress=report,
             )
 
-            # This button replaced a separate "Install Fabric + Sodium", so
-            # Sodium still has to be accounted for. It cannot simply be added:
-            # the pack's VulkanMod replaces the renderer and lists Sodium as
-            # incompatible. So Sodium fills in only when VulkanMod is not
-            # available for this version, which is exactly when the renderer
-            # would otherwise go unoptimized.
-            got_vulkan = any(
-                entry.installed and "vulkanmod" in entry.filename.lower()
-                for entry in entries
+            return (
+                profile_id,
+                instance,
+                entries,
+                mods.ranged_conflict_warnings(instance),
             )
-            sodium: Optional[str] = None
-            if not got_vulkan:
-                status("VulkanMod has no build here; installing Sodium instead...")
-                try:
-                    sodium = mods.install_project(
-                        "sodium", minecraft_version, directory,
-                        loader=mods.MOD_LOADER_DEFAULT, project_type="mod",
-                    ).name
-                except ModError:
-                    sodium = None
-
-            return profile_id, entries, mods.find_conflicts(entries, directory), sodium
 
         self.worker.submit(
             work,
@@ -1025,9 +1029,9 @@ class MaestroApp(*_ROOT_BASES):
         )
 
     def _optimization_finished(
-        self, outcome: tuple[str, list, list[str], Optional[str]]
+        self, outcome: tuple[str, Path, list, list[str]]
     ) -> None:
-        profile_id, entries, conflicts, sodium = outcome
+        profile_id, instance, entries, conflicts = outcome
         self.clear_progress()
 
         # The profile is brand new, so nothing else knows it exists yet. Adding
@@ -1044,19 +1048,18 @@ class MaestroApp(*_ROOT_BASES):
         prerelease = [entry for entry in installed if not entry.stable]
 
         parts = [f"'{profile_id}' is ready -- pick it and press Play"]
-        parts.append(f"{len(installed)} of {len(entries)} pack mods installed")
-        if sodium:
-            parts.append("Sodium added, since VulkanMod has no build for this version")
+        parts.append(f"{len(installed)} mods installed into {instance.name}/mods")
         if prerelease:
             parts.append(
                 f"{len(prerelease)} came from a prerelease "
                 f"({', '.join(entry.title for entry in prerelease)})"
             )
         if failed:
-            parts.append(
-                f"{len(failed)} had no build for this version "
-                f"({', '.join(entry.title for entry in failed)})"
-            )
+            # Naming the reason matters more than the count: "no build for this
+            # version" and "conflicts with something else" are different
+            # problems, and only one of them is worth changing version over.
+            reasons = "; ".join(f"{entry.title} ({entry.error})" for entry in failed)
+            parts.append(f"{len(failed)} skipped -- {reasons}")
         parts.extend(conflicts)
 
         self.set_status(". ".join(parts) + ".")

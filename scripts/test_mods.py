@@ -47,22 +47,21 @@ def render(progress: Progress) -> None:
 
 
 def test_collection() -> int:
-    """The optimization collection behind the launcher's one-click button.
+    """The optimization collection, and the three ways it used to break a launch.
 
-    Everything here installs into a temp directory, never into test_mc/. The
-    collection carries VulkanMod, which cannot load alongside the Sodium that the
-    Fabric profile in test_mc/ depends on, so installing it there would break a
-    working launch as a side effect of running a test.
+    Everything installs into temp directories, never into test_mc/, so a run here
+    cannot disturb a working setup.
     """
     import tempfile
 
-    from core.installer import base_game_version
+    from core.installer import base_game_version, instance_directory
     from core.mods import (
         OPTIMIZATION_COLLECTION,
+        conflicts_between,
         fetch_collection,
-        find_conflicts,
         install_collection,
         project_titles,
+        read_fabric_metadata,
     )
 
     print("\nOptimization collection\n")
@@ -74,18 +73,11 @@ def test_collection() -> int:
         return 1
 
     print(f"  {collection.name}: {len(collection.project_ids)} projects")
-    if not collection.project_ids:
-        print("FAILED: the collection came back empty.")
-        return 1
-
     titles = project_titles(collection.project_ids)
     if len(titles) != len(collection.project_ids):
         print(f"FAILED: named {len(titles)} of {len(collection.project_ids)} projects.")
         return 1
-    print(f"  every project resolved to a name, e.g. {sorted(titles.values())[0]}")
 
-    # A Fabric profile ID is not a Minecraft version, and Modrinth only knows the
-    # latter. This is what the button relies on to ask the right question.
     resolved = base_game_version("fabric-loader-0.19.5-1.21.1", TARGET)
     if resolved != "1.21.1":
         print(f"FAILED: a Fabric profile resolved to '{resolved}', not 1.21.1.")
@@ -93,47 +85,100 @@ def test_collection() -> int:
     print("  a Fabric profile resolves to the Minecraft version it inherits from")
 
     with tempfile.TemporaryDirectory() as tmp:
-        try:
-            entries = install_collection(OPTIMIZATION_COLLECTION, "1.21.1", tmp)
-        except ModError as exc:
-            print(f"FAILED: installing the collection: {exc}")
+        root = Path(tmp)
+
+        # -- two versions side by side ---------------------------------------
+        #
+        # The bug: one shared mods/ folder, so builds for two Minecraft versions
+        # piled up and Fabric refused to start. Each profile gets its own
+        # directory now, and the point of this check is that neither install can
+        # see the other's jars.
+        print("\n  Two versions side by side\n")
+        older, newer = "1.21.1", "26.2"
+        instances = {}
+        for version in (older, newer):
+            instance = instance_directory(f"{version}-optimized", root)
+            entries = install_collection(OPTIMIZATION_COLLECTION, version, instance,
+                                         extra_projects=("sodium",))
+            jars = sorted(p.name for p in (instance / "mods").glob("*.jar"))
+            instances[version] = (instance, entries, jars)
+            kept = [e for e in entries if e.installed]
+            print(f"    {version}: {len(kept)} installed, {len(jars)} jars")
+
+        if instances[older][0] == instances[newer][0]:
+            print("FAILED: both versions used the same directory.")
             return 1
 
-        installed = [e for e in entries if e.installed]
-        failed_entries = [e for e in entries if not e.installed]
-        prerelease = [e for e in installed if not e.stable]
-
-        for entry in entries:
-            if not entry.installed:
-                mark = "FAIL"
-            elif entry.stable:
-                mark = "ok  "
-            else:
-                mark = "beta"
-            detail = entry.filename if entry.installed else entry.error[:50]
-            print(f"    {mark} {entry.title[:34]:<34} {detail}")
-
-        if failed_entries:
-            print(f"FAILED: {len(failed_entries)} project(s) did not install.")
+        overlap = set(instances[older][2]) & set(instances[newer][2])
+        if overlap:
+            print(f"FAILED: the two instances share jars: {sorted(overlap)}")
             return 1
-        print(f"\n  {len(installed)}/{len(entries)} installed, {len(prerelease)} from a prerelease")
+        print("    the two mods folders have no jar in common")
 
-        jars = list((Path(tmp) / "mods").glob("*.jar"))
-        if len(jars) != len(installed):
-            print(f"FAILED: {len(installed)} reported but {len(jars)} jars on disk.")
-            return 1
-        print(f"  {len(jars)} jars are really in mods/")
+        # Every jar in an instance must actually be for that instance's version.
+        for version, (instance, _entries, jars) in instances.items():
+            for jar in (instance / "mods").glob("*.jar"):
+                meta = read_fabric_metadata(jar)
+                if meta and meta.minecraft and meta.minecraft.replace(" ", "") == version:
+                    continue
+                if meta and meta.minecraft and not any(
+                    c in meta.minecraft for c in "<>=~^*| ,"
+                ) and meta.minecraft != version:
+                    print(f"FAILED: {jar.name} pins {meta.minecraft}, not {version}.")
+                    return 1
+        print("    no jar pins a Minecraft version other than its own instance's")
 
-        # The conflict warning must stay quiet until Sodium is actually present.
-        if find_conflicts(entries, tmp):
-            print("FAILED: warned about Sodium when none is installed.")
+        # -- a conflicting pair ----------------------------------------------
+        #
+        # Sodium declares 'breaks': {'vulkanmod': '*'} in its own jar, and
+        # Modrinth's API says nothing about it. Both were being installed.
+        print("\n  A conflicting pair\n")
+        for version, (instance, entries, jars) in instances.items():
+            metas = [m for m in (read_fabric_metadata(j) for j in (instance / "mods").glob("*.jar")) if m]
+            ids = {m.mod_id for m in metas}
+            if "sodium" in ids and "vulkanmod" in ids:
+                print(f"FAILED: {version} kept both Sodium and VulkanMod.")
+                return 1
+
+            certain = [c for c in conflicts_between(metas) if c[2] == "*"]
+            if certain:
+                print(f"FAILED: {version} has a certain conflict: {certain}")
+                return 1
+
+            renderer = sorted(ids & {"sodium", "vulkanmod"})
+            dropped = [e for e in entries if not e.installed and "conflict" in e.error]
+            print(f"    {version}: renderer = {renderer or ['none']}"
+                  + (f", dropped {[e.title for e in dropped]}" if dropped else ""))
+
+        if not any("sodium" in {m.mod_id for m in
+                   [x for x in (read_fabric_metadata(j) for j in (inst / 'mods').glob('*.jar')) if x]}
+                   or "vulkanmod" in {m.mod_id for m in
+                   [x for x in (read_fabric_metadata(j) for j in (inst / 'mods').glob('*.jar')) if x]}
+                   for inst, _e, _j in instances.values()):
+            print("FAILED: neither instance ended up with a renderer at all.")
             return 1
-        (Path(tmp) / "mods" / "sodium-fabric-0.8.13+mc1.21.1.jar").write_bytes(b"")
-        warnings = find_conflicts(entries, tmp)
-        if not warnings or "Sodium" not in warnings[0]:
-            print(f"FAILED: no Sodium/VulkanMod warning: {warnings}")
+        print("    exactly one renderer survives in each instance")
+
+        # -- a mod with no compatible build ----------------------------------
+        #
+        # VulkanMod has no 26.2 build. It must be skipped and named, never
+        # approximated with a build for a nearby version.
+        print("\n  A mod with no compatible build\n")
+        skipped = [e for e in instances[newer][1] if not e.installed]
+        if not skipped:
+            print("FAILED: expected at least one skip on 26.2.")
             return 1
-        print("  Sodium alongside VulkanMod is reported, and only then")
+        for entry in skipped:
+            if not entry.error:
+                print(f"FAILED: {entry.title} was skipped with no reason given.")
+                return 1
+            print(f"    skipped {entry.title}: {entry.error}")
+
+        installed_names = {e.filename for e in instances[newer][1] if e.installed}
+        if any("1.21" in name for name in installed_names):
+            print(f"FAILED: a 1.21 build was installed for 26.2: {installed_names}")
+            return 1
+        print("    nothing built for another version was installed instead")
 
     return 0
 

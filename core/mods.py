@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -521,6 +522,91 @@ def project_titles(project_ids: Sequence[str]) -> dict[str, str]:
     return titles
 
 
+@dataclass(frozen=True)
+class FabricMod:
+    """What a jar says about itself in its own ``fabric.mod.json``.
+
+    This is the file Fabric reads at startup, so it is the only description of a
+    mod that actually decides whether the game will boot. Modrinth's API is a
+    catalogue on top of it and does not always agree: Sodium's jar has declared
+    VulkanMod incompatible for years while Modrinth lists no dependencies for it
+    at all. Anything that must match what the loader will do is read from here.
+    """
+
+    mod_id: str
+    version: str
+    minecraft: str
+    breaks: dict[str, str]
+    filename: str
+
+
+def read_fabric_metadata(jar: Path | str) -> Optional[FabricMod]:
+    """Read a mod jar's own metadata, or None if it has none we understand."""
+    path = Path(jar)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            raw = archive.read("fabric.mod.json").decode("utf-8")
+    except (OSError, KeyError, zipfile.BadZipFile, UnicodeDecodeError):
+        return None
+
+    try:
+        # Some mods ship a fabric.mod.json with trailing commas or comments;
+        # those are not worth a parser, they are worth not crashing over.
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    depends = data.get("depends")
+    depends = depends if isinstance(depends, dict) else {}
+    declared_breaks: dict[str, str] = {}
+    for key in ("breaks", "conflicts"):
+        section = data.get(key)
+        if isinstance(section, dict):
+            for name, constraint in section.items():
+                declared_breaks[str(name)] = str(constraint)
+
+    return FabricMod(
+        mod_id=str(data.get("id", "")),
+        version=str(data.get("version", "")),
+        minecraft=str(depends.get("minecraft", "")),
+        breaks=declared_breaks,
+        filename=path.name,
+    )
+
+
+def _is_exact_version(constraint: str) -> bool:
+    """True when a Fabric dependency string names one version and nothing else.
+
+    Ranges need a real predicate parser and are left to Modrinth's own
+    compatibility tags. A bare literal like ``"1.21.11"`` needs no parser and is
+    the case that actually bites -- VulkanMod pins exactly one game version, so a
+    build for the wrong one is a guaranteed startup failure rather than a risk.
+    """
+    return bool(constraint) and not any(
+        character in constraint for character in "<>=~^*| ,"
+    )
+
+
+def conflicts_between(metadata: Sequence[FabricMod]) -> list[tuple[str, str, str]]:
+    """Find pairs that declare each other incompatible.
+
+    Returns ``(mod_id, blocked_id, constraint)`` for every declared break where
+    the blocked mod is actually present. Only ``"*"`` -- meaning every version --
+    is treated as certain; a version-ranged break is reported by the caller as a
+    possibility rather than acted on, because deciding it needs the version
+    predicate parser this deliberately does not have.
+    """
+    present = {meta.mod_id: meta for meta in metadata if meta.mod_id}
+    found: list[tuple[str, str, str]] = []
+    for meta in metadata:
+        for blocked_id, constraint in meta.breaks.items():
+            if blocked_id in present:
+                found.append((meta.mod_id, blocked_id, constraint))
+    return found
+
+
 def install_collection(
     collection: str,
     game_version: str,
@@ -528,66 +614,58 @@ def install_collection(
     loader: Optional[str] = MOD_LOADER_DEFAULT,
     allow_unstable: bool = True,
     prefer_newest: bool = True,
+    extra_projects: Sequence[str] = (),
     on_progress: Optional[ProgressCallback] = None,
 ) -> list[CollectionEntry]:
-    """Install every project in a collection, and report on each one.
+    """Install a collection into one game directory, and report on every project.
 
-    One project failing does not stop the rest: a collection is a list of
-    independent mods, and getting thirteen of sixteen is worth far more than
-    getting none because the fourteenth had no build for this version. Every
-    outcome, good or bad, comes back in the returned list for the caller to
-    report.
+    Three rules, each learned from a launch that failed:
 
-    ``prefer_newest`` and ``allow_unstable`` are both on by default here, unlike
-    elsewhere in this module. An optimization collection routinely carries mods
-    whose only build for a given version is a beta -- C2ME and VMP both are on
-    1.21.1 -- and a mod tracking a brand-new Minecraft release often has its
-    newest build on beta while the stable one is pinned to an older game
-    version. Preferring stable would silently install something older than what
-    the person asked for, and skipping betas would make "install everything"
-    quietly untrue. Which channel each build came from is recorded per entry so
-    the caller can say so.
+    * **A mod with no build for this exact Minecraft version is skipped, never
+      approximated.** Modrinth's per-version ``game_versions`` decides, not the
+      filename. A jar that additionally pins one exact game version in its own
+      ``fabric.mod.json`` is checked against that too and dropped if it
+      disagrees, because that pin is what Fabric will enforce at startup.
+    * **Mods that declare each other incompatible are never both kept.** The
+      declaration is read from the jars, since Modrinth's dependency list does
+      not carry it -- Sodium has broken VulkanMod for years with nothing on
+      Modrinth to say so.
+    * **``directory`` is expected to be per-version.** Builds for two Minecraft
+      versions in one mods folder make Fabric refuse to start, so callers pass an
+      isolated instance directory rather than a shared ``.minecraft``.
+
+    ``extra_projects`` are installed after the collection and take part in the
+    same checks, which is how an alternative renderer gets offered without
+    risking it landing beside one it conflicts with.
     """
     found = fetch_collection(collection)
-    titles = project_titles(found.project_ids)
+    wanted = list(found.project_ids) + [p for p in extra_projects if p not in found.project_ids]
+    titles = project_titles(wanted)
 
-    total = len(found.project_ids)
+    total = len(wanted)
     results: list[CollectionEntry] = []
+    staged: list[tuple[int, FabricMod]] = []
 
-    for index, project_id in enumerate(found.project_ids):
+    for index, project_id in enumerate(wanted):
         title = titles.get(project_id, project_id)
 
         if on_progress:
             on_progress(Progress(f"Installing {title}", index, total))
 
-        try:
-            file = resolve_version(
-                project_id,
-                game_version,
-                loader=loader,
-                allow_unstable=prefer_newest or False,
-                project_type="mod",
-                prefer_newest=prefer_newest,
-            )
-        except ModError:
-            file = None
-
-        if file is None and allow_unstable:
-            # Nothing on the preferred channel. Take whatever exists rather than
-            # drop the mod, and remember what channel it came from.
+        file = None
+        for unstable in ((False, True) if not prefer_newest else (True,)):
             try:
                 file = resolve_version(
                     project_id,
                     game_version,
                     loader=loader,
-                    allow_unstable=True,
+                    allow_unstable=unstable or allow_unstable,
                     project_type="mod",
+                    prefer_newest=prefer_newest,
                 )
+                break
             except ModError as exc:
-                results.append(
-                    CollectionEntry(project_id=project_id, title=title, error=str(exc))
-                )
-                continue
+                last_error = exc
 
         if file is None:
             results.append(
@@ -607,16 +685,65 @@ def install_collection(
             )
             continue
 
-        results.append(
-            CollectionEntry(
-                project_id=project_id,
-                title=title,
-                path=path,
-                filename=file.filename,
-                version_number=file.version_number,
-                stable=file.is_stable,
-            )
+        entry = CollectionEntry(
+            project_id=project_id,
+            title=title,
+            path=path,
+            filename=file.filename,
+            version_number=file.version_number,
+            stable=file.is_stable,
         )
+
+        # The jar's own pin beats Modrinth's tag when the two disagree, because
+        # the jar's is the one Fabric enforces.
+        meta = read_fabric_metadata(path)
+        if meta and _is_exact_version(meta.minecraft) and meta.minecraft != game_version:
+            _discard(path)
+            results.append(
+                CollectionEntry(
+                    project_id=project_id,
+                    title=title,
+                    error=(
+                        f"built for Minecraft {meta.minecraft}, not {game_version}"
+                    ),
+                )
+            )
+            continue
+
+        results.append(entry)
+        if meta:
+            staged.append((len(results) - 1, meta))
+
+    # Now that everything is on disk, let the mods themselves say what cannot sit
+    # beside what. Whichever of a conflicting pair came later is the one dropped,
+    # so the collection's own order decides and the result is reproducible.
+    kept: dict[str, int] = {}
+    order = {position: rank for rank, (position, _) in enumerate(staged)}
+    metas = [meta for _, meta in staged]
+    for blocker_id, blocked_id, constraint in conflicts_between(metas):
+        if constraint != "*":
+            # A ranged break needs a version predicate parser to settle. Left
+            # alone rather than guessed at; the caller surfaces it as a warning.
+            continue
+        positions = {meta.mod_id: position for position, meta in staged}
+        blocker_pos, blocked_pos = positions.get(blocker_id), positions.get(blocked_id)
+        if blocker_pos is None or blocked_pos is None:
+            continue
+        loser_pos = max(blocker_pos, blocked_pos)
+        winner_pos = min(blocker_pos, blocked_pos)
+        loser = results[loser_pos]
+        if not loser.installed:
+            continue
+        _discard(loser.path)
+        results[loser_pos] = CollectionEntry(
+            project_id=loser.project_id,
+            title=loser.title,
+            error=(
+                f"conflicts with {results[winner_pos].title} -- they are mutually "
+                "exclusive and only one can be installed"
+            ),
+        )
+        staged = [(p, m) for p, m in staged if p != loser_pos]
 
     if on_progress:
         on_progress(Progress(f"Installed {found.name}", total, total))
@@ -624,39 +751,39 @@ def install_collection(
     return results
 
 
-def find_conflicts(entries: Sequence[CollectionEntry], directory: Path | str) -> list[str]:
-    """Warnings about mods that cannot be loaded together.
-
-    Only one pair is worth checking here, and it is the one this launcher can
-    walk someone into by itself: the Fabric button installs Sodium, and this
-    collection installs VulkanMod. Both replace the renderer. VulkanMod's own
-    documentation lists Sodium as incompatible and says it "will never be
-    supported", so having both in mods/ means the game will not start properly.
-
-    Returns sentences to show the person. Nothing is deleted -- which jar to
-    keep is their call, not ours.
-    """
-    installed_vulkan = any(
-        entry.installed and "vulkanmod" in entry.filename.lower() for entry in entries
-    )
-    if not installed_vulkan:
-        return []
-
-    mods_directory = Path(directory).expanduser() / SUBDIRECTORY["mod"]
+def _discard(path: Optional[Path]) -> None:
+    """Remove a jar we decided not to keep. Failing to is not worth raising over."""
+    if path is None:
+        return
     try:
-        sodium_jars = [
-            path.name
-            for path in mods_directory.glob("*.jar")
-            if path.name.lower().startswith("sodium")
-        ]
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def ranged_conflict_warnings(directory: Path | str) -> list[str]:
+    """Possible conflicts in a mods folder that need a version range to settle.
+
+    Separate from the certain ones because these are not acted on. A mod saying
+    it breaks *some* versions of another is common and usually already satisfied;
+    reporting it is useful, silently deleting on a guess is not.
+    """
+    folder = Path(directory).expanduser() / SUBDIRECTORY["mod"]
+    try:
+        jars = sorted(folder.glob("*.jar"))
     except OSError:
         return []
 
-    if not sodium_jars:
-        return []
+    metas = [meta for meta in (read_fabric_metadata(jar) for jar in jars) if meta]
+    by_id = {meta.mod_id: meta for meta in metas}
 
-    return [
-        "VulkanMod and Sodium are both installed and cannot run together -- "
-        "VulkanMod replaces the renderer and lists Sodium as incompatible. "
-        f"Remove {', '.join(sodium_jars)} from mods/, or remove VulkanMod."
-    ]
+    warnings: list[str] = []
+    for blocker, blocked, constraint in conflicts_between(metas):
+        if constraint == "*":
+            continue
+        other = by_id.get(blocked)
+        warnings.append(
+            f"{blocker} declares it breaks {blocked} {constraint}"
+            + (f" (you have {other.version})" if other else "")
+        )
+    return warnings

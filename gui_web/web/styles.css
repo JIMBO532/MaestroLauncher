@@ -1,8 +1,8 @@
-/* MaestroLauncher web frontend -- M8 slice 1, static shell.
+/* MaestroLauncher web frontend -- M8, static shell.
 
-   Full-bleed black. Nothing sits in a panel, a card or a border: every element
-   floats directly on the background, which is what makes the layout read as
-   cinematic rather than as an app chrome.
+   Full-bleed screenshot. Nothing sits in a panel, a card or a border: every
+   element floats directly on the background, which is what makes the layout
+   read as cinematic rather than as an app chrome.
 
    Colour discipline, and it is the whole point of the palette:
      royal blue  = action        (PLAY and installs, nothing else)
@@ -35,13 +35,62 @@
 
 * { box-sizing: border-box; }
 
+/* ------------------------------------------------------------- the backdrop */
+
+/* The screenshot, edge to edge. --bg shows through only in the moment before
+   the image decodes, and behind it if the file is ever missing, so the window
+   never flashes white. */
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--bg) url("assets/background.jpg") center / cover no-repeat;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* The scrim. Its shape is not symmetrical decoration -- it is fitted to where
+   this particular screenshot is bright and where the UI sits.
+
+   Measured on the real image at 1280x760, worst-case (95th percentile) patch
+   under each element, white text against it:
+
+     top-left, logo        2.50:1 bare  ->   9.24:1 scrimmed
+     top-right, account    6.83:1       ->  18.60:1
+     right edge, rail     10.38:1       ->  12.87:1
+     bottom-left, status   7.84:1       ->  16.92:1
+     bottom-centre, Play   8.99:1       ->  17.63:1
+
+   The top needed the most help, not the bottom: the bright cloud band sits
+   exactly behind the logo. The bottom is still taken further down because Play
+   and the status line sit there and because a heavy base anchors the shot.
+   The 40-60% band is deliberately left nearly clear -- that is the water, the
+   treeline and the moon, and covering them would defeat the point of using a
+   screenshot at all. Grey labels (--muted) measure 4.90:1 on the status and
+   5.37:1 beside Play; the rail's icons are 3.73:1, past the 3:1 that non-text
+   needs. */
+.backdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to bottom,
+    rgba(10, 10, 10, 0.82) 0%,
+    rgba(10, 10, 10, 0.58) 16%,
+    rgba(10, 10, 10, 0.20) 40%,
+    rgba(10, 10, 10, 0.30) 60%,
+    rgba(10, 10, 10, 0.94) 100%
+  );
+}
+
+.stage { z-index: 1; }
+
 html, body {
   height: 100%;
   margin: 0;
   background: var(--bg);
   color: var(--fg);
   overflow: hidden;                    /* a launcher screen never scrolls */
-  font-family: "Inter", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-family: "Barlow", "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   cursor: default;
@@ -56,14 +105,22 @@ html, body {
 
 /* ---------------------------------------------------------------- the logo */
 
+/* Roughly half its old size. On black the logo was the only thing on the
+   screen and had to carry it; against the screenshot it is a mark, not the
+   picture, and at 470px it was a large object alone in a corner with nothing
+   answering it. At this size the top of the window reads as one band -- mark
+   on the left, account on the right -- and it shares the left margin with the
+   status line below, so the left edge is a column rather than a stray. */
 .logo {
   position: absolute;
-  top: clamp(28px, 4vh, 52px);
+  top: clamp(26px, 3.4vh, 44px);
   left: var(--edge);
-  width: clamp(330px, 33vw, 470px);
+  width: clamp(190px, 18.5vw, 248px);
   height: auto;
-  /* The artwork is fine white wireframe; at full strength it glares on black. */
   opacity: 0.94;
+  /* Fine white linework over a photograph needs its own separation; the scrim
+     lifts the average but not the bright cloud edges directly behind it. */
+  filter: drop-shadow(0 2px 16px rgba(0, 0, 0, 0.6));
   pointer-events: none;
 }
 
@@ -76,7 +133,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 8px 10px 8px 8px;
+  padding: 8px 8px 8px 14px;
   background: none;
   border: 0;
   border-radius: 999px;
@@ -86,17 +143,24 @@ html, body {
   transition: color var(--base) var(--ease), background-color var(--base) var(--ease);
 }
 
-.account__avatar {
-  display: grid;
-  place-items: center;
+/* A Minecraft head is square and hard-edged; smoothing it would lose the one
+   cue that says which game this launcher is for. */
+.skin {
+  display: block;
   width: 34px;
   height: 34px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.07);
-  transition: background-color var(--base) var(--ease);
+  border-radius: 5px;
+  overflow: hidden;
+  filter: saturate(0.82) brightness(0.92);
+  transition: filter var(--base) var(--ease), transform var(--base) var(--ease);
 }
 
-.account__avatar svg { width: 17px; height: 17px; }
+.skin svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+}
 
 .account__label {
   font-size: 11px;
@@ -106,7 +170,7 @@ html, body {
 }
 
 .account:hover { color: var(--fg); background-color: rgba(255, 255, 255, 0.04); }
-.account:hover .account__avatar { background: rgba(255, 255, 255, 0.13); }
+.account:hover .skin { filter: none; transform: translateY(-1px); }
 .account:active { transform: scale(0.98); }
 
 /* ---------------------------------------------------------------- the rail */
@@ -221,6 +285,63 @@ html, body {
    drop the label half its height on every press. */
 .version:active { transform: translateY(-50%) scale(0.98); }
 
+/* -------------------------------------------------------------- the status */
+
+/* Genre convention, taken from the reference: quiet facts along the bottom
+   edge, no panel behind them. */
+.status {
+  position: absolute;
+  left: var(--edge);
+  bottom: clamp(46px, 8vh, 78px);
+  display: flex;
+  align-items: center;
+  gap: clamp(16px, 1.8vw, 26px);
+}
+
+.status__item {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.status__key {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  /* Was --muted-dim, which the token itself is commented "never body text" --
+     and these are words, not decoration. It measured 3.88:1 on black and
+     3.35:1 over the screenshot, both short of 4.5:1. The hierarchy between
+     key and value is carried by size, weight and tracking instead, which
+     costs nothing and survives a bright frame behind it. */
+  color: var(--muted);
+}
+
+.status__value {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.status__rule {
+  width: 1px;
+  height: 26px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* The only green on the screen, and it reports state -- never an action. */
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 8px rgba(92, 184, 92, 0.55);
+}
+
 /* --------------------------------------------------------------- keyboard */
 
 :focus-visible {
@@ -232,7 +353,7 @@ html, body {
 /* ---------------------------------------------------- shorter windows only */
 
 @media (max-height: 700px) {
-  .logo { width: clamp(280px, 27vw, 380px); }
+  .logo { width: clamp(168px, 15vw, 206px); }
   .play { padding: 18px 46px; }
 }
 

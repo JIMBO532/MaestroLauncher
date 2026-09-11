@@ -3,33 +3,44 @@
 <head>
 <meta charset="utf-8">
 <title>MaestroLauncher</title>
-<!-- Progressive enhancement: Inter if the machine is online, Segoe UI Variable
-     otherwise. The layout is designed to survive the fallback. -->
+<!-- Barlow: squared, technical, real thin weights, and it tracks out well in
+     caps. Progressive enhancement -- Segoe UI Variable carries the layout if
+     the machine is offline. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@200;300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
+<!-- The screenshot is what makes this layout read as a Minecraft launcher; the
+     drawn horizon that stood in for it never did. Decorative, so it is a
+     background rather than an <img> and stays out of the accessibility tree. -->
+<div class="backdrop" aria-hidden="true"></div>
+
 <main class="stage">
 
-  <!-- Top left: the logo is the main visual on the screen. -->
   <img class="logo" src="assets/logo.png" alt="MaestroLauncher" draggable="false">
 
-  <!-- Top right: account placeholder. Not wired to anything in slice 1. -->
+  <!-- Top right: account. The blocky head is the strongest Minecraft cue on the
+       screen that costs no asset -- a generic skin silhouette, not anyone's. -->
   <button class="account" type="button" aria-label="Sign in to your Microsoft account">
-    <span class="account__avatar" aria-hidden="true">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"
-           stroke-linecap="round" stroke-linejoin="round">
-        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path>
-        <circle cx="12" cy="7" r="4"></circle>
+    <span class="account__label">Sign in</span>
+    <span class="skin" aria-hidden="true">
+      <svg viewBox="0 0 8 8" shape-rendering="crispEdges">
+        <rect x="0" y="0" width="8" height="8" fill="#6b4b34"></rect>
+        <rect x="0" y="0" width="8" height="2" fill="#4a3323"></rect>
+        <rect x="1" y="3" width="6" height="4" fill="#b08160"></rect>
+        <rect x="0" y="3" width="1" height="4" fill="#8a6247"></rect>
+        <rect x="7" y="3" width="1" height="4" fill="#8a6247"></rect>
+        <rect x="2" y="4" width="1" height="1" fill="#ffffff"></rect>
+        <rect x="5" y="4" width="1" height="1" fill="#ffffff"></rect>
+        <rect x="2" y="4" width="1" height="1" fill="#3b5a9b"></rect>
+        <rect x="5" y="4" width="1" height="1" fill="#3b5a9b"></rect>
       </svg>
     </span>
-    <span class="account__label">Sign in</span>
   </button>
 
-  <!-- Right edge: secondary destinations, icons only. -->
   <nav class="rail" aria-label="Sections">
     <button class="rail__item" type="button" aria-label="Content" title="Content">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
@@ -60,7 +71,6 @@
     </button>
   </nav>
 
-  <!-- Bottom centre: the one primary action, with the version beside it. -->
   <div class="dock">
     <button class="play" type="button">Play</button>
 
@@ -71,6 +81,23 @@
         <polyline points="6 15 12 9 18 15"></polyline>
       </svg>
     </button>
+  </div>
+
+  <!-- Bottom left: the genre convention from the reference. Green is state and
+       only ever state, so the dot is the one place it appears. Placeholder
+       values in slice 1; nothing behind them yet. -->
+  <div class="status">
+    <div class="status__item">
+      <span class="status__key">Installed</span>
+      <span class="status__value">1.21.1 &middot; Fabric</span>
+    </div>
+    <span class="status__rule" aria-hidden="true"></span>
+    <div class="status__item">
+      <span class="status__key">Mojang</span>
+      <span class="status__value">
+        <span class="dot" aria-hidden="true"></span>Online
+      </span>
+    </div>
   </div>
 
 </main>

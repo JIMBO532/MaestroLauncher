@@ -1,30 +1,32 @@
-/* MaestroLauncher web frontend -- M8 slice 1.
+/* MaestroLauncher web frontend -- M8 static shell.
  *
- * Deliberately almost empty. Nothing here is wired to core/: this slice exists
- * to judge the look, so every button is dead on purpose. The only behaviour is
- * what makes a dead shell honest to look at and usable from a keyboard.
+ * Still nothing wired to core/: every control is dead on purpose. The drawn
+ * voxel horizon that used to live here is gone -- a real screenshot does that
+ * job now, and the drawn one read as an unfinished effect along the bottom
+ * rather than as scenery.
  */
 
 (function () {
   "use strict";
 
-  // A launcher window is not a web page: dragging the logo or rubber-banding
-  // the viewport immediately breaks the illusion of a native app.
+  /* --------------------------------------------------------------- shell -- */
+
+  // A launcher is not a web page: dragging images or opening a context menu
+  // immediately breaks the illusion of a native window.
   document.addEventListener("dragstart", function (event) {
     event.preventDefault();
   });
-
   document.addEventListener("contextmenu", function (event) {
     event.preventDefault();
   });
 
-  // Slice 1 has nothing behind the buttons. Rather than have them look broken,
-  // say so once in the console so it is obvious this is the shell, not a bug.
+  // Nothing behind the controls yet. Say so in the console rather than
+  // letting them look broken.
   var pending = document.querySelectorAll(".play, .version, .account, .rail__item");
   Array.prototype.forEach.call(pending, function (element) {
     element.addEventListener("click", function () {
       console.log(
-        "[slice 1] " +
+        "[not wired] " +
           (element.getAttribute("aria-label") || element.textContent.trim()) +
           " is not wired up yet."
       );

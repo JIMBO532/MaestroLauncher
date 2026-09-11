@@ -9,3 +9,7 @@ dist/
 # the one place a binary lands; *.exe stays as a backstop for a stray build.
 launcher/
 *.exe
+
+# The uncompressed background source. The bundled copy is
+# gui_web/web/assets/background.jpg at 246 KB; this is the 4 MB original.
+gui_web/assets/

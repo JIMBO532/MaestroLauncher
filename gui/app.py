@@ -35,7 +35,7 @@ except Exception:  # noqa: BLE001 -- a missing or broken tkdnd must not stop the
     DND_FILES = None
     TkinterDnD = None
 
-from core import __version__, auth, imports, installer, launch, mods
+from core import __version__, auth, imports, installer, launch, mods, worlds
 from core.auth import Account, AuthError, LoginCancelled
 from core.installer import InstallError, Progress
 from core.mods import ModError, SearchResult
@@ -368,6 +368,10 @@ class MaestroApp(*_ROOT_BASES):
         # Versions already re-checked for newly available mods, so browsing the
         # dropdown does not fire a network round trip per keystroke.
         self._skipped_checked: set[str] = set()
+
+        # Versions already warned about upgrading a world, so the warning is
+        # shown once rather than on every press of Play.
+        self._world_warned: set[str] = set()
 
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -992,6 +996,52 @@ class MaestroApp(*_ROOT_BASES):
 
     # -- playing --------------------------------------------------------------
 
+    def confirm_world_upgrade(self, version: str, directory: str) -> bool:
+        """Warn once if this version would upgrade a world, and let it happen anyway.
+
+        Worlds are shared across versions now, so launching a newer version
+        reaches worlds that an older one made. Minecraft rewrites a world's
+        format on load and never writes it back, so the world cannot be opened
+        in the older version again. That is worth saying out loud before it
+        happens and is not worth blocking: upgrading is usually exactly what
+        someone wants, and it is their world.
+
+        Returns False only if they actively cancel. Once per version per session:
+        the first Play is the useful moment to hear it, the fifth is nagging.
+        """
+        if version in self._world_warned:
+            return True
+
+        base = installer.base_game_version(version, directory)
+        saves = installer.shared_data_directory(directory) / "saves"
+        try:
+            affected = worlds.worlds_needing_upgrade(saves, base, directory)
+        except Exception:  # noqa: BLE001 -- a warning must never stop a launch
+            return True
+
+        self._world_warned.add(version)
+        if not affected:
+            return True
+
+        listing = "\n".join(
+            f"  - {world.name}"
+            + (f" (made in {world.version_name})" if world.version_name else "")
+            for world in affected[:8]
+        )
+        if len(affected) > 8:
+            listing += f"\n  ... and {len(affected) - 8} more"
+
+        return messagebox.askokcancel(
+            "World format will be upgraded",
+            f"{len(affected)} world(s) were made in an older version than {base}:\n\n"
+            f"{listing}\n\n"
+            "Opening one in this version upgrades its format permanently. It will "
+            "not open in the older version afterwards.\n\n"
+            "Worlds you do not open are untouched. Continue?",
+            parent=self,
+            icon=messagebox.WARNING,
+        )
+
     def start_play(self) -> None:
         """Install the selected version if it is missing, then launch it.
 
@@ -1017,6 +1067,9 @@ class MaestroApp(*_ROOT_BASES):
             self.set_status("Sign in first -- Minecraft will not start without an account.")
             return
 
+        if not self.confirm_world_upgrade(version, directory):
+            return
+
         account = self.account
         self._set_busy(True)
         self.progress.set(0)
@@ -1038,6 +1091,12 @@ class MaestroApp(*_ROOT_BASES):
             # 1.21.11 cannot see any of them.
             game_directory = installer.instance_directory(version, directory)
             game_directory.mkdir(parents=True, exist_ok=True)
+
+            # Worlds, settings and packs are shared across versions; only mods
+            # are not. Relinking before every launch is what keeps an instance
+            # made before this existed in step with one made after.
+            for note in installer.link_shared_data(game_directory, directory):
+                status(note)
 
             return launch.launch(
                 version,

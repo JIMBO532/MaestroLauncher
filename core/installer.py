@@ -348,6 +348,163 @@ def shared_mods_directory(directory: Path | str) -> Path:
     return Path(directory).expanduser() / "mods"
 
 
+# Everything under an instance that should NOT be per-version. Worlds are the
+# reason this exists: a world that vanishes because someone changed version is
+# not an acceptable way to lose a build. Settings and packs follow the same
+# logic -- nobody expects their keybinds to reset because they launched 1.21.11.
+#
+# mods/ is deliberately absent and must stay absent. It is the one folder that
+# genuinely is per-version, and sharing it is the bug all of this came from.
+SHARED_DIRNAME = "maestro-shared"
+SHARED_DIRECTORIES = ("saves", "resourcepacks", "shaderpacks", "screenshots")
+SHARED_FILES = ("options.txt",)
+
+
+def shared_data_directory(directory: Path | str) -> Path:
+    """Where the data that every version shares actually lives."""
+    return Path(directory).expanduser() / SHARED_DIRNAME
+
+
+def _is_link_to(path: Path, target: Path) -> bool:
+    """True when path is a link already pointing at target."""
+    if not path.exists() and not path.is_symlink():
+        return False
+    try:
+        return Path(os.path.realpath(path)) == Path(os.path.realpath(target))
+    except OSError:
+        return False
+
+
+def _make_directory_link(link: Path, target: Path) -> None:
+    """Point link at target, by junction on Windows and symlink elsewhere.
+
+    A junction rather than a symlink on Windows because a symlink needs either
+    administrator rights or developer mode, and a junction needs neither. The
+    game cannot tell the difference.
+    """
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _merge_into(source: Path, target: Path) -> list[str]:
+    """Move source's entries into target without overwriting. Returns collisions.
+
+    Used when an instance already has real worlds in it from before sharing.
+    Moving them is the whole point -- leaving them behind would strand exactly
+    the worlds this change exists to protect -- but a name that already exists in
+    the shared folder is never overwritten, because one of the two would be lost
+    and no rule here can say which.
+    """
+    collisions: list[str] = []
+    try:
+        entries = sorted(source.iterdir())
+    except OSError:
+        return collisions
+
+    for entry in entries:
+        destination = target / entry.name
+        if destination.exists():
+            collisions.append(entry.name)
+            continue
+        try:
+            shutil.move(str(entry), str(destination))
+        except OSError:
+            collisions.append(entry.name)
+    return collisions
+
+
+def link_shared_data(instance: Path | str, directory: Path | str) -> list[str]:
+    """Point an instance's shared folders at the one copy everyone uses.
+
+    Returns notes worth showing someone -- what was migrated, what could not be.
+    An empty list means it did what it was asked and there is nothing to say.
+
+    Safe to call before every launch: an instance already linked is left alone,
+    so this is how a newly created instance and a long-standing one end up in the
+    same state.
+    """
+    instance_path = Path(instance).expanduser()
+    shared = shared_data_directory(directory)
+    notes: list[str] = []
+
+    instance_path.mkdir(parents=True, exist_ok=True)
+    shared.mkdir(parents=True, exist_ok=True)
+
+    for name in SHARED_DIRECTORIES:
+        target = shared / name
+        target.mkdir(parents=True, exist_ok=True)
+        link = instance_path / name
+
+        if _is_link_to(link, target):
+            continue
+
+        if link.is_dir() and not os.path.isjunction(str(link)) and not link.is_symlink():
+            # A real folder already here, possibly with worlds in it.
+            collisions = _merge_into(link, target)
+            moved = not collisions
+            try:
+                link.rmdir()
+            except OSError:
+                # Not empty, so something stayed behind. Leave it exactly as it
+                # is rather than deleting anything, and say so.
+                notes.append(
+                    f"{link} still holds {', '.join(collisions) or 'files'} that "
+                    f"could not be merged into {target} (same name already there); "
+                    "it is not shared until you move them yourself"
+                )
+                continue
+            if moved and collisions == []:
+                pass
+        elif link.exists() or link.is_symlink():
+            # A stale link somewhere else, or a file where a folder should be.
+            try:
+                if os.path.isjunction(str(link)) or link.is_symlink():
+                    link.unlink()
+                else:
+                    notes.append(f"{link} is a file, so {name} could not be shared")
+                    continue
+            except OSError as exc:
+                notes.append(f"Could not replace {link}: {exc}")
+                continue
+
+        try:
+            _make_directory_link(link, target)
+        except OSError as exc:
+            notes.append(f"Could not share {name}: {exc}")
+
+    for name in SHARED_FILES:
+        target = shared / name
+        link = instance_path / name
+
+        try:
+            if link.exists() and target.exists() and link.samefile(target):
+                continue
+        except OSError:
+            pass
+
+        try:
+            if link.is_file() and not target.exists():
+                # First instance to be linked donates its settings to everyone.
+                shutil.move(str(link), str(target))
+            elif link.exists():
+                link.unlink()
+
+            if not target.exists():
+                # The game writes this on first run; the link has to exist before
+                # then or the game simply makes its own and shares nothing.
+                target.touch()
+
+            os.link(target, link)
+        except OSError as exc:
+            notes.append(f"Could not share {name}: {exc}")
+
+    return notes
+
+
 def _declared_release(constraint: str) -> str:
     """The Minecraft release a dependency string is about, e.g. "26.2".
 

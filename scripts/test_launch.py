@@ -294,6 +294,161 @@ def main() -> int:
         repr(captured_output[:60]),
     )
 
+    # -- shared data, isolated mods ------------------------------------------
+    #
+    # Worlds must survive a version change. Mods must not follow one. Those pull
+    # in opposite directions, so the instance keeps its own mods folder and links
+    # everything else at one shared copy.
+    import gzip
+    import shutil
+    import struct
+
+    from core.installer import (
+        SHARED_DIRECTORIES,
+        instance_directory,
+        link_shared_data,
+        shared_data_directory,
+    )
+    from core.worlds import (
+        client_world_version,
+        list_worlds,
+        read_world,
+        worlds_needing_upgrade,
+    )
+
+    print("\nShared data\n")
+
+    check("mods is not in the shared list", "mods" not in SHARED_DIRECTORIES)
+    check("saves is", "saves" in SHARED_DIRECTORIES)
+    check("resourcepacks and shaderpacks are",
+          {"resourcepacks", "shaderpacks"} <= set(SHARED_DIRECTORIES))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        first = instance_directory("1.21.1", root)
+        second = instance_directory("26.2", root)
+
+        # The first instance already has a world, from before sharing existed.
+        (first / "saves" / "Survival").mkdir(parents=True)
+        (first / "saves" / "Survival" / "marker").write_text("keep me", encoding="utf-8")
+        (first / "options.txt").write_text("fov:80\n", encoding="utf-8")
+
+        notes = link_shared_data(first, root)
+        check("linking an existing instance reports no problems", not notes, repr(notes))
+
+        shared = shared_data_directory(root)
+        check(
+            "an existing world is migrated, not stranded",
+            (shared / "saves" / "Survival" / "marker").read_text(encoding="utf-8") == "keep me",
+        )
+        check("the instance still sees it", (first / "saves" / "Survival").is_dir())
+        check(
+            "existing settings are migrated",
+            (shared / "options.txt").read_text(encoding="utf-8").strip() == "fov:80",
+        )
+
+        link_shared_data(second, root)
+        check("a second version sees the same world", (second / "saves" / "Survival").is_dir())
+        check(
+            "and the same settings file",
+            (second / "options.txt").samefile(first / "options.txt"),
+        )
+
+        # A world made under one version shows up under the other.
+        (second / "saves" / "MadeInNewer").mkdir()
+        check("a world made in one version appears in the other",
+              (first / "saves" / "MadeInNewer").is_dir())
+
+        # Settings written through one are read through the other.
+        (second / "options.txt").write_text("fov:110\n", encoding="utf-8")
+        check(
+            "settings do not reset between versions",
+            (first / "options.txt").read_text(encoding="utf-8").strip() == "fov:110",
+        )
+
+        # Mods stay apart. This is the whole reason instances exist.
+        (first / "mods").mkdir(exist_ok=True)
+        (second / "mods").mkdir(exist_ok=True)
+        (first / "mods" / "for-1-21-1.jar").write_bytes(b"x")
+        check(
+            "mods do not leak between versions",
+            not (second / "mods" / "for-1-21-1.jar").exists()
+            and [p.name for p in (first / "mods").glob("*.jar")] == ["for-1-21-1.jar"],
+        )
+
+        check("relinking is a no-op", not link_shared_data(first, root))
+
+        # A name that already exists in the shared folder is never overwritten.
+        third = instance_directory("1.21", root)
+        (third / "saves" / "Survival").mkdir(parents=True)
+        (third / "saves" / "Survival" / "different").write_text("mine", encoding="utf-8")
+        collision_notes = link_shared_data(third, root)
+        check("a colliding world is reported, not merged over", bool(collision_notes),
+              repr(collision_notes))
+        check(
+            "and the original shared world is untouched",
+            (shared / "saves" / "Survival" / "marker").read_text(encoding="utf-8") == "keep me",
+        )
+        check(
+            "and the colliding copy is left where it is",
+            (third / "saves" / "Survival" / "different").exists(),
+        )
+
+    # -- reading what a world was made in ------------------------------------
+    print("\nWorld format\n")
+
+    def write_level_dat(path: Path, data_version: int, name: str) -> None:
+        """The smallest level.dat that read_world can answer about."""
+
+        def string(value: str) -> bytes:
+            raw = value.encode("utf-8")
+            return struct.pack(">H", len(raw)) + raw
+
+        body = b"\x0a" + string("")                       # root compound
+        body += b"\x0a" + string("Data")                  # Data compound
+        body += b"\x03" + string("DataVersion") + struct.pack(">i", data_version)
+        body += b"\x08" + string("LevelName") + string(name)
+        body += b"\x0a" + string("Version") + b"\x08" + string("Name") + string("test") + b"\x00"
+        body += b"\x00"                                   # end Data
+        body += b"\x00"                                   # end root
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(gzip.compress(body))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        saves = Path(tmp) / "saves"
+        write_level_dat(saves / "Old" / "level.dat", 3000, "Old World")
+        write_level_dat(saves / "New" / "level.dat", 99999, "New World")
+        (saves / "NotAWorld").mkdir(parents=True)
+
+        old = read_world(saves / "Old")
+        check("a world's DataVersion is read", old is not None and old.data_version == 3000,
+              repr(old))
+        check("its name is read", old is not None and old.name == "Old World")
+        check("a folder without level.dat is not a world", read_world(saves / "NotAWorld") is None)
+        check("both worlds are listed", len(list_worlds(saves)) == 2)
+
+        target = client_world_version(version, TARGET)
+        check(f"the client jar declares a world format ({target})", isinstance(target, int))
+
+        if isinstance(target, int):
+            needing = worlds_needing_upgrade(saves, version, TARGET)
+            names = {w.folder for w in needing}
+            check(
+                "a world older than the version is flagged for upgrade",
+                "Old" in names,
+                repr(names),
+            )
+            check(
+                "a world newer than the version is not",
+                "New" not in names,
+                repr(names),
+            )
+
+    check(
+        "an unknown version flags nothing rather than guessing",
+        worlds_needing_upgrade(TARGET, "0.0.1-nope", TARGET) == [],
+    )
+
     # core.launch must not drag in auth.
     check("core.launch does not import core.auth", "core.auth" not in sys.modules)
 

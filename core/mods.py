@@ -607,39 +607,22 @@ def conflicts_between(metadata: Sequence[FabricMod]) -> list[tuple[str, str, str
     return found
 
 
-def install_collection(
-    collection: str,
+def _install_projects(
+    project_ids: Sequence[str],
     game_version: str,
     directory: Path | str,
     loader: Optional[str] = MOD_LOADER_DEFAULT,
     allow_unstable: bool = True,
     prefer_newest: bool = True,
-    extra_projects: Sequence[str] = (),
     on_progress: Optional[ProgressCallback] = None,
 ) -> list[CollectionEntry]:
-    """Install a collection into one game directory, and report on every project.
+    """Install a list of projects into one directory under the pack's rules.
 
-    Three rules, each learned from a launch that failed:
-
-    * **A mod with no build for this exact Minecraft version is skipped, never
-      approximated.** Modrinth's per-version ``game_versions`` decides, not the
-      filename. A jar that additionally pins one exact game version in its own
-      ``fabric.mod.json`` is checked against that too and dropped if it
-      disagrees, because that pin is what Fabric will enforce at startup.
-    * **Mods that declare each other incompatible are never both kept.** The
-      declaration is read from the jars, since Modrinth's dependency list does
-      not carry it -- Sodium has broken VulkanMod for years with nothing on
-      Modrinth to say so.
-    * **``directory`` is expected to be per-version.** Builds for two Minecraft
-      versions in one mods folder make Fabric refuse to start, so callers pass an
-      isolated instance directory rather than a shared ``.minecraft``.
-
-    ``extra_projects`` are installed after the collection and take part in the
-    same checks, which is how an alternative renderer gets offered without
-    risking it landing beside one it conflicts with.
+    Shared by the pack install and by catching up on mods that were skipped
+    earlier, so a mod arriving late goes through exactly the same checks: the
+    jar's own game-version pin, and the conflicts the jars declare.
     """
-    found = fetch_collection(collection)
-    wanted = list(found.project_ids) + [p for p in extra_projects if p not in found.project_ids]
+    wanted = list(project_ids)
     titles = project_titles(wanted)
 
     total = len(wanted)
@@ -746,10 +729,58 @@ def install_collection(
         staged = [(p, m) for p, m in staged if p != loser_pos]
 
     if on_progress:
-        on_progress(Progress(f"Installed {found.name}", total, total))
+        on_progress(Progress("Finished", total, total))
 
     return results
 
+
+
+
+def install_collection(
+    collection: str,
+    game_version: str,
+    directory: Path | str,
+    loader: Optional[str] = MOD_LOADER_DEFAULT,
+    allow_unstable: bool = True,
+    prefer_newest: bool = True,
+    extra_projects: Sequence[str] = (),
+    on_progress: Optional[ProgressCallback] = None,
+) -> list[CollectionEntry]:
+    """Install a collection into one game directory, and report on every project.
+
+    Three rules, each learned from a launch that failed:
+
+    * **A mod with no build for this exact Minecraft version is skipped, never
+      approximated.** Modrinth's per-version ``game_versions`` decides, not the
+      filename. A jar that additionally pins one exact game version in its own
+      ``fabric.mod.json`` is checked against that too and dropped if it
+      disagrees, because that pin is what Fabric will enforce at startup.
+    * **Mods that declare each other incompatible are never both kept.** The
+      declaration is read from the jars, since Modrinth's dependency list does
+      not carry it -- Sodium has broken VulkanMod for years with nothing on
+      Modrinth to say so.
+    * **``directory`` is expected to be per-version.** Builds for two Minecraft
+      versions in one mods folder make Fabric refuse to start, so callers pass an
+      isolated instance directory rather than a shared ``.minecraft``.
+
+    ``extra_projects`` are installed after the collection and take part in the
+    same checks, which is how an alternative renderer gets offered without
+    risking it landing beside one it conflicts with.
+
+    Whatever could not be installed is written to the instance's skip list, so a
+    later session can re-check whether a build has appeared since.
+    """
+    found = fetch_collection(collection)
+    wanted = list(found.project_ids) + [
+        p for p in extra_projects if p not in found.project_ids
+    ]
+    results = _install_projects(
+        wanted, game_version, directory,
+        loader=loader, allow_unstable=allow_unstable,
+        prefer_newest=prefer_newest, on_progress=on_progress,
+    )
+    record_skipped(directory, results)
+    return results
 
 def _discard(path: Optional[Path]) -> None:
     """Remove a jar we decided not to keep. Failing to is not worth raising over."""
@@ -787,3 +818,142 @@ def ranged_conflict_warnings(directory: Path | str) -> list[str]:
             + (f" (you have {other.version})" if other else "")
         )
     return warnings
+
+# Where an instance remembers what could not be installed for it.
+SKIPPED_FILENAME = "maestro-skipped.json"
+
+
+@dataclass(frozen=True)
+class SkippedMod:
+    """A project that had no usable build when the pack was installed."""
+
+    project_id: str
+    title: str
+    reason: str
+
+
+def skipped_path(directory: Path | str) -> Path:
+    """Where the skip list for an instance directory lives."""
+    return Path(directory).expanduser() / SKIPPED_FILENAME
+
+
+def record_skipped(directory: Path | str, entries: Sequence[CollectionEntry]) -> Path:
+    """Remember which projects were skipped, so they can be retried later.
+
+    Written even when nothing was skipped, because an empty list is the
+    difference between "nothing to catch up on" and "never installed here".
+    """
+    path = skipped_path(directory)
+    payload = [
+        {"project_id": entry.project_id, "title": entry.title, "reason": entry.error}
+        for entry in entries
+        if not entry.installed
+    ]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise ModError(f"Could not record skipped mods in {path}: {exc}") from exc
+    return path
+
+
+def load_skipped(directory: Path | str) -> list[SkippedMod]:
+    """Read back what was skipped. Missing or unreadable means nothing known."""
+    try:
+        payload = json.loads(skipped_path(directory).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    skipped: list[SkippedMod] = []
+    for item in payload:
+        if isinstance(item, dict) and item.get("project_id"):
+            skipped.append(
+                SkippedMod(
+                    project_id=str(item["project_id"]),
+                    title=str(item.get("title") or item["project_id"]),
+                    reason=str(item.get("reason") or ""),
+                )
+            )
+    return skipped
+
+
+def recheck_skipped(
+    directory: Path | str,
+    game_version: str,
+    loader: Optional[str] = MOD_LOADER_DEFAULT,
+    prefer_newest: bool = True,
+) -> list[SkippedMod]:
+    """Which previously skipped projects now have a build for this version.
+
+    Asks Modrinth again for each one. A mod with no build for a brand-new
+    Minecraft version usually gets one within weeks, and nothing else would ever
+    notice -- the pack install already happened and will not run again by itself.
+
+    Returns only the ones that would now install. Nothing is downloaded here;
+    deciding to install is the caller's, and the caller is expected to ask first.
+    """
+    available: list[SkippedMod] = []
+    for entry in load_skipped(directory):
+        try:
+            resolve_version(
+                entry.project_id,
+                game_version,
+                loader=loader,
+                allow_unstable=True,
+                project_type="mod",
+                prefer_newest=prefer_newest,
+            )
+        except ModError:
+            continue
+        available.append(entry)
+    return available
+
+
+def install_skipped(
+    directory: Path | str,
+    game_version: str,
+    projects: Sequence[str],
+    loader: Optional[str] = MOD_LOADER_DEFAULT,
+    on_progress: Optional[ProgressCallback] = None,
+) -> list[CollectionEntry]:
+    """Install specific projects into an instance and refresh its skip list.
+
+    Goes through the same checks as a pack install -- the jar's own game-version
+    pin and its declared conflicts -- because a mod arriving late is no more
+    trustworthy than one that arrived on time.
+    """
+    results = _install_projects(
+        list(projects), game_version, directory, loader=loader,
+        prefer_newest=True, on_progress=on_progress,
+    )
+
+    # Anything still not installable stays on the list, and anything that made it
+    # comes off; otherwise the same mod is offered every session forever.
+    remaining = [item for item in load_skipped(directory)]
+    installed_ids = {entry.project_id for entry in results if entry.installed}
+    still_skipped = [item for item in remaining if item.project_id not in installed_ids]
+    for entry in results:
+        if not entry.installed and entry.project_id not in {s.project_id for s in still_skipped}:
+            still_skipped.append(
+                SkippedMod(entry.project_id, entry.title, entry.error)
+            )
+
+    path = skipped_path(directory)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                [
+                    {"project_id": s.project_id, "title": s.title, "reason": s.reason}
+                    for s in still_skipped
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+    return results

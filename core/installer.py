@@ -8,6 +8,7 @@ so it stays testable without a login.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -318,8 +319,15 @@ def optimized_profile_id(minecraft_version: str) -> str:
     return f"{minecraft_version}-{OPTIMIZED_SUFFIX}"
 
 
-def instance_directory(profile_id: str, directory: Path | str) -> Path:
-    """The private game directory a generated profile runs in.
+def instance_directory(version_id: str, directory: Path | str) -> Path:
+    """The private game directory a version runs in.
+
+    Keyed by the *Minecraft* version, not by the profile, so ``26.2``,
+    ``fabric-loader-0.19.5-26.2`` and ``26.2-optimized`` all share one folder
+    while ``1.21.11`` gets its own. Mods are compatible with a game version
+    rather than with a profile, so that is the line worth drawing: a pack
+    installed for 26.2 is visible to every 26.2 profile and invisible to
+    everything else.
 
     ``mods/`` is read from the *game* directory, not from the version, so every
     profile sharing one ``.minecraft`` also shares one mods folder. Install for
@@ -331,7 +339,63 @@ def instance_directory(profile_id: str, directory: Path | str) -> Path:
     Versions, libraries and assets stay in the shared directory -- those are
     keyed by version already and are far too big to duplicate per profile.
     """
-    return Path(directory).expanduser() / INSTANCES_DIRNAME / profile_id
+    base = base_game_version(version_id, directory)
+    return Path(directory).expanduser() / INSTANCES_DIRNAME / base
+
+
+def shared_mods_directory(directory: Path | str) -> Path:
+    """The old ``.minecraft/mods`` that every profile used to share."""
+    return Path(directory).expanduser() / "mods"
+
+
+def _declared_release(constraint: str) -> str:
+    """The Minecraft release a dependency string is about, e.g. "26.2".
+
+    Fabric constraints come in many shapes -- ``"1.21.11"``, ``">=1.21.11-
+    <1.21.12-"``, ``"~26.2"``, a list of several -- and grouping on the raw text
+    would file ``~26.2`` and ``~26.2-`` as two different versions when they are
+    plainly one. Every version-looking number is reduced to its major.minor and
+    the lowest is taken, which is the release the jar was built against.
+
+    Returns "" when nothing version-shaped is in there, which is a jar that
+    declares no game version and so cannot be the one causing a mismatch.
+    """
+    numbers = re.findall(r"\d+\.\d+(?:\.\d+)?", constraint or "")
+    releases = {".".join(number.split(".")[:2]) for number in numbers}
+    if not releases:
+        return ""
+    return sorted(releases, key=lambda v: [int(part) for part in v.split(".")])[0]
+
+
+def mixed_version_mods(directory: Path | str) -> dict[str, list[str]]:
+    """Group a shared mods folder's jars by the Minecraft release they declare.
+
+    Only interesting when it finds more than one group: that is the folder that
+    stops Fabric from starting, because a build for the wrong version is an error
+    and not something it skips over. Reported rather than touched -- what to
+    delete out of a folder someone filled by hand is their call.
+
+    Jars declaring no game version at all are left out entirely rather than
+    lumped together, since they are compatible with whatever is running and can
+    never be the cause of a mismatch.
+    """
+    # core.mods imports from this module, so this import is deferred to call
+    # time for the same reason install_fabric_with_sodium's is.
+    from core.mods import read_fabric_metadata
+
+    folder = shared_mods_directory(directory)
+    try:
+        jars = sorted(folder.glob("*.jar"))
+    except OSError:
+        return {}
+
+    groups: dict[str, list[str]] = {}
+    for jar in jars:
+        meta = read_fabric_metadata(jar)
+        release = _declared_release(meta.minecraft if meta else "")
+        if release:
+            groups.setdefault(release, []).append(jar.name)
+    return groups
 
 
 def is_optimized_profile(version_id: str) -> bool:

@@ -24,7 +24,7 @@ import threading
 import tkinter
 import traceback
 from pathlib import Path
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 from typing import Any, Callable, Optional, Sequence
 
 import customtkinter as ctk
@@ -365,6 +365,10 @@ class MaestroApp(*_ROOT_BASES):
         self.account: Optional[Account] = None
         self.game: Optional[launch.RunningGame] = None
 
+        # Versions already re-checked for newly available mods, so browsing the
+        # dropdown does not fire a network round trip per keystroke.
+        self._skipped_checked: set[str] = set()
+
         self._build_widgets()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -429,7 +433,8 @@ class MaestroApp(*_ROOT_BASES):
             row=0, column=0, padx=(4, 12), pady=(12, 8), sticky="w"
         )
         self.version_menu = ctk.CTkOptionMenu(
-            play_tab, values=["Loading..."], state="disabled", width=220
+            play_tab, values=["Loading..."], state="disabled", width=220,
+            command=self._version_changed,
         )
         self.version_menu.grid(row=0, column=1, padx=(0, 4), pady=(12, 8), sticky="w")
 
@@ -684,6 +689,14 @@ class MaestroApp(*_ROOT_BASES):
         else:
             self.set_status(f"{len(versions)} versions available. {READY_HINT}")
 
+        # A shared mods folder holding several versions is the thing that breaks
+        # a launch, so say so before anything is pressed. This overwrites the
+        # line above deliberately: it matters more.
+        self.warn_about_shared_mods()
+
+        # And offer anything the selected version had to skip last time.
+        self.maybe_offer_skipped(self.version_menu.get())
+
     def _versions_failed(self, error: BaseException) -> None:
         self.clear_progress()
         message = str(error) if isinstance(error, InstallError) else f"{error}"
@@ -866,6 +879,117 @@ class MaestroApp(*_ROOT_BASES):
         self._render_account()
         self.set_status("Signed out.")
 
+    # -- catching up on mods that were skipped --------------------------------
+
+    def _version_changed(self, version: str) -> None:
+        """Called when the version picker changes. Offers any newly available mods."""
+        self.maybe_offer_skipped(version)
+
+    def maybe_offer_skipped(self, version: str) -> None:
+        """Re-check Modrinth for mods this version had to skip, and offer them.
+
+        Once per version per session. A mod with no build for a brand-new
+        Minecraft version usually gets one within weeks, and nothing would ever
+        notice otherwise -- the install already happened and will not repeat
+        itself. Checking on every version change instead would mean a network
+        round trip each time someone browses the dropdown.
+        """
+        if self.busy or not version:
+            return
+        directory = self.directory_var.get().strip()
+        if not directory or version in self._skipped_checked:
+            return
+        self._skipped_checked.add(version)
+
+        instance = installer.instance_directory(version, directory)
+        if not mods.load_skipped(instance):
+            return
+
+        game_version = installer.base_game_version(version, directory)
+
+        self.worker.submit(
+            lambda: (
+                version,
+                instance,
+                game_version,
+                mods.recheck_skipped(instance, game_version),
+            ),
+            on_success=self._skipped_rechecked,
+            on_error=lambda error: None,  # a failed re-check is not worth a banner
+        )
+
+    def _skipped_rechecked(self, outcome: tuple) -> None:
+        version, instance, game_version, available = outcome
+        if not available or self.busy:
+            return
+        if self.version_menu.get() != version:
+            # They moved on while the check was in flight; do not ambush them.
+            return
+
+        names = ", ".join(item.title for item in available)
+        wanted = messagebox.askyesno(
+            "Mods now available",
+            f"{len(available)} mod(s) skipped earlier now have a build for "
+            f"{game_version}:\n\n{names}\n\nInstall them now?",
+            parent=self,
+        )
+        if not wanted:
+            self.set_status(f"Left {len(available)} newly available mod(s) uninstalled.")
+            return
+
+        self._set_busy(True)
+        self.progress.set(0)
+        self.set_status(f"Installing {len(available)} newly available mod(s)...")
+
+        report = self.worker.progress_bridge(self.show_progress)
+        projects = [item.project_id for item in available]
+        self.worker.submit(
+            lambda: mods.install_skipped(
+                instance, game_version, projects, on_progress=report
+            ),
+            on_success=self._skipped_installed,
+            on_error=self._optimization_failed,
+        )
+
+    def _skipped_installed(self, entries: list) -> None:
+        self.clear_progress()
+        self._set_busy(False)
+        installed = [entry for entry in entries if entry.installed]
+        failed = [entry for entry in entries if not entry.installed]
+
+        parts = [f"{len(installed)} newly available mod(s) installed"]
+        if failed:
+            parts.append(
+                "still skipped: "
+                + "; ".join(f"{entry.title} ({entry.error})" for entry in failed)
+            )
+        self.set_status(". ".join(parts) + ".")
+
+    def warn_about_shared_mods(self) -> None:
+        """Say so when the old shared mods folder holds builds for several versions.
+
+        Not touched and not migrated -- that folder was filled by hand and is not
+        ours to empty. But it is exactly what stops Fabric from starting, so
+        leaving it unmentioned would be unhelpful.
+        """
+        directory = self.directory_var.get().strip()
+        if not directory:
+            return
+        groups = installer.mixed_version_mods(directory)
+        declared = {key: names for key, names in groups.items() if key != "unknown"}
+        if len(declared) < 2:
+            return
+
+        summary = "; ".join(
+            f"{key} ({len(names)})" for key, names in sorted(declared.items())
+        )
+        self.set_status(
+            f"Heads up: {installer.shared_mods_directory(directory)} holds mods for "
+            f"several Minecraft versions -- {summary}. Nothing here uses that folder "
+            "any more (each version has its own), but the old launcher profiles do, "
+            "and Fabric will refuse to start with mixed versions in it."
+        )
+
     # -- playing --------------------------------------------------------------
 
     def start_play(self) -> None:
@@ -906,13 +1030,14 @@ class MaestroApp(*_ROOT_BASES):
                 installer.install_version(version, directory, on_progress=report)
             status(f"Starting Minecraft {version}...")
 
-            # A generated profile keeps its mods in its own directory, so it has
-            # to be launched there. Pass the shared directory for anything else,
-            # which is where vanilla and hand-made profiles expect to live.
-            game_directory = None
-            if installer.is_optimized_profile(version):
-                game_directory = installer.instance_directory(version, directory)
-                game_directory.mkdir(parents=True, exist_ok=True)
+            # Every version launches in its own directory, not just generated
+            # ones. Mods belong to a game version, so two versions sharing one
+            # mods folder is the whole bug: switching from 26.2 to 1.21.11 used
+            # to load both sets at once and Fabric refused to start. Keyed by the
+            # Minecraft version, so every 26.2 profile sees the same mods and
+            # 1.21.11 cannot see any of them.
+            game_directory = installer.instance_directory(version, directory)
+            game_directory.mkdir(parents=True, exist_ok=True)
 
             return launch.launch(
                 version,
@@ -1192,10 +1317,14 @@ class MaestroApp(*_ROOT_BASES):
         self.progress.set(0)
         self.set_status(f"Installing {hit.title} for {version}...")
 
+        # Into the version's own directory, like everything else. A mod
+        # downloaded here for 26.2 must not turn up when 1.21.11 launches.
+        instance = installer.instance_directory(version, directory)
+
         report = self.worker.progress_bridge(self.show_progress)
         self.worker.submit(
             lambda: mods.install_project(
-                slug, version, directory, loader=MOD_LOADER,
+                slug, version, instance, loader=MOD_LOADER,
                 project_type=hit.project_type, on_progress=report,
             ),
             on_success=lambda path: self._mod_install_finished(hit, path),
@@ -1271,7 +1400,13 @@ class MaestroApp(*_ROOT_BASES):
         if not chosen:
             return
 
-        self.import_paths(chosen, directory)
+        version = self.version_menu.get()
+        target = (
+            installer.instance_directory(version, directory)
+            if version in self.versions
+            else Path(directory)
+        )
+        self.import_paths(chosen, str(target))
 
     def import_paths(self, paths: Sequence[str], directory: str) -> None:
         """Import a list of local files off the UI thread.

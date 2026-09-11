@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.mods import (  # noqa: E402
+        CollectionEntry,
     ModError,
     Progress,
     download_file,
@@ -53,6 +54,7 @@ def test_collection() -> int:
     cannot disturb a working setup.
     """
     import tempfile
+    import shutil
 
     from core.installer import base_game_version, instance_directory
     from core.mods import (
@@ -180,6 +182,87 @@ def test_collection() -> int:
             return 1
         print("    nothing built for another version was installed instead")
 
+
+        # -- a previously skipped mod becoming available ----------------------
+        #
+        # The skip list is written at install time. The catch-up re-asks Modrinth
+        # for exactly those projects later, so a mod that gains a build for this
+        # version stops being invisible. Simulated by recording a skip for a
+        # project that does have a build: the re-check must notice.
+        print("\n  A previously skipped mod becoming available\n")
+        from core.mods import (
+            install_skipped,
+            load_skipped,
+            recheck_skipped,
+            record_skipped,
+            skipped_path,
+        )
+
+        instance, entries, _jars = instances[newer]
+
+        recorded = load_skipped(instance)
+        if not recorded:
+            print("FAILED: the install recorded no skip list.")
+            return 1
+        if {s.project_id for s in recorded} != {e.project_id for e in entries if not e.installed}:
+            print("FAILED: the skip list does not match what was skipped.")
+            return 1
+        if any(not s.reason for s in recorded):
+            print("FAILED: a recorded skip has no reason.")
+            return 1
+        print(f"    {len(recorded)} skip(s) recorded with reasons: "
+              + "; ".join(f"{s.title} ({s.reason})" for s in recorded))
+
+        still = recheck_skipped(instance, newer)
+        if still:
+            print(f"FAILED: re-check claims {[s.title for s in still]} are available on {newer}.")
+            return 1
+        print(f"    re-checking on {newer} still finds nothing -- they really have no build")
+
+        # Now pretend a mod was skipped that in fact has a build for this
+        # version, which is what "a build appeared since" looks like from here.
+        krypton = next(
+            (pid for pid, name in titles.items() if name == "Krypton"), None
+        )
+        if krypton is None:
+            print("FAILED: could not find Krypton in the collection.")
+            return 1
+
+        fake = Path(tempfile.mkdtemp(prefix="catchup-"))
+        try:
+            record_skipped(
+                fake,
+                [CollectionEntry(project_id=krypton, title="Krypton",
+                                 error=f"no build for Minecraft {newer}")],
+            )
+            if not skipped_path(fake).exists():
+                print("FAILED: the skip list was not written.")
+                return 1
+
+            now_available = recheck_skipped(fake, newer)
+            if [s.project_id for s in now_available] != [krypton]:
+                print(f"FAILED: re-check did not offer Krypton: {now_available}")
+                return 1
+            print("    a mod that has gained a build is offered")
+
+            installed_now = install_skipped(
+                fake, newer, [s.project_id for s in now_available]
+            )
+            if not all(e.installed for e in installed_now):
+                print(f"FAILED: installing the caught-up mod failed: {installed_now}")
+                return 1
+            jars_now = list((fake / "mods").glob("*.jar"))
+            if len(jars_now) != 1:
+                print(f"FAILED: expected one jar, got {[j.name for j in jars_now]}")
+                return 1
+            print(f"    installing it puts {jars_now[0].name} in mods/")
+
+            if load_skipped(fake):
+                print(f"FAILED: it is still on the skip list: {load_skipped(fake)}")
+                return 1
+            print("    and it comes off the skip list, so it is not offered again")
+        finally:
+            shutil.rmtree(fake, ignore_errors=True)
     return 0
 
 

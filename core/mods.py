@@ -269,14 +269,22 @@ def resolve_version(
     loader: Optional[str] = None,
     allow_unstable: bool = False,
     project_type: Optional[str] = None,
+    prefer_newest: bool = False,
 ) -> ModFile:
     """Pick the file to download for a project on a given game version.
 
     ``project`` is a slug or a project ID. Prefers stable releases over betas and
     newer publish dates over older ones. Pass ``project_type`` when you already
     know it -- a search result carries one -- to save a request.
+
+    ``prefer_newest`` drops the preference for the stable channel and takes the
+    most recently published compatible build whatever it is labelled, which
+    implies ``allow_unstable``. Mods that track a new Minecraft release often sit
+    on beta for months while the stable build stays pinned to an older game
+    version, so "newest" and "stable" genuinely disagree; this picks newest.
     """
     resolved_type = project_type or get_project_type(project)
+    allow_unstable = allow_unstable or prefer_newest
 
     params: dict[str, Any] = {"game_versions": json.dumps([game_version])}
     if loader and resolved_type not in LOADERLESS_TYPES:
@@ -310,9 +318,11 @@ def resolve_version(
         raise ModError(f"'{project}' has no version for {wanted}{hint}.")
 
     # Two stable sorts: newest first, then stable-channel first wins over it.
-    # ISO-8601 with a Z suffix compares correctly as a plain string.
+    # ISO-8601 with a Z suffix compares correctly as a plain string. With
+    # prefer_newest the second sort is skipped, so publish date decides alone.
     candidates.sort(key=lambda v: v.get("date_published") or "", reverse=True)
-    candidates.sort(key=lambda v: _STABILITY.get(v.get("version_type", ""), 9))
+    if not prefer_newest:
+        candidates.sort(key=lambda v: _STABILITY.get(v.get("version_type", ""), 9))
     version = candidates[0]
 
     files = version.get("files") or []
@@ -517,6 +527,7 @@ def install_collection(
     directory: Path | str,
     loader: Optional[str] = MOD_LOADER_DEFAULT,
     allow_unstable: bool = True,
+    prefer_newest: bool = True,
     on_progress: Optional[ProgressCallback] = None,
 ) -> list[CollectionEntry]:
     """Install every project in a collection, and report on each one.
@@ -527,11 +538,15 @@ def install_collection(
     outcome, good or bad, comes back in the returned list for the caller to
     report.
 
-    ``allow_unstable`` is on by default here, unlike elsewhere in this module.
-    An optimization collection routinely carries mods whose only build for a
-    given version is a beta -- C2ME and VMP both are on 1.21.1 -- and skipping
-    them silently would make "install everything" quietly untrue. Which ones
-    came from a prerelease is recorded per entry so the caller can say so.
+    ``prefer_newest`` and ``allow_unstable`` are both on by default here, unlike
+    elsewhere in this module. An optimization collection routinely carries mods
+    whose only build for a given version is a beta -- C2ME and VMP both are on
+    1.21.1 -- and a mod tracking a brand-new Minecraft release often has its
+    newest build on beta while the stable one is pinned to an older game
+    version. Preferring stable would silently install something older than what
+    the person asked for, and skipping betas would make "install everything"
+    quietly untrue. Which channel each build came from is recorded per entry so
+    the caller can say so.
     """
     found = fetch_collection(collection)
     titles = project_titles(found.project_ids)
@@ -550,15 +565,16 @@ def install_collection(
                 project_id,
                 game_version,
                 loader=loader,
-                allow_unstable=False,
+                allow_unstable=prefer_newest or False,
                 project_type="mod",
+                prefer_newest=prefer_newest,
             )
         except ModError:
             file = None
 
         if file is None and allow_unstable:
-            # No stable build for this version. Take a prerelease rather than
-            # drop the mod, and remember that it was one.
+            # Nothing on the preferred channel. Take whatever exists rather than
+            # drop the mod, and remember what channel it came from.
             try:
                 file = resolve_version(
                     project_id,

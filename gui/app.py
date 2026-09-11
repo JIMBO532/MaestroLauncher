@@ -558,13 +558,33 @@ class MaestroApp(*_ROOT_BASES):
         self.set_status(f"{progress.status} ({progress.percent}%)")
 
     def load_versions(self) -> None:
-        """Fetch the release list from Mojang without blocking the window."""
+        """List what can be launched: everything installed, plus Mojang's releases.
+
+        Installed profiles come first and are listed even when Mojang has never
+        heard of them, because a Fabric profile is not one of Mojang's releases.
+        Listing only releases meant that installing Fabric and then restarting
+        left nothing modded to pick, so Play launched vanilla, loaded no mods,
+        and the game looked exactly as if the mods had never installed.
+        """
         self.set_status("Fetching the version list from Mojang...")
         self.progress.configure(mode="indeterminate")
         self.progress.start()
 
+        directory = self.directory_var.get().strip()
+
+        def work() -> list[str]:
+            installed = installer.installed_versions(directory) if directory else []
+            try:
+                releases = installer.list_releases()
+            except InstallError:
+                # Offline is survivable: what is already on disk still launches.
+                if not installed:
+                    raise
+                releases = []
+            return installed + [v for v in releases if v not in installed]
+
         self.worker.submit(
-            installer.list_releases,
+            work,
             on_success=self._versions_loaded,
             on_error=self._versions_failed,
         )
@@ -578,9 +598,19 @@ class MaestroApp(*_ROOT_BASES):
             return
 
         self.version_menu.configure(values=versions)
+        # versions[0] is an installed one when anything is installed, which is a
+        # better default than the newest release nobody has downloaded yet.
         self.version_menu.set(versions[0])
         self._set_busy(False)
-        self.set_status(f"{len(versions)} releases available. {READY_HINT}")
+
+        directory = self.directory_var.get().strip()
+        installed = installer.installed_versions(directory) if directory else []
+        if installed:
+            self.set_status(
+                f"{len(installed)} installed, {len(versions)} available. {READY_HINT}"
+            )
+        else:
+            self.set_status(f"{len(versions)} versions available. {READY_HINT}")
 
     def _versions_failed(self, error: BaseException) -> None:
         self.clear_progress()
@@ -591,8 +621,11 @@ class MaestroApp(*_ROOT_BASES):
         chosen = filedialog.askdirectory(
             title="Choose the game folder", initialdir=self.directory_var.get()
         )
-        if chosen:
+        if chosen and str(Path(chosen)) != self.directory_var.get():
             self.directory_var.set(str(Path(chosen)))
+            # Which versions are installed is a property of the folder, so the
+            # list is stale the moment the folder changes.
+            self.load_versions()
 
     def _fit_status_width(self, event: tkinter.Event) -> None:
         self.status_label.configure(wraplength=max(event.width - 40, 200))
@@ -897,17 +930,20 @@ class MaestroApp(*_ROOT_BASES):
 
         report = self.worker.progress_bridge(self.show_progress)
 
-        def work() -> tuple[list, list[str]]:
+        def work() -> tuple[list, list[str], bool]:
             # A Fabric profile is not a Minecraft version number, and Modrinth
             # only knows the latter, so resolve the profile to what it inherits.
             game_version = installer.base_game_version(version, directory)
+            # A profile that inherits from something else is modded; one that is
+            # its own base is vanilla, and vanilla loads no mods at all.
+            modded = game_version != version
             entries = mods.install_collection(
                 mods.OPTIMIZATION_COLLECTION,
                 game_version,
                 directory,
                 on_progress=report,
             )
-            return entries, mods.find_conflicts(entries, directory)
+            return entries, mods.find_conflicts(entries, directory), modded
 
         self.worker.submit(
             work,
@@ -915,8 +951,8 @@ class MaestroApp(*_ROOT_BASES):
             on_error=self._optimization_failed,
         )
 
-    def _optimization_finished(self, outcome: tuple[list, list[str]]) -> None:
-        entries, conflicts = outcome
+    def _optimization_finished(self, outcome: tuple[list, list[str], bool]) -> None:
+        entries, conflicts, modded = outcome
         self.clear_progress()
         self._set_busy(False)
 
@@ -936,6 +972,15 @@ class MaestroApp(*_ROOT_BASES):
             parts.append(
                 f"{len(failed)} could not be installed "
                 f"({', '.join(entry.title for entry in failed)})"
+            )
+        if installed and not modded:
+            # The jars are in mods/ and correct, but vanilla Minecraft ignores
+            # that folder entirely, so the game looks exactly as if nothing had
+            # been installed. Say so here rather than letting it be discovered
+            # by launching and finding no mods.
+            parts.append(
+                f"'{self.version_menu.get()}' is vanilla and loads no mods -- press "
+                "Install Fabric + Sodium, then pick the fabric-loader version and Play"
             )
         parts.extend(conflicts)
 

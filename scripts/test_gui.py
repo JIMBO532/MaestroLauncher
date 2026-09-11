@@ -37,6 +37,7 @@ import customtkinter as ctk  # noqa: E402
 
 from core import auth  # noqa: E402
 from core.auth import AuthError  # noqa: E402
+from core import installer  # noqa: E402
 from core.installer import InstallError, Progress  # noqa: E402
 from core.mods import ModError  # noqa: E402
 from gui.app import SIGNED_OUT, BackgroundWorker, MaestroApp  # noqa: E402
@@ -420,6 +421,70 @@ def test_real_flow(version: str) -> None:
         app.destroy()
 
 
+def test_installed_versions_are_selectable() -> None:
+    """Anything installed must be launchable, including modded profiles.
+
+    This is a regression guard. The version menu used to be filled from Mojang's
+    release list alone, so a Fabric profile was only selectable in the session
+    that installed it. After a restart the only thing left to pick was vanilla,
+    Play launched vanilla, no mods loaded, and the game looked exactly as though
+    the mods had never been installed.
+    """
+    print("\nInstalled versions are selectable\n")
+
+    app = MaestroApp()
+    app.withdraw()
+    app.update()
+
+    try:
+        app.directory_var.set(str(TARGET))
+        app.load_versions()
+        pump(
+            app,
+            lambda: bool(app.versions) or "Could not load" in app.status_label.cget("text"),
+            timeout=60,
+        )
+
+        installed = installer.installed_versions(TARGET)
+        check("the test install has something in it", bool(installed), str(installed))
+        if not installed:
+            return
+
+        missing = [v for v in installed if v not in app.versions]
+        check("every installed version is in the menu", not missing, f"missing {missing}")
+
+        profiles = [v for v in installed if v.startswith("fabric-loader-")]
+        if profiles:
+            check(
+                "a Fabric profile is selectable without installing it again",
+                all(p in app.versions for p in profiles),
+                f"{profiles} vs menu",
+            )
+            # Mojang's release list will never contain it, which is the whole point.
+            check(
+                "that profile is not one of Mojang's releases",
+                all(p not in installer.list_releases() for p in profiles),
+            )
+
+        check(
+            "the menu defaults to something installed",
+            app.version_menu.get() in installed,
+            app.version_menu.get(),
+        )
+
+        # base_game_version is what tells the pack which Minecraft to ask for.
+        for profile in profiles:
+            base = installer.base_game_version(profile, TARGET)
+            check(
+                f"{profile} resolves to a plain Minecraft version",
+                base != profile and not base.startswith("fabric-loader-"),
+                base,
+            )
+    finally:
+        app.worker.stop()
+        app.destroy()
+
+
 def main() -> int:
     print("MaestroLauncher GUI worker test")
     print("  the window is withdrawn; nothing is shown, focused or clicked\n")
@@ -431,6 +496,7 @@ def main() -> int:
         test_worker()
         test_app_recovers()
         test_version_is_single_sourced()
+        test_installed_versions_are_selectable()
         if "--real" in sys.argv:
             test_real_flow(version)
     except Exception as exc:  # noqa: BLE001

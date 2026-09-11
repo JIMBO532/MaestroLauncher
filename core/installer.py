@@ -301,6 +301,88 @@ def install_fabric_loader(
         raise InstallError(f"Installing Fabric failed unexpectedly: {exc}") from exc
 
 
+# What a generated profile is called: "1.21.1-optimized". The suffix is in the
+# ID because the ID is what the version list shows, and telling an optimized
+# profile apart from plain Fabric at a glance is the whole point of making one.
+OPTIMIZED_SUFFIX = "optimized"
+
+
+def optimized_profile_id(minecraft_version: str) -> str:
+    """The profile ID :func:`install_optimized_profile` creates for a version."""
+    return f"{minecraft_version}-{OPTIMIZED_SUFFIX}"
+
+
+def is_optimized_profile(version_id: str) -> bool:
+    """True for a profile this launcher generated."""
+    return version_id.endswith(f"-{OPTIMIZED_SUFFIX}")
+
+
+def install_optimized_profile(
+    minecraft_version: str,
+    directory: Path | str,
+    loader_version: Optional[str] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> str:
+    """Install vanilla and Fabric, then add a clearly named profile beside them.
+
+    Returns the new profile's ID, e.g. ``1.21.1-optimized``.
+
+    Fabric's installer names its profile ``fabric-loader-<loader>-<version>``
+    and offers no way to call it anything else, so a launcher that wants a
+    recognisable entry in the version list has to add one. This writes a version
+    JSON, which is as close to the launch protocol as this module gets, so it
+    does the least it possibly can: it copies the profile Fabric just generated
+    and changes exactly two keys.
+
+    * ``id`` becomes the new name, because that is what the version list shows.
+    * ``jar`` is pointed at Fabric's profile, because the classpath takes the
+      client jar from ``versions/<jar or id>/<...>.jar`` and the new profile has
+      no jar of its own. Setting it avoids copying Fabric's 26 MB jar per
+      profile.
+
+    Everything else -- libraries, main class, arguments, ``inheritsFrom`` -- is
+    Fabric's, untouched. No manifest is parsed, no assets are fetched, no JVM
+    arguments are built; ``minecraft_launcher_lib`` still resolves and launches
+    the result exactly as it does the profile it was copied from. Inheritance is
+    deliberately kept one level deep, pointing at the vanilla version, because
+    the library resolves ``inheritsFrom`` once rather than recursively -- a
+    profile inheriting from Fabric's would silently lose vanilla's libraries.
+
+    Re-running replaces the profile, so this is safe to call repeatedly.
+    """
+    path = _prepare_directory(directory)
+
+    if not is_installed(minecraft_version, path):
+        install_version(minecraft_version, path, on_progress=on_progress)
+
+    fabric_id = install_fabric_loader(
+        minecraft_version, path, loader_version=loader_version, on_progress=on_progress
+    )
+
+    source = path / "versions" / fabric_id / f"{fabric_id}.json"
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise InstallError(
+            f"Could not read the Fabric profile at {source}: {exc}"
+        ) from exc
+
+    profile_id = optimized_profile_id(minecraft_version)
+    data["id"] = profile_id
+    data["jar"] = fabric_id
+
+    target = path / "versions" / profile_id
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / f"{profile_id}.json").write_text(
+            json.dumps(data, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        raise InstallError(f"Could not write the profile {profile_id}: {exc}") from exc
+
+    return profile_id
+
+
 def install_fabric_with_sodium(
     minecraft_version: str,
     directory: Path | str,

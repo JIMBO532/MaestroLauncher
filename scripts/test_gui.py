@@ -217,7 +217,7 @@ def test_app_recovers() -> None:
     for label, handler, error in (
         ("a launch", app._play_failed, InstallError("disk full")),
         ("a sign in", app._login_failed, AuthError("Microsoft refused the login")),
-        ("a Fabric install", app._fabric_failed, InstallError("fabric installer exited 1")),
+        ("a profile build", app._optimization_failed, InstallError("fabric installer exited 1")),
         ("the optimization pack", app._optimization_failed, ModError("modrinth returned 503")),
         ("a mod install", app._mod_install_failed, ModError("no version for 1.21.1")),
         ("a search", app._search_failed, ModError("modrinth returned 503")),

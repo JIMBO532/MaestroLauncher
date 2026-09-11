@@ -257,6 +257,80 @@ def _split_braced(data: str) -> list[str]:
     return [item for item in items if item]
 
 
+class VersionPrompt(ctk.CTkToplevel):
+    """A small modal "which Minecraft version?" picker.
+
+    Returns the chosen version from :meth:`ask`, or None if the person closed or
+    cancelled it. Kept as its own window rather than a third dropdown on the Play
+    tab because the version being optimized is a different decision from the
+    version being played, and putting both on screen at once invites picking the
+    wrong one.
+    """
+
+    def __init__(self, parent: tkinter.Misc, versions: Sequence[str]) -> None:
+        super().__init__(parent)
+        self.choice: Optional[str] = None
+
+        self.title("Install optimizations")
+        self.resizable(False, False)
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self, text="Which Minecraft version?",
+            font=ctk.CTkFont(size=15, weight="bold"),
+        ).grid(row=0, column=0, padx=24, pady=(22, 4), sticky="w")
+
+        ctk.CTkLabel(
+            self,
+            text=(
+                "Fabric and the optimization mods are installed for this version,\n"
+                "and a profile is added to the version list to launch them with."
+            ),
+            justify="left", anchor="w", text_color=("gray45", "gray60"),
+        ).grid(row=1, column=0, padx=24, pady=(0, 14), sticky="w")
+
+        self.version_var = ctk.StringVar(value=versions[0] if versions else "")
+        ctk.CTkOptionMenu(
+            self, values=list(versions), variable=self.version_var, width=260
+        ).grid(row=2, column=0, padx=24, pady=(0, 18), sticky="w")
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.grid(row=3, column=0, padx=24, pady=(0, 20), sticky="e")
+        ctk.CTkButton(
+            buttons, text="Cancel", width=100, command=self._cancel,
+            fg_color=("gray70", "gray30"),
+        ).grid(row=0, column=0, padx=(0, 10))
+        ctk.CTkButton(buttons, text="Install", width=120, command=self._accept).grid(
+            row=0, column=1
+        )
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Return>", lambda _event: self._accept())
+        self.bind("<Escape>", lambda _event: self._cancel())
+
+    def _accept(self) -> None:
+        self.choice = self.version_var.get() or None
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.choice = None
+        self.destroy()
+
+    def ask(self) -> Optional[str]:
+        """Show the dialog and block until it is answered. Returns the choice."""
+        # Centre on the parent, then take the focus. Doing this before the first
+        # idle pass puts the window at 1x1 in the corner.
+        self.update_idletasks()
+        parent = self.master
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        self.grab_set()
+        self.wait_window()
+        return self.choice
+
+
 class MaestroApp(*_ROOT_BASES):
     """The launcher window."""
 
@@ -379,26 +453,24 @@ class MaestroApp(*_ROOT_BASES):
         )
         self.play_button.grid(row=2, column=0, columnspan=2, padx=4, pady=(22, 6), sticky="ew")
 
-        self.fabric_button = ctk.CTkButton(
-            play_tab, text="Install Fabric + Sodium", height=36, command=self.start_fabric
-        )
-        self.fabric_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 8), sticky="ew")
-
+        # One button, not two. Installing Fabric and installing the optimization
+        # mods were always the same errand, and doing them separately is how a
+        # folder full of mods ends up under a vanilla profile that ignores them.
         self.optimize_button = ctk.CTkButton(
-            play_tab, text="Install optimization pack", height=36,
+            play_tab, text="Install optimizations", height=36,
             command=self.start_optimization_pack,
         )
-        self.optimize_button.grid(row=4, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
+        self.optimize_button.grid(row=3, column=0, columnspan=2, padx=4, pady=(0, 4), sticky="ew")
 
         ctk.CTkLabel(
             play_tab,
             text=(
-                "Installs the Optimized Minecraft collection from Modrinth into mods/.\n"
-                "Needs Fabric; VulkanMod in the pack replaces Sodium."
+                "Asks which Minecraft version, installs Fabric and the Optimized\n"
+                "Minecraft mods, then adds a '<version>-optimized' profile to play them with."
             ),
             justify="left", anchor="w", text_color=("gray45", "gray60"),
             font=ctk.CTkFont(size=11),
-        ).grid(row=5, column=0, columnspan=2, padx=6, pady=(0, 12), sticky="ew")
+        ).grid(row=4, column=0, columnspan=2, padx=6, pady=(0, 12), sticky="ew")
 
         # -- Content tab --
         mods_tab.grid_columnconfigure(0, weight=1)
@@ -525,7 +597,7 @@ class MaestroApp(*_ROOT_BASES):
         self._button_fills = {
             button: button.cget("fg_color")
             for button in (
-                self.browse_button, self.play_button, self.fabric_button,
+                self.browse_button, self.play_button,
                 self.search_button, self.install_mod_button, self.add_files_button,
                 self.signin_button, self.signout_button, self.optimize_button,
             )
@@ -648,7 +720,6 @@ class MaestroApp(*_ROOT_BASES):
         self.content_type.configure(state="disabled" if busy else "normal")
         self.set_button_enabled(self.browse_button, not busy)
         self.set_button_enabled(self.play_button, ready)
-        self.set_button_enabled(self.fabric_button, ready)
         self.set_button_enabled(self.optimize_button, ready)
         self.set_button_enabled(self.search_button, ready)
         self.set_button_enabled(
@@ -863,87 +934,89 @@ class MaestroApp(*_ROOT_BASES):
         # is a surprise and gets shown as-is rather than swallowed.
         self.set_status(f"Could not start the game: {error}")
 
-    def start_fabric(self) -> None:
-        """Install Fabric plus Sodium for the selected version, off the UI thread."""
-        if self.busy:
-            return
-
-        version = self.version_menu.get()
-        directory = self.directory_var.get().strip()
-
-        if version not in self.versions:
-            self.set_status("Pick a version first.")
-            return
-        if not directory:
-            self.set_status("Choose a game folder first.")
-            return
-
-        self._set_busy(True)
-        self.progress.set(0)
-        self.set_status(f"Installing Fabric and Sodium for {version}...")
-
-        report = self.worker.progress_bridge(self.show_progress)
-        self.worker.submit(
-            lambda: installer.install_fabric_with_sodium(
-                version, directory, on_progress=report
-            ),
-            on_success=self._fabric_finished,
-            on_error=self._fabric_failed,
-        )
-
-    def _fabric_finished(self, profile_id: str) -> None:
-        self.clear_progress()
-
-        # The profile is not one of Mojang's releases, so it is not in the list
-        # the menu was filled from. Without adding it here the button that just
-        # built it would leave nothing able to launch it.
-        if profile_id not in self.versions:
-            self.versions.append(profile_id)
-            self.version_menu.configure(values=self.versions)
-        self.version_menu.set(profile_id)
-
-        self._set_busy(False)
-        self.set_status(f"Ready: {profile_id}, with Sodium in mods/. Press Play.")
-
     def start_optimization_pack(self) -> None:
-        """Install every mod in the Modrinth optimization collection, off the UI thread.
+        """Ask which Minecraft version to optimize, then build the profile.
 
-        The collection is fetched live rather than pinned in code, so editing it
-        on Modrinth changes what this button installs without a release here.
+        The version is asked for rather than taken from the Play tab's picker,
+        because this makes a *new* profile rather than changing the selected
+        one, and the two are rarely the same choice.
         """
         if self.busy:
             return
 
-        version = self.version_menu.get()
         directory = self.directory_var.get().strip()
-
         if not directory:
             self.set_status("Choose a game folder first.")
             return
-        if version not in self.versions and not installer.is_installed(version, directory):
-            self.set_status("Pick a version first.")
+        if not self.versions:
+            self.set_status("Still fetching the version list. Try again in a moment.")
+            return
+
+        choices = [v for v in self.versions if not installer.is_optimized_profile(v)]
+        chosen = VersionPrompt(self, choices).ask()
+        if chosen is None:
+            self.set_status("Cancelled.")
+            return
+
+        self.begin_optimization(chosen)
+
+    def begin_optimization(self, minecraft_version: str) -> None:
+        """Install Fabric, the optimization pack, and a named profile for them.
+
+        Split from the prompt so the whole job can be driven without opening a
+        dialog, which is what the tests do.
+        """
+        if self.busy:
+            return
+
+        directory = self.directory_var.get().strip()
+        if not directory:
+            self.set_status("Choose a game folder first.")
             return
 
         self._set_busy(True)
         self.progress.set(0)
-        self.set_status("Fetching the optimization collection from Modrinth...")
+        self.set_status(f"Building an optimized profile for {minecraft_version}...")
 
         report = self.worker.progress_bridge(self.show_progress)
+        status = self.worker.status_bridge(self.set_status)
 
-        def work() -> tuple[list, list[str], bool]:
-            # A Fabric profile is not a Minecraft version number, and Modrinth
-            # only knows the latter, so resolve the profile to what it inherits.
-            game_version = installer.base_game_version(version, directory)
-            # A profile that inherits from something else is modded; one that is
-            # its own base is vanilla, and vanilla loads no mods at all.
-            modded = game_version != version
+        def work() -> tuple[str, list, list[str], Optional[str]]:
+            status(f"Installing Minecraft {minecraft_version} and Fabric...")
+            profile_id = installer.install_optimized_profile(
+                minecraft_version, directory, on_progress=report
+            )
+
+            status("Installing the optimization pack from Modrinth...")
             entries = mods.install_collection(
                 mods.OPTIMIZATION_COLLECTION,
-                game_version,
+                minecraft_version,
                 directory,
                 on_progress=report,
             )
-            return entries, mods.find_conflicts(entries, directory), modded
+
+            # This button replaced a separate "Install Fabric + Sodium", so
+            # Sodium still has to be accounted for. It cannot simply be added:
+            # the pack's VulkanMod replaces the renderer and lists Sodium as
+            # incompatible. So Sodium fills in only when VulkanMod is not
+            # available for this version, which is exactly when the renderer
+            # would otherwise go unoptimized.
+            got_vulkan = any(
+                entry.installed and "vulkanmod" in entry.filename.lower()
+                for entry in entries
+            )
+            sodium: Optional[str] = None
+            if not got_vulkan:
+                status("VulkanMod has no build here; installing Sodium instead...")
+                try:
+                    sodium = mods.install_project(
+                        "sodium", minecraft_version, directory,
+                        loader=mods.MOD_LOADER_DEFAULT, project_type="mod",
+                    ).name
+                except ModError:
+                    sodium = None
+
+            return profile_id, entries, mods.find_conflicts(entries, directory), sodium
 
         self.worker.submit(
             work,
@@ -951,36 +1024,38 @@ class MaestroApp(*_ROOT_BASES):
             on_error=self._optimization_failed,
         )
 
-    def _optimization_finished(self, outcome: tuple[list, list[str], bool]) -> None:
-        entries, conflicts, modded = outcome
+    def _optimization_finished(
+        self, outcome: tuple[str, list, list[str], Optional[str]]
+    ) -> None:
+        profile_id, entries, conflicts, sodium = outcome
         self.clear_progress()
+
+        # The profile is brand new, so nothing else knows it exists yet. Adding
+        # and selecting it is the difference between this button finishing and
+        # this button being usable.
+        if profile_id not in self.versions:
+            self.versions.insert(0, profile_id)
+            self.version_menu.configure(values=self.versions)
+        self.version_menu.set(profile_id)
         self._set_busy(False)
 
         installed = [entry for entry in entries if entry.installed]
         failed = [entry for entry in entries if not entry.installed]
         prerelease = [entry for entry in installed if not entry.stable]
 
-        parts = [f"Optimization pack: {len(installed)} of {len(entries)} installed"]
+        parts = [f"'{profile_id}' is ready -- pick it and press Play"]
+        parts.append(f"{len(installed)} of {len(entries)} pack mods installed")
+        if sodium:
+            parts.append("Sodium added, since VulkanMod has no build for this version")
         if prerelease:
-            # Worth naming rather than burying: these are the mods most likely to
-            # misbehave, and the person did not choose them individually.
             parts.append(
-                f"{len(prerelease)} had no stable build and came from a prerelease "
+                f"{len(prerelease)} came from a prerelease "
                 f"({', '.join(entry.title for entry in prerelease)})"
             )
         if failed:
             parts.append(
-                f"{len(failed)} could not be installed "
+                f"{len(failed)} had no build for this version "
                 f"({', '.join(entry.title for entry in failed)})"
-            )
-        if installed and not modded:
-            # The jars are in mods/ and correct, but vanilla Minecraft ignores
-            # that folder entirely, so the game looks exactly as if nothing had
-            # been installed. Say so here rather than letting it be discovered
-            # by launching and finding no mods.
-            parts.append(
-                f"'{self.version_menu.get()}' is vanilla and loads no mods -- press "
-                "Install Fabric + Sodium, then pick the fabric-loader version and Play"
             )
         parts.extend(conflicts)
 
@@ -989,13 +1064,7 @@ class MaestroApp(*_ROOT_BASES):
     def _optimization_failed(self, error: BaseException) -> None:
         self.clear_progress()
         self._set_busy(False)
-        self.set_status(f"Could not install the optimization pack: {error}")
-
-    def _fabric_failed(self, error: BaseException) -> None:
-        self.clear_progress()
-        self._set_busy(False)
-        detail = str(error) if isinstance(error, InstallError) else f"{error}"
-        self.set_status(f"Fabric install failed: {detail}")
+        self.set_status(f"Could not build the optimized profile: {error}")
 
     def _selected_version(self) -> Optional[str]:
         version = self.version_menu.get()

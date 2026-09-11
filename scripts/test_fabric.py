@@ -30,6 +30,10 @@ from core.installer import (  # noqa: E402
     InstallError,
     Progress,
     find_java_executable,
+    base_game_version,
+    install_optimized_profile,
+    is_optimized_profile,
+    optimized_profile_id,
     install_fabric_with_sodium,
     installed_versions,
     is_installed,
@@ -192,6 +196,65 @@ def main() -> int:
     if _failed:
         print("\nFAILED")
         return 1
+    # -- the named optimized profile -----------------------------------------
+    #
+    # Fabric names its profile "fabric-loader-<loader>-<version>" and offers no
+    # way to change it, so the launcher adds a recognisable one beside it. What
+    # matters is that the copy is still launchable: it must resolve to the same
+    # classpath as the profile it came from, or it is a version list entry that
+    # starts nothing.
+    print("\nThe optimized profile\n")
+
+    profile = install_optimized_profile(version, TARGET)
+    check(
+        "the profile is named after the version",
+        profile == optimized_profile_id(version) and "optimized" in profile,
+        profile,
+    )
+    check("it shows up as installed", profile in installed_versions(TARGET), profile)
+    check("it is recognised as one of ours", is_optimized_profile(profile))
+    check(
+        "plain Fabric is not mistaken for one",
+        not is_optimized_profile(profile_id),
+        profile_id,
+    )
+    check(
+        "it resolves to the plain Minecraft version",
+        base_game_version(profile, TARGET) == version,
+        base_game_version(profile, TARGET),
+    )
+
+    # The launch command is the real test. Inheritance is only resolved one
+    # level deep by the library, so a profile pointing at Fabric's instead of at
+    # vanilla would quietly lose vanilla's libraries and produce a short
+    # classpath here rather than an error.
+    fabric_command = build_command(profile_id, TARGET, "T", "0" * 32, "tok")
+    optimized_command = build_command(profile, TARGET, "T", "0" * 32, "tok")
+    fabric_cp = fabric_command[fabric_command.index("-cp") + 1]
+    optimized_cp = optimized_command[optimized_command.index("-cp") + 1]
+
+    check(
+        "its classpath matches the Fabric profile's exactly",
+        optimized_cp == fabric_cp,
+        f"{len(optimized_cp.split(';'))} entries vs {len(fabric_cp.split(';'))}",
+    )
+    check(
+        "it uses the Fabric main class, not vanilla's",
+        "net.fabricmc" in " ".join(optimized_command),
+    )
+    check(
+        "the version it passes to the game is the profile",
+        profile in optimized_command,
+    )
+    check(
+        "no 26 MB jar was copied for it",
+        not (TARGET / "versions" / profile / f"{profile}.jar").exists(),
+    )
+
+    again = install_optimized_profile(version, TARGET)
+    check("building it twice is safe and stable", again == profile, again)
+
+
 
     print("\nMilestone 4 PASSED")
     return 0

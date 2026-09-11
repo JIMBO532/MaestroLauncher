@@ -18,9 +18,14 @@
      background rather than an <img> and stays out of the accessibility tree. -->
 <div class="backdrop" aria-hidden="true"></div>
 
+<div class="dropzone-hint" id="dropzone-hint" aria-hidden="true" hidden>Drop image to set background</div>
+
 <main class="stage">
 
-  <img class="logo" src="assets/logo.png" alt="MaestroLauncher" draggable="false">
+  <div class="brand">
+    <img class="logo" src="assets/logo.png" alt="" draggable="false">
+    <span class="wordmark">MaestroLauncher</span>
+  </div>
 
   <!-- Top right: account. The blocky head is the strongest Minecraft cue on the
        screen that costs no asset -- a generic skin silhouette, not anyone's. -->
@@ -42,7 +47,8 @@
   </button>
 
   <nav class="rail" aria-label="Sections">
-    <button class="rail__item" type="button" aria-label="Content" title="Content">
+    <button class="rail__item" type="button" aria-label="Content">
+      <span class="rail__label" aria-hidden="true">Content</span>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <polyline points="12 2 2 7 12 12 22 7 12 2"></polyline>
@@ -50,7 +56,8 @@
         <polyline points="2 12 12 17 22 12"></polyline>
       </svg>
     </button>
-    <button class="rail__item" type="button" aria-label="Settings" title="Settings">
+    <button class="rail__item" id="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="settings-panel" aria-label="Settings">
+      <span class="rail__label" aria-hidden="true">Settings</span>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="4" y1="7" x2="20" y2="7"></line>
@@ -61,7 +68,8 @@
         <circle cx="8" cy="17" r="2.2" fill="#0a0a0a"></circle>
       </svg>
     </button>
-    <button class="rail__item" type="button" aria-label="About" title="About">
+    <button class="rail__item" type="button" aria-label="About">
+      <span class="rail__label" aria-hidden="true">About</span>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="9.2"></circle>
@@ -71,32 +79,42 @@
     </button>
   </nav>
 
-  <div class="dock">
-    <button class="play" type="button">Play</button>
-
-    <button class="version" type="button" aria-label="Choose version. Currently 1.21.1 Fabric">
-      <span class="version__value">1.21.1 Fabric</span>
-      <svg class="version__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="6 15 12 9 18 15"></polyline>
-      </svg>
-    </button>
+  <!-- Only the choice of background image and its reset live here; the rest
+       of Settings is still a stub for a later slice. -->
+  <div class="settings-panel" id="settings-panel" role="menu" aria-label="Settings" hidden>
+    <button class="settings-panel__item" type="button" role="menuitem" data-action="choose-background">Change background image&hellip;</button>
+    <button class="settings-panel__item settings-panel__item--reset" type="button" role="menuitem" data-action="reset-background">Reset to default</button>
   </div>
+  <input type="file" id="background-file-input" accept="image/png,image/jpeg" hidden>
 
-  <!-- Bottom left: the genre convention from the reference. Green is state and
-       only ever state, so the dot is the one place it appears. Placeholder
-       values in slice 1; nothing behind them yet. -->
-  <div class="status">
-    <div class="status__item">
-      <span class="status__key">Installed</span>
-      <span class="status__value">1.21.1 &middot; Fabric</span>
+  <div class="bottom-group">
+    <div class="dock">
+      <button class="play" type="button">Play</button>
+
+      <button class="version" type="button" aria-label="Choose version. Currently 1.21.1 Fabric">
+        <span class="version__value">1.21.1 Fabric</span>
+        <svg class="version__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="6 15 12 9 18 15"></polyline>
+        </svg>
+      </button>
     </div>
-    <span class="status__rule" aria-hidden="true"></span>
-    <div class="status__item">
-      <span class="status__key">Mojang</span>
-      <span class="status__value">
-        <span class="dot" aria-hidden="true"></span>Online
-      </span>
+
+    <!-- Centred under Play as a group. Green is state and only ever state, so
+         the dot is the one place it appears. Placeholder values in slice 1;
+         nothing behind them yet. -->
+    <div class="status">
+      <div class="status__item">
+        <span class="status__key">Installed</span>
+        <span class="status__value">1.21.1 &middot; Fabric</span>
+      </div>
+      <span class="status__rule" aria-hidden="true"></span>
+      <div class="status__item">
+        <span class="status__key">Mojang</span>
+        <span class="status__value">
+          <span class="dot" aria-hidden="true"></span>Online
+        </span>
+      </div>
     </div>
   </div>
 

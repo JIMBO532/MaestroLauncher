@@ -31,6 +31,15 @@
   --base: 190ms;
 
   --edge: clamp(36px, 4.4vw, 68px);   /* breathing room from the window edge */
+
+  /* How much extra darkening each text region gets on top of the base
+     vertical scrim below, 0-1. Zero for the bundled night shot -- it was
+     tuned bare. Set by app.js after sampling whatever image is actually
+     loaded, so a bright custom background gets help where the bundled one
+     never needed any. */
+  --scrim-logo: 0;
+  --scrim-account: 0;
+  --scrim-bottom: 0;
 }
 
 * { box-sizing: border-box; }
@@ -48,8 +57,27 @@
   z-index: 0;
 }
 
-/* The scrim. Its shape is not symmetrical decoration -- it is fitted to where
-   this particular screenshot is bright and where the UI sits.
+/* Adaptive top-up, on top of the fixed scrim below. The bundled shot needed
+   none of this -- it was measured and tuned bare -- so every stop is zero
+   until app.js samples a user-chosen image and finds one of these three
+   spots too bright for white text. Ellipses, not the full-width bands below,
+   because a bright sky can sit right next to a dark cliff at the same
+   height and only one of them has text over it. */
+.backdrop::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 480px 300px at 16% 9%,
+      rgba(0, 0, 0, var(--scrim-logo)) 0%, rgba(0, 0, 0, 0) 72%),
+    radial-gradient(ellipse 320px 240px at 93% 7%,
+      rgba(0, 0, 0, var(--scrim-account)) 0%, rgba(0, 0, 0, 0) 72%),
+    radial-gradient(ellipse 780px 440px at 50% 86%,
+      rgba(0, 0, 0, var(--scrim-bottom)) 0%, rgba(0, 0, 0, 0) 72%);
+}
+
+/* The base scrim. Its shape is not symmetrical decoration -- it is fitted to
+   where this particular screenshot is bright and where the UI sits.
 
    Measured on the real image at 1280x760, worst-case (95th percentile) patch
    under each element, white text against it:
@@ -57,7 +85,7 @@
      top-left, logo        2.50:1 bare  ->   9.24:1 scrimmed
      top-right, account    6.83:1       ->  18.60:1
      right edge, rail     10.38:1       ->  12.87:1
-     bottom-left, status   7.84:1       ->  16.92:1
+     bottom-centre, status 7.84:1       ->  16.92:1
      bottom-centre, Play   8.99:1       ->  17.63:1
 
    The top needed the most help, not the bottom: the bright cloud band sits
@@ -66,8 +94,9 @@
    The 40-60% band is deliberately left nearly clear -- that is the water, the
    treeline and the moon, and covering them would defeat the point of using a
    screenshot at all. Grey labels (--muted) measure 4.90:1 on the status and
-   5.37:1 beside Play; the rail's icons are 3.73:1, past the 3:1 that non-text
-   needs. */
+   5.37:1 beside Play; the rail's icons run brighter than --muted since they
+   carry no text fallback, so their floor is comfortably past the 3:1 that
+   non-text needs. */
 .backdrop::after {
   content: "";
   position: absolute;
@@ -111,17 +140,36 @@ html, body {
    answering it. At this size the top of the window reads as one band -- mark
    on the left, account on the right -- and it shares the left margin with the
    status line below, so the left edge is a column rather than a stray. */
-.logo {
+.brand {
   position: absolute;
   top: clamp(26px, 3.4vh, 44px);
   left: var(--edge);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.logo {
   width: clamp(190px, 18.5vw, 248px);
   height: auto;
   opacity: 0.94;
   /* Fine white linework over a photograph needs its own separation; the scrim
      lifts the average but not the bright cloud edges directly behind it. */
   filter: drop-shadow(0 2px 16px rgba(0, 0, 0, 0.6));
-  pointer-events: none;
+}
+
+/* Same caps-and-tracking treatment as every other label in the UI, not the
+   Minecraft or Mojang wordmark -- this is our own mark's name, not theirs.
+   Sized well under the logo's own type so the mark still leads. */
+.wordmark {
+  font-size: clamp(15px, 1.5vw, 20px);
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--fg);
+  text-shadow: 0 2px 12px rgba(0, 0, 0, 0.7);
+  white-space: nowrap;
 }
 
 /* ------------------------------------------------------------- the account */
@@ -186,6 +234,7 @@ html, body {
 }
 
 .rail__item {
+  position: relative;
   display: grid;
   place-items: center;
   width: 44px;                 /* 44x44 minimum touch/click target */
@@ -193,7 +242,10 @@ html, body {
   background: none;
   border: 0;
   border-radius: 14px;
-  color: var(--muted);
+  /* Brighter than --muted on purpose: an icon carries no text fallback the
+     way a label does, so it needs to read as present at a glance rather
+     than just pass a contrast minimum. */
+  color: rgba(255, 255, 255, 0.75);
   cursor: pointer;
   transition: color var(--base) var(--ease),
               background-color var(--base) var(--ease),
@@ -204,36 +256,124 @@ html, body {
 
 .rail__item:hover {
   color: var(--fg);
-  background-color: rgba(255, 255, 255, 0.06);
+  background-color: rgba(255, 255, 255, 0.1);
 }
 
 .rail__item:active { transform: scale(0.94); }
 
-/* ---------------------------------------------------------------- the dock */
-
-/* PLAY holds the centre line of the window on its own. The version sits beside
-   it, positioned off the dock rather than laid out next to it -- centring the
-   two as a group would push the primary action off centre by half the version's
-   width, which is visible at this size. */
-.dock {
+/* The rail has no visible text, so what each icon does is invisible until
+   hovered -- a small label flags out to the left of it, clear of the icon
+   itself. */
+.rail__label {
   position: absolute;
-  left: 50%;
-  bottom: clamp(52px, 9vh, 92px);
-  transform: translateX(-50%);
-  display: flex;
-  align-items: center;
+  right: calc(100% + 12px);
+  top: 50%;
+  transform: translateY(-50%) translateX(6px);
+  white-space: nowrap;
+  padding: 7px 12px;
+  background: rgba(10, 10, 10, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: var(--fg);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--base) var(--ease), transform var(--base) var(--ease);
 }
 
-/* The one primary action on the screen. */
+.rail__item:hover .rail__label,
+.rail__item:focus-visible .rail__label {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
+
+/* ------------------------------------------------------------ the settings
+   panel -- the one deliberate exception to "nothing sits in a panel": a
+   background file and a reset action need somewhere to live, and a menu is
+   the honest way to hold two buttons. Anchored off the rail like the hover
+   labels are, not centred on the window. */
+.settings-panel {
+  position: absolute;
+  top: 50%;
+  right: calc(var(--edge) + 44px + 14px);
+  transform: translateY(-72px);
+  display: flex;
+  flex-direction: column;
+  min-width: 220px;
+  padding: 6px;
+  background: rgba(10, 10, 10, 0.9);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.settings-panel[hidden] { display: none; }
+
+.settings-panel__item {
+  padding: 12px 14px;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.settings-panel__item:hover { background-color: rgba(255, 255, 255, 0.08); }
+
+.settings-panel__item--reset { color: var(--muted); }
+.settings-panel__item--reset:hover { color: var(--fg); }
+
+/* ------------------------------------------------------------ bottom group */
+
+/* Dock and status stack as one centred column, so growing Play never has to
+   be re-measured against a separately-anchored status row underneath it --
+   the gap between the two is explicit instead of two independent vh guesses
+   that happened to clear each other. */
+.bottom-group {
+  position: absolute;
+  left: 50%;
+  bottom: clamp(40px, 7vh, 70px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: clamp(30px, 4.4vh, 44px);
+}
+
+/* ---------------------------------------------------------------- the dock */
+
+/* Play and the version selector are laid out together and centred as one
+   pair -- Play no longer holds the exact window centre line on its own.
+   That was the earlier call, but it left status centred under Play alone
+   while Play+version visibly wasn't, which read as misaligned from directly
+   above. Treating the pair as the group being centred fixes both at once. */
+.dock {
+  display: flex;
+  align-items: center;
+  gap: clamp(20px, 2.4vw, 34px);
+}
+
+/* The one primary action on the screen -- and the thing the bottom of the
+   window should read as first, so it runs a quarter wider than a "just big
+   enough" button would. */
 .play {
-  min-width: clamp(230px, 21vw, 292px);
-  padding: 22px 56px;
+  min-width: clamp(288px, 26vw, 365px);
+  padding: 27px 60px;
   background: var(--blue);
   border: 0;
-  border-radius: 18px;
+  border-radius: 20px;
   color: var(--fg);
   font-family: inherit;
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 600;
   letter-spacing: 0.26em;
   text-transform: uppercase;
@@ -257,42 +397,44 @@ html, body {
   box-shadow: 0 6px 16px rgba(43, 79, 214, 0.28);
 }
 
+/* A bordered control, not a caption -- the version is the second most
+   important choice on this screen and was reading as a footnote next to
+   the caption-weight labels below. Laid out in-flow beside Play now, as
+   part of the pair .dock centres. */
 .version {
-  position: absolute;
-  left: calc(100% + clamp(18px, 2.2vw, 32px));
-  top: 50%;
-  transform: translateY(-50%);
   white-space: nowrap;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 6px;
-  background: none;
-  border: 0;
-  color: var(--muted);
+  gap: 10px;
+  padding: 14px 20px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 14px;
+  color: var(--fg);
   font-family: inherit;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
-  letter-spacing: 0.2em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   cursor: pointer;
-  transition: color var(--base) var(--ease);
+  transition: background-color var(--base) var(--ease),
+              border-color var(--base) var(--ease);
 }
 
-.version__chevron { width: 13px; height: 13px; }
-.version:hover { color: var(--fg); }
-/* Keep the centring transform: a bare scale() here would replace it and
-   drop the label half its height on every press. */
-.version:active { transform: translateY(-50%) scale(0.98); }
+.version__chevron { width: 15px; height: 15px; }
+.version:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.32);
+}
+.version:active { transform: scale(0.98); }
 
 /* -------------------------------------------------------------- the status */
 
 /* Genre convention, taken from the reference: quiet facts along the bottom
-   edge, no panel behind them. */
+   edge, no panel behind them. Centred under Play as part of .bottom-group
+   rather than pinned to the left -- pinned left, it was the only thing on
+   the screen with nothing answering it on the right. */
 .status {
-  position: absolute;
-  left: var(--edge);
-  bottom: clamp(46px, 8vh, 78px);
   display: flex;
   align-items: center;
   gap: clamp(16px, 1.8vw, 26px);
@@ -342,6 +484,29 @@ html, body {
   box-shadow: 0 0 8px rgba(92, 184, 92, 0.55);
 }
 
+/* ---------------------------------------------------------- the dropzone */
+
+/* Shown only while an OS file drag is over the window. Full-window so it
+   doesn't matter where over the screenshot the file gets dropped. */
+.dropzone-hint {
+  position: fixed;
+  inset: 18px;
+  display: grid;
+  place-items: center;
+  border: 2px dashed rgba(255, 255, 255, 0.5);
+  border-radius: 24px;
+  background: rgba(10, 10, 10, 0.55);
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  z-index: 5;
+  pointer-events: none;
+}
+
+.dropzone-hint[hidden] { display: none; }
+
 /* --------------------------------------------------------------- keyboard */
 
 :focus-visible {
@@ -354,7 +519,8 @@ html, body {
 
 @media (max-height: 700px) {
   .logo { width: clamp(168px, 15vw, 206px); }
-  .play { padding: 18px 46px; }
+  .wordmark { font-size: clamp(13px, 1.3vw, 17px); }
+  .play { padding: 21px 50px; }
 }
 
 /* ------------------------------------------------------- reduced motion */

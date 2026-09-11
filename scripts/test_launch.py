@@ -221,6 +221,79 @@ def main() -> int:
     check("the default log path is under the game directory", TARGET.resolve() in path.parents)
     check("the default log path is not the game's own logs/", path.parent.name != "logs")
 
+    # -- how the game is spawned ---------------------------------------------
+    #
+    # Two bugs lived here. A console window opened beside the game, and closing
+    # that console killed the game, because a child sharing its parent's console
+    # is sent CTRL_CLOSE_EVENT when the console goes away. Both are creation
+    # flags, and the flags are easy to lose in a refactor without anything
+    # failing until someone launches and watches a console appear.
+    import subprocess as _subprocess
+
+    from core.launch import _popen_detached
+
+    captured: dict = {}
+    real_popen = _subprocess.Popen
+
+    class RecordingPopen(real_popen):  # type: ignore[misc,valid-type]
+        def __init__(self, *args, **kwargs):
+            captured.update(kwargs)
+            super().__init__(*args, **kwargs)
+
+    _subprocess.Popen = RecordingPopen
+    captured_output = ""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "spawn.log"
+            with log.open("wb") as handle:
+                probe = _popen_detached(
+                    [sys.executable, "-c", "print('spawned')"], Path(tmp), handle
+                )
+                probe.wait(timeout=30)
+            # Read it before the temp directory goes away.
+            captured_output = log.read_text(encoding="utf-8", errors="replace")
+    finally:
+        _subprocess.Popen = real_popen
+
+    if os.name == "nt":
+        flags = captured.get("creationflags", 0)
+        check(
+            "the game is spawned with no console window",
+            bool(flags & _subprocess.CREATE_NO_WINDOW),
+            hex(flags),
+        )
+        check(
+            "it gets its own process group, so Ctrl+C does not reach it",
+            bool(flags & _subprocess.CREATE_NEW_PROCESS_GROUP),
+            hex(flags),
+        )
+        check(
+            "DETACHED_PROCESS is not combined with CREATE_NO_WINDOW",
+            not (flags & 0x00000008),
+            hex(flags),
+        )
+    else:
+        check(
+            "the game is spawned in its own session",
+            captured.get("start_new_session") is True,
+            repr(captured.get("start_new_session")),
+        )
+
+    # Detaching is only half of it: the log has to survive the change, because
+    # the exit code is not a usable success signal -- the game exits 0 even when
+    # it fails to get a renderer -- so the log is the only evidence there is.
+    check(
+        "stdout is still redirected to the log handle",
+        captured.get("stdout") is not None
+        and captured.get("stderr") == _subprocess.STDOUT,
+        repr(captured.get("stderr")),
+    )
+    check(
+        "the detached spawn still captures output",
+        captured_output.strip().endswith("spawned"),
+        repr(captured_output[:60]),
+    )
+
     # core.launch must not drag in auth.
     check("core.launch does not import core.auth", "core.auth" not in sys.modules)
 

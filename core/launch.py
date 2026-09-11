@@ -179,6 +179,71 @@ def default_log_path(version_id: str, directory: Path | str) -> Path:
     return Path(directory).expanduser().resolve() / LOG_DIRNAME / f"{safe_version}-{stamp}.log"
 
 
+# Windows creation flags. Named here rather than used inline because the reason
+# for each is the whole point, and because two of them look interchangeable and
+# are not.
+#
+# CREATE_NO_WINDOW gives the child its own console that is never shown. That is
+# what stops a black console box appearing beside the game, and it also detaches
+# the game from *our* console -- which matters more than the cosmetics. A child
+# sharing its parent's console receives CTRL_CLOSE_EVENT when that console is
+# closed, so closing the launcher's window was killing Minecraft.
+#
+# DETACHED_PROCESS would also do that but is mutually exclusive with
+# CREATE_NO_WINDOW, and it gives the child no console at all; the JVM is happier
+# with one it simply never shows.
+#
+# CREATE_NEW_PROCESS_GROUP keeps Ctrl+C in a terminal from reaching the game.
+#
+# CREATE_BREAKAWAY_FROM_JOB is the one that is conditional. Terminals, IDEs and
+# task runners often put their children in a job object marked kill-on-close, and
+# every process in such a job dies with it no matter how it was spawned. Breaking
+# out is the only way to survive that, but the call fails outright when the job
+# forbids breakaway, so it is attempted and then dropped rather than assumed.
+_CREATE_NO_WINDOW = 0x08000000
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def _popen_detached(
+    command: Sequence[str],
+    working_directory: Path,
+    handle: IO[bytes],
+) -> subprocess.Popen:
+    """Start the game so it outlives us, with no console window, still logging.
+
+    The log is the reason this is fiddly. Detaching a process is easy if you are
+    willing to throw its output away; here stdout and stderr must keep flowing
+    into ``handle``, because the exit code is not trustworthy -- the game exits 0
+    even when it fails to get a renderer -- and the log is the only place that
+    says what actually happened. So the handle is inherited as normal and only
+    the console and job behaviour are changed.
+    """
+    arguments: dict = {
+        "cwd": str(working_directory),
+        "stdout": handle,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+    }
+
+    if os.name != "nt":
+        # POSIX: a new session detaches from the controlling terminal, which is
+        # the equivalent of everything above.
+        arguments["start_new_session"] = True
+        return subprocess.Popen(list(command), **arguments)
+
+    base_flags = _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP
+
+    try:
+        return subprocess.Popen(
+            list(command), creationflags=base_flags | _CREATE_BREAKAWAY_FROM_JOB, **arguments
+        )
+    except OSError:
+        # The job we are in forbids breakaway. Everything else still applies, and
+        # a game that dies with a job-killing parent is no worse than before.
+        return subprocess.Popen(list(command), creationflags=base_flags, **arguments)
+
+
 def _spawn(
     command: Sequence[str],
     working_directory: Path,
@@ -208,13 +273,7 @@ def _spawn(
         pass
 
     try:
-        process = subprocess.Popen(
-            list(command),
-            cwd=str(working_directory),
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
+        process = _popen_detached(command, working_directory, handle)
     except OSError as exc:
         handle.close()
         raise LaunchError(f"Could not start {command[0]}: {exc}") from exc

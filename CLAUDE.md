@@ -34,6 +34,7 @@ gui/         customtkinter app (milestone 5)
 - `core/` must stay importable and testable without a GUI and without a login.
 - Type-hint public functions. Wrap library exceptions in our own error types so the
   GUI never sees a `minecraft_launcher_lib` traceback.
+- **Be consice with all of your responses**
 
 ## Environment
 

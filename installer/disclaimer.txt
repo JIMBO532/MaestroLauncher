@@ -1,0 +1,14 @@
+MaestroLauncher
+
+Not an official Minecraft product. Not approved by or associated with Mojang
+or Microsoft.
+
+Minecraft is a trademark of Mojang Studios. Game files are downloaded from
+Mojang; mods, resource packs and shaders are downloaded from Modrinth. You
+need your own Microsoft account that owns Minecraft: Java Edition in order to
+play.
+
+This launcher installs into your user profile and needs no administrator
+rights. It does not modify any existing Minecraft installation: versions it
+installs are added alongside whatever is already there, and each version runs
+in its own instance folder so mods for one version cannot reach another.

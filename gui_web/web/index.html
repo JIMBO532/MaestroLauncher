@@ -29,35 +29,46 @@
 
   <!-- Top right: account. The blocky head is the strongest Minecraft cue on the
        screen that costs no asset -- a generic skin silhouette, not anyone's. -->
-  <button class="account" type="button" aria-label="Sign in to your Microsoft account">
-    <span class="account__label">Sign in</span>
-    <span class="skin" aria-hidden="true">
-      <svg viewBox="0 0 8 8" shape-rendering="crispEdges">
-        <rect x="0" y="0" width="8" height="8" fill="#6b4b34"></rect>
-        <rect x="0" y="0" width="8" height="2" fill="#4a3323"></rect>
-        <rect x="1" y="3" width="6" height="4" fill="#b08160"></rect>
-        <rect x="0" y="3" width="1" height="4" fill="#8a6247"></rect>
-        <rect x="7" y="3" width="1" height="4" fill="#8a6247"></rect>
-        <rect x="2" y="4" width="1" height="1" fill="#ffffff"></rect>
-        <rect x="5" y="4" width="1" height="1" fill="#ffffff"></rect>
-        <rect x="2" y="4" width="1" height="1" fill="#3b5a9b"></rect>
-        <rect x="5" y="4" width="1" height="1" fill="#3b5a9b"></rect>
-      </svg>
-    </span>
-  </button>
+  <div class="account-wrap">
+    <button class="account" id="account-toggle" type="button" aria-label="Sign in to your Microsoft account">
+      <span class="account__label" id="account-label">Sign in</span>
+      <span class="skin" aria-hidden="true">
+        <svg viewBox="0 0 8 8" shape-rendering="crispEdges">
+          <rect x="0" y="0" width="8" height="8" fill="#6b4b34"></rect>
+          <rect x="0" y="0" width="8" height="2" fill="#4a3323"></rect>
+          <rect x="1" y="3" width="6" height="4" fill="#b08160"></rect>
+          <rect x="0" y="3" width="1" height="4" fill="#8a6247"></rect>
+          <rect x="7" y="3" width="1" height="4" fill="#8a6247"></rect>
+          <rect x="2" y="4" width="1" height="1" fill="#ffffff"></rect>
+          <rect x="5" y="4" width="1" height="1" fill="#ffffff"></rect>
+          <rect x="2" y="4" width="1" height="1" fill="#3b5a9b"></rect>
+          <rect x="5" y="4" width="1" height="1" fill="#3b5a9b"></rect>
+        </svg>
+      </span>
+    </button>
 
+    <!-- Only shown once signed in: signed out, the button itself is the
+         sign-in action and a menu holding one item would be in the way. -->
+    <div class="account-panel" id="account-panel" role="menu" aria-label="Account" hidden>
+      <div class="account-panel__name" id="account-panel-name"></div>
+      <button class="account-panel__item" id="account-sign-out" type="button" role="menuitem">Sign out</button>
+    </div>
+  </div>
+
+  <!-- Each icon carries its own label now rather than one shown on hover --
+       hovering to find out which icon does what is how this rail earned the
+       complaint that it was undiscoverable. -->
   <nav class="rail" aria-label="Sections">
-    <button class="rail__item" type="button" aria-label="Content">
-      <span class="rail__label" aria-hidden="true">Content</span>
+    <button class="rail__item" id="content-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="content-panel">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <polyline points="12 2 2 7 12 12 22 7 12 2"></polyline>
         <polyline points="2 17 12 22 22 17"></polyline>
         <polyline points="2 12 12 17 22 12"></polyline>
       </svg>
+      <span class="rail__item-label">Content</span>
     </button>
-    <button class="rail__item" id="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="settings-panel" aria-label="Settings">
-      <span class="rail__label" aria-hidden="true">Settings</span>
+    <button class="rail__item" id="settings-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="settings-panel">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <line x1="4" y1="7" x2="20" y2="7"></line>
@@ -67,53 +78,209 @@
         <circle cx="15" cy="12" r="2.2" fill="#0a0a0a"></circle>
         <circle cx="8" cy="17" r="2.2" fill="#0a0a0a"></circle>
       </svg>
+      <span class="rail__item-label">Settings</span>
     </button>
-    <button class="rail__item" type="button" aria-label="About">
-      <span class="rail__label" aria-hidden="true">About</span>
+    <button class="rail__item" id="about-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="about-panel">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="9.2"></circle>
         <line x1="12" y1="11" x2="12" y2="16.5"></line>
         <line x1="12" y1="7.6" x2="12.01" y2="7.6"></line>
       </svg>
+      <span class="rail__item-label">About</span>
     </button>
   </nav>
 
-  <!-- Only the choice of background image and its reset live here; the rest
-       of Settings is still a stub for a later slice. -->
+  <!-- Floating, no card behind it beyond the same panel treatment Settings
+       already uses -- just app name, the version read from core/__init__.py,
+       and the trademark notice. -->
+  <div class="about-panel" id="about-panel" role="dialog" aria-label="About" hidden>
+    <div class="about-panel__name">MaestroLauncher</div>
+    <div class="about-panel__version" id="about-version">Version &hellip;</div>
+    <p class="about-panel__notice">Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.</p>
+  </div>
+
+  <!-- Modrinth search, a type picker, results, and local import -- ported
+       from gui/app.py's Content tab. Results are filtered by the version
+       chosen in .version-menu and by Fabric, except resource packs and
+       shaders, which core.mods itself never applies a loader filter to. -->
+  <div class="content-panel" id="content-panel" role="dialog" aria-label="Content" hidden>
+    <div class="content-panel__type-picker" role="tablist" aria-label="Content type">
+      <button class="content-panel__type" type="button" data-type="mod" aria-selected="true">Mods</button>
+      <button class="content-panel__type" type="button" data-type="resourcepack" aria-selected="false">Resource packs</button>
+      <button class="content-panel__type" type="button" data-type="shader" aria-selected="false">Shaders</button>
+    </div>
+
+    <div class="content-panel__search-row">
+      <input type="text" id="content-search-input" class="content-panel__search"
+             placeholder="Search Modrinth&hellip;" autocomplete="off" spellcheck="false">
+      <button class="content-panel__search-button" id="content-search-button" type="button">Search</button>
+    </div>
+
+    <div class="content-panel__results" id="content-results">
+      <div class="content-panel__hint" id="content-hint">Search Modrinth for mods.</div>
+    </div>
+
+    <button class="content-panel__add-files" id="content-add-files" type="button">Add files from your computer&hellip;</button>
+
+    <div class="content-panel__dropzone" id="content-dropzone">Drop jars and pack zips here</div>
+  </div>
+
+  <template id="content-result-template">
+    <div class="content-panel__result">
+      <div class="content-panel__result-main">
+        <div class="content-panel__result-title"></div>
+        <div class="content-panel__result-meta"></div>
+      </div>
+      <button class="content-panel__result-install" type="button" data-state="not-installed">Install</button>
+    </div>
+  </template>
+
+  <input type="file" id="content-file-input" accept=".jar,.zip" multiple hidden>
+
+  <!-- RAM and the game folder show real values read from core/, and Browse /
+       Open instance folder are real OS actions -- but neither is threaded
+       into an actual install or launch yet. That wiring is a later slice. -->
   <div class="settings-panel" id="settings-panel" role="menu" aria-label="Settings" hidden>
-    <button class="settings-panel__item" type="button" role="menuitem" data-action="choose-background">Change background image&hellip;</button>
-    <button class="settings-panel__item settings-panel__item--reset" type="button" role="menuitem" data-action="reset-background">Reset to default</button>
+    <div class="settings-panel__scroll">
+      <div class="settings-panel__section">
+        <div class="settings-panel__section-label">Background</div>
+        <button class="settings-panel__item" type="button" role="menuitem" data-action="choose-background">Change background image&hellip;</button>
+        <button class="settings-panel__item settings-panel__item--reset" type="button" role="menuitem" data-action="reset-background">Reset to default</button>
+      </div>
+
+      <div class="settings-panel__section">
+        <div class="settings-panel__section-label">Memory allocated</div>
+        <div class="settings-panel__row">
+          <input type="range" id="ram-slider" class="settings-panel__slider"
+                 min="512" max="16384" step="512" value="2048"
+                 aria-label="Memory allocated to the game">
+          <span class="settings-panel__value" id="ram-value">2.0 GB</span>
+        </div>
+      </div>
+
+      <div class="settings-panel__section">
+        <div class="settings-panel__section-label">Game folder</div>
+        <div class="settings-panel__row">
+          <span class="settings-panel__path" id="game-folder-path" title="">Loading&hellip;</span>
+          <button class="settings-panel__mini-button" id="browse-folder" type="button">Browse</button>
+        </div>
+      </div>
+
+      <div class="settings-panel__section">
+        <button class="settings-panel__toggle-row" id="keep-open-toggle" type="button" role="switch" aria-checked="false">
+          <span>Keep launcher open after launching</span>
+          <span class="settings-panel__switch" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <div class="settings-panel__section">
+        <button class="settings-panel__item" id="open-instance-folder" type="button" role="menuitem" data-action="open-instance-folder">Open instance folder</button>
+      </div>
+    </div>
   </div>
   <input type="file" id="background-file-input" accept="image/png,image/jpeg" hidden>
 
   <div class="bottom-group">
     <div class="dock">
-      <button class="play" type="button">Play</button>
+      <button class="play" id="play-button" type="button">Play</button>
 
-      <button class="version" type="button" aria-label="Choose version. Currently 1.21.1 Fabric">
-        <span class="version__value">1.21.1 Fabric</span>
-        <svg class="version__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <polyline points="6 15 12 9 18 15"></polyline>
-        </svg>
-      </button>
+      <!-- The optimization pack's entry point: no second button next to Play,
+           it lives as a variant of the version already being chosen here. -->
+      <div class="version-wrap">
+        <button class="version" id="version-toggle" type="button"
+                aria-haspopup="listbox" aria-expanded="false" aria-controls="version-menu"
+                aria-label="Choose version">
+          <span class="version__value" id="version-label">Loading versions&hellip;</span>
+          <svg class="version__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 15 12 9 18 15"></polyline>
+          </svg>
+        </button>
+
+        <!-- Opens upward from the button rather than down over Play. Same
+             floating-panel treatment as the settings menu: no heavy card,
+             just enough separation from the screenshot to read as a menu.
+             Group markup lives in a <template> and is stamped out per
+             version by app.js -- there can be 100+ releases, so nothing
+             here is written out by hand. -->
+        <div class="version-menu" id="version-menu" role="listbox" aria-label="Version and profile" hidden>
+          <div class="version-menu__search-row">
+            <input type="text" id="version-search" class="version-menu__search"
+                   placeholder="Search versions&hellip;" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="version-menu__list" id="version-list">
+            <div class="version-menu__empty" id="version-empty">Loading versions&hellip;</div>
+          </div>
+        </div>
+      </div>
+
+      <template id="version-group-template">
+        <div class="version-menu__group" data-version="">
+          <div class="version-menu__group-label"></div>
+
+          <button class="version-menu__option" type="button" role="option"
+                  data-variant="fabric" data-state="not-installed" aria-selected="false">
+            <span class="version-menu__option-main">
+              <svg class="version-menu__check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="5 13 10 18 19 7"></polyline>
+              </svg>
+              <span class="version-menu__option-text">
+                <span class="version-menu__option-label">Fabric</span>
+                <span class="version-menu__progress" hidden>
+                  <span class="version-menu__progress-fill"></span>
+                </span>
+              </span>
+            </span>
+            <span class="version-menu__badge">Install</span>
+          </button>
+
+          <button class="version-menu__option" type="button" role="option"
+                  data-variant="optimized" data-state="not-installed" aria-selected="false">
+            <span class="version-menu__option-main">
+              <svg class="version-menu__check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="5 13 10 18 19 7"></polyline>
+              </svg>
+              <span class="version-menu__option-text">
+                <span class="version-menu__option-label">Fabric &middot; Optimized</span>
+                <span class="version-menu__progress" hidden>
+                  <span class="version-menu__progress-fill"></span>
+                </span>
+              </span>
+            </span>
+            <span class="version-menu__badge">Install</span>
+          </button>
+        </div>
+      </template>
     </div>
 
-    <!-- Centred under Play as a group. Green is state and only ever state, so
-         the dot is the one place it appears. Placeholder values in slice 1;
-         nothing behind them yet. -->
-    <div class="status">
-      <div class="status__item">
-        <span class="status__key">Installed</span>
-        <span class="status__value">1.21.1 &middot; Fabric</span>
+    <!-- One progress bar and one status line for every job, the way
+         gui/app.py's shared footer works: an install, a pack install, a mod
+         download and a launch all report here rather than each growing its
+         own readout. Both sit in one flex child so they stay tight together
+         under Play instead of taking the bottom group's full gap. -->
+    <div class="foot">
+      <div class="job" id="job" hidden>
+        <span class="job__fill" id="job-fill"></span>
       </div>
-      <span class="status__rule" aria-hidden="true"></span>
-      <div class="status__item">
-        <span class="status__key">Mojang</span>
-        <span class="status__value">
-          <span class="dot" aria-hidden="true"></span>Online
-        </span>
+      <div class="job-status" id="job-status" role="status" aria-live="polite"></div>
+
+      <!-- Centred under Play as a group. Green is state and only ever state,
+           so the dot and the bar above are the only places it appears. -->
+      <div class="status">
+        <div class="status__item">
+          <span class="status__key">Selected</span>
+          <span class="status__value" id="status-installed">&mdash;</span>
+        </div>
+        <span class="status__rule" aria-hidden="true"></span>
+        <div class="status__item">
+          <span class="status__key">Account</span>
+          <span class="status__value" id="status-account">
+            <span class="dot" id="status-dot" data-state="off" aria-hidden="true"></span><span id="status-account-text">Signed out</span>
+          </span>
+        </div>
       </div>
     </div>
   </div>

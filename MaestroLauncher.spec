@@ -4,29 +4,40 @@
     pyinstaller MaestroLauncher.spec
 
 Produces a single launcher/MaestroLauncher.exe. ``launcher/`` is gitignored, so
-the 38 MB binary has one place to live and no way to reach a commit. It used to
-build to dist/ and be copied to the repo root afterwards, which left the exe
-sitting next to the source and relying on a bare ``*.exe`` ignore rule.
+the binary has one place to live and no way to reach a commit. It used to build
+to dist/ and be copied to the repo root afterwards, which left the exe sitting
+next to the source and relying on a bare ``*.exe`` ignore rule.
 
-Two packages need their data files carried in by hand, because neither is found
-by following imports alone:
+What has to be carried in by hand, because following imports does not find it:
 
-* tkinterdnd2 loads its tkdnd Tcl package at runtime from
-  ``os.path.dirname(__file__)/tkdnd/<platform>``, and on Tcl 9 from the
-  ``-tcl9`` variant of that folder. Those are .tcl scripts and a .dll that
-  nothing imports, so PyInstaller does not see them. They are copied to
-  ``tkinterdnd2/tkdnd`` inside the bundle, which is exactly where that
-  dirname(__file__) lookup lands once the archive is unpacked. Miss this and
-  the app still starts, but ``TkinterDnD._require`` fails and the drop zone
-  turns itself off.
-* customtkinter reads its themes and assets from disk at import time.
+* **gui_web/web/** -- the whole frontend. index.html, app.js, styles.css and
+  assets/ (the background screenshot and the logo) are read off disk at
+  runtime and imported by nothing, so PyInstaller has no way to see them.
+  Miss this and the exe starts, finds no index.html, and raises the
+  FileNotFoundError create_window() throws on purpose rather than opening an
+  empty window. The destination path matters as much as the source: app.py's
+  _web_root() looks for ``<sys._MEIPASS>/gui_web/web``, so that is exactly
+  where this has to land.
+
+The icon is built from the launcher's own logo by installer/make_icon.py and
+is referenced here rather than embedded, so the exe, the Start Menu shortcut
+and the installer all show the same mark.
+
+pywebview's own data files (its injected api.js/finish.js and the backend
+hiddenimports) are NOT listed here: pywebview ships a PyInstaller hook of its
+own at webview/__pyinstaller/hook-webview.py, which PyInstaller discovers
+through the package's pyinstaller40 entry point and applies automatically.
+
+The CustomTkinter app in gui/ is no longer the entry point and is deliberately
+not packaged, so customtkinter's themes and tkinterdnd2's tkdnd Tcl package --
+both of which used to need hand-carrying here for exactly the same reason
+gui_web/web does -- are gone from this spec. gui/ still runs from source with
+``python -m gui.app``.
 """
 
 from pathlib import Path
 
-import tkinterdnd2
 from PyInstaller.config import CONF
-from PyInstaller.utils.hooks import collect_data_files
 
 # Build into launcher/ instead of dist/.
 #
@@ -39,10 +50,16 @@ OUTPUT_DIR = Path(SPECPATH) / "launcher"  # noqa: F821 -- SPECPATH is injected
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CONF["distpath"] = str(OUTPUT_DIR)
 
-TKDND_SOURCE = Path(tkinterdnd2.__file__).parent / "tkdnd"
+WEB_SOURCE = Path(SPECPATH) / "gui_web" / "web"  # noqa: F821
+ICON = Path(SPECPATH) / "installer" / "MaestroLauncher.ico"  # noqa: F821
 
-datas = [(str(TKDND_SOURCE), "tkinterdnd2/tkdnd")]
-datas += collect_data_files("customtkinter")
+# Fail the build rather than produce an exe that cannot find its own frontend.
+# A missing data file is silent at build time and fatal at run time, which is
+# the worst order for it to be discovered in.
+if not (WEB_SOURCE / "index.html").is_file():
+    raise SystemExit(f"Frontend missing at build time: {WEB_SOURCE / 'index.html'}")
+
+datas = [(str(WEB_SOURCE), "gui_web/web")]
 
 a = Analysis(
     ["main.py"],
@@ -79,4 +96,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(ICON),
 )

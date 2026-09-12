@@ -15,7 +15,23 @@ Not a coding task. Runs in parallel with M1.
       confidential client and Azure then rejects the login with AADSTS70002,
       demanding a client secret that this PKCE public-client flow does not use.
 - [x] Submit the Minecraft API permission request form
-- [x] Store the client ID in `.env` (gitignored), never commit it
+- [x] Ship the client ID with the app; keep `.env` as a development override
+
+The client ID is **not a secret** and is committed, in `gui_web/app.py`. An
+earlier version of this note said to keep it out of the repo; that was wrong.
+This is a PKCE public client -- the OAuth flow that exists specifically for
+apps that cannot hold a secret, which is every desktop app, because anything
+compiled into one can be read back out of it. The ID names the application and
+authorises nothing by itself; the registered redirect URI and the PKCE
+challenge are what stop another app from using it to obtain tokens. Desktop
+clients are expected to ship theirs.
+
+The alternative -- every person who installs this registering their own Azure
+app and waiting for Mojang to approve it -- is not something anyone would do,
+and would make the packaged installer useless on arrival.
+
+`.env` is still read first, so a development build can point at a different app
+registration without editing the source.
 
 Without approval, `api.minecraftservices.com` returns 403 and login cannot work.
 Approval is not instant. Submit it before writing any auth code.
@@ -127,7 +143,7 @@ bottom-centre with the version selector as small text beside it, and a vertical
 icon rail on the right edge for Content, Settings and About. Nothing else.
 
 - [x] Slice 1: static shell in `gui_web/`, nothing wired to `core/`
-- [ ] Slice 2: version list and install wired through to `core/`
-- [ ] Slice 3: content browsing and local file import
-- [ ] Slice 4: account and launching
+- [x] Slice 2: version list and install wired through to `core/`
+- [x] Slice 3: content browsing and local file import
+- [x] Slice 4: account and launching
 - [ ] Retire `gui/` once the web frontend covers everything it did

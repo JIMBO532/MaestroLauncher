@@ -221,6 +221,93 @@ html, body {
 .account:hover .skin { filter: none; transform: translateY(-1px); }
 .account:active { transform: scale(0.98); }
 
+/* Signed in, the name is the label, so it gets the weight a name deserves
+   rather than the tracked-out caps a "SIGN IN" instruction wants. */
+.account[data-signed-in="true"] { color: var(--fg); }
+.account[data-signed-in="true"] .account__label {
+  text-transform: none;
+  letter-spacing: 0.04em;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.account[data-signed-in="true"] .skin { filter: none; }
+
+.account-wrap {
+  position: absolute;
+  top: clamp(30px, 4vh, 50px);
+  right: var(--edge);
+}
+
+/* The account button sits inside the wrap now, so its own absolute anchor
+   moves up here and it lays out normally within it. */
+.account-wrap .account {
+  position: static;
+  top: auto;
+  right: auto;
+}
+
+.account-panel {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  min-width: 180px;
+  padding: 6px;
+  background: rgba(10, 10, 10, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.account-panel[hidden] { display: none; }
+
+.account-panel__name {
+  padding: 8px 12px 6px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-panel__item {
+  width: 100%;
+  padding: 11px 12px;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.account-panel__item:hover { background-color: rgba(255, 255, 255, 0.08); }
+
+/* ------------------------------------------------------------ busy state */
+
+/* A locked control says so: dimmed, no hover lift, and the cursor stops
+   promising anything. A button that keeps looking clickable while a job runs
+   is the thing that gets pressed twice. */
+[disabled], .is-locked {
+  opacity: 0.45;
+  cursor: default !important;
+  pointer-events: none;
+}
+
+.play[disabled]:hover,
+.play.is-locked:hover {
+  background: var(--blue);
+  transform: none;
+  box-shadow: none;
+}
+
 /* ---------------------------------------------------------------- the rail */
 
 .rail {
@@ -233,12 +320,18 @@ html, body {
   gap: 10px;
 }
 
+/* Icon and its label stacked, both always visible -- a label that only
+   appeared on hover meant there was no way to tell Content from About
+   without trying each one first. 44px was the icon alone; the button now
+   has to be measured as a whole, and it clears 44x44 with room over. */
 .rail__item {
-  position: relative;
-  display: grid;
-  place-items: center;
-  width: 44px;                 /* 44x44 minimum touch/click target */
-  height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 64px;
+  padding: 9px 4px 8px;
   background: none;
   border: 0;
   border-radius: 14px;
@@ -254,6 +347,15 @@ html, body {
 
 .rail__item svg { width: 20px; height: 20px; }
 
+.rail__item-label {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  /* Inherits color from .rail__item, so hover/focus brightens both the icon
+     and its label together without a second rule. */
+}
+
 .rail__item:hover {
   color: var(--fg);
   background-color: rgba(255, 255, 255, 0.1);
@@ -261,58 +363,58 @@ html, body {
 
 .rail__item:active { transform: scale(0.94); }
 
-/* The rail has no visible text, so what each icon does is invisible until
-   hovered -- a small label flags out to the left of it, clear of the icon
-   itself. */
-.rail__label {
-  position: absolute;
-  right: calc(100% + 12px);
-  top: 50%;
-  transform: translateY(-50%) translateX(6px);
-  white-space: nowrap;
-  padding: 7px 12px;
-  background: rgba(10, 10, 10, 0.85);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  color: var(--fg);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity var(--base) var(--ease), transform var(--base) var(--ease);
-}
-
-.rail__item:hover .rail__label,
-.rail__item:focus-visible .rail__label {
-  opacity: 1;
-  transform: translateY(-50%) translateX(0);
-}
-
 /* ------------------------------------------------------------ the settings
    panel -- the one deliberate exception to "nothing sits in a panel": a
-   background file and a reset action need somewhere to live, and a menu is
-   the honest way to hold two buttons. Anchored off the rail like the hover
-   labels are, not centred on the window. */
+   handful of real controls need somewhere to live, and a menu is the honest
+   way to hold them. Anchored off the rail, vertically centred on the
+   Settings icon rather than pinned by a hand-tuned offset, because the
+   panel is tall enough now that a fixed offset would risk running off the
+   top or bottom of a short window. Capped height plus an inner scroller
+   guards the same case. */
 .settings-panel {
   position: absolute;
   top: 50%;
-  right: calc(var(--edge) + 44px + 14px);
-  transform: translateY(-72px);
+  right: calc(var(--edge) + 64px + 14px);
+  transform: translateY(-50%);
+  width: 300px;
+  max-height: min(72vh, 560px);
   display: flex;
   flex-direction: column;
-  min-width: 220px;
   padding: 6px;
-  background: rgba(10, 10, 10, 0.9);
+  background: rgba(10, 10, 10, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 12px;
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
 }
 
 .settings-panel[hidden] { display: none; }
 
+.settings-panel__scroll {
+  overflow-y: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-panel__section { padding: 4px 0; }
+
+.settings-panel__section + .settings-panel__section {
+  margin-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settings-panel__section-label {
+  padding: 10px 14px 2px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 .settings-panel__item {
+  width: 100%;
   padding: 12px 14px;
   background: none;
   border: 0;
@@ -331,6 +433,422 @@ html, body {
 
 .settings-panel__item--reset { color: var(--muted); }
 .settings-panel__item--reset:hover { color: var(--fg); }
+
+.settings-panel__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px 12px;
+}
+
+.settings-panel__value {
+  flex: none;
+  min-width: 52px;
+  text-align: right;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-panel__path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.settings-panel__mini-button {
+  flex: none;
+  padding: 7px 12px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease), border-color var(--base) var(--ease);
+}
+
+.settings-panel__mini-button:hover {
+  background: rgba(255, 255, 255, 0.14);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+/* No blue here on purpose -- royal blue is reserved for Play and installs,
+   and a slider fill is neither, so it stays in the white/grey family like
+   everything else on the screen. */
+.settings-panel__slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.16);
+  outline: none;
+  cursor: pointer;
+}
+
+.settings-panel__slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  background: var(--fg);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+.settings-panel__toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.settings-panel__toggle-row:hover { background-color: rgba(255, 255, 255, 0.08); }
+
+.settings-panel__switch {
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.16);
+  transition: background-color var(--base) var(--ease);
+}
+
+.settings-panel__switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--fg);
+  transition: transform var(--base) var(--ease);
+}
+
+.settings-panel__toggle-row[aria-checked="true"] .settings-panel__switch {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.settings-panel__toggle-row[aria-checked="true"] .settings-panel__switch::after {
+  transform: translateX(14px);
+}
+
+/* ------------------------------------------------------------ about panel */
+
+/* The smallest of the floating panels -- static text, no controls, so it
+   gets no scroller and no fixed height. Same anchor as Settings: centred on
+   the rail rather than hand-measured against the About icon specifically. */
+.about-panel {
+  position: absolute;
+  top: 50%;
+  right: calc(var(--edge) + 64px + 14px);
+  transform: translateY(-50%);
+  width: 260px;
+  padding: 22px 20px;
+  background: rgba(10, 10, 10, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
+
+.about-panel[hidden] { display: none; }
+
+.about-panel__name {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--fg);
+}
+
+.about-panel__version {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.about-panel__notice {
+  margin: 14px 0 0;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------- content panel */
+
+/* The biggest floating panel here, for the same reason Settings and the
+   version menu earned the exception in the first place: a search box, a
+   type picker, a scrollable result list and a dropzone need somewhere to
+   live, and that is more than "a menu holding a couple of buttons" but the
+   same honest idea. */
+/* Top- and bottom-anchored rather than centred like Settings/About: this
+   panel is tall enough, with a real results list in it, that centring it
+   let it grow straight down into the dock and the version selector. Setting
+   both edges makes the browser size the box to fit exactly what is left
+   between them, on any window height.
+
+   The bottom edge tracks --dock-clearance, which app.js measures from the
+   real bottom group. A hand-picked offset here was already wrong once: the
+   progress bar and status line made that group taller and the panel started
+   overlapping Play again. Measuring means it cannot drift a second time. */
+.content-panel {
+  position: absolute;
+  top: clamp(70px, 10vh, 110px);
+  bottom: var(--dock-clearance, 220px);
+  right: calc(var(--edge) + 64px + 14px);
+  width: 380px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 10, 10, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.content-panel[hidden] { display: none; }
+
+.content-panel__type-picker {
+  flex: none;
+  display: flex;
+  gap: 4px;
+  padding: 10px 10px 6px;
+}
+
+.content-panel__type {
+  flex: 1 1 0;
+  padding: 8px 6px;
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease), color var(--base) var(--ease);
+}
+
+.content-panel__type:hover { color: var(--fg); }
+
+.content-panel__type[aria-selected="true"] {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--fg);
+}
+
+.content-panel__search-row {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 4px 10px 8px;
+}
+
+.content-panel__search {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12.5px;
+  outline: none;
+  transition: background-color var(--base) var(--ease), border-color var(--base) var(--ease);
+}
+
+.content-panel__search::placeholder { color: var(--muted); }
+
+.content-panel__search:focus {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+/* The one other blue in this panel besides an install action -- Search is
+   what starts the Modrinth request, which is close enough kin to "install"
+   that a second colour for it would be the thing that looked wrong. */
+.content-panel__search-button {
+  flex: none;
+  padding: 10px 16px;
+  background: var(--blue);
+  border: 0;
+  border-radius: 9px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.content-panel__search-button:hover { background: var(--blue-lift); }
+
+.content-panel__results {
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 2px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.content-panel__hint {
+  padding: 26px 14px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.content-panel__hint[hidden] { display: none; }
+
+.content-panel__result {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 8px;
+  border-radius: 9px;
+  transition: background-color var(--base) var(--ease);
+}
+
+.content-panel__result:hover { background: rgba(255, 255, 255, 0.05); }
+
+.content-panel__result-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.content-panel__result-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.content-panel__result-meta {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.content-panel__result-install {
+  flex: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--blue);
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.content-panel__result-install:hover { background: var(--blue-lift); }
+
+/* Once installed this stops being a button in anything but markup -- it is
+   reporting state, which is exactly what green is for elsewhere on this
+   screen and the one other place it is allowed to appear. */
+.content-panel__result-install[data-state="installed"] {
+  background: none;
+  color: var(--green);
+  cursor: default;
+}
+
+.content-panel__result-install[data-state="installing"] {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--muted);
+  cursor: default;
+}
+
+.content-panel__add-files {
+  flex: none;
+  margin: 6px 10px 0;
+  padding: 11px 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease), border-color var(--base) var(--ease);
+}
+
+.content-panel__add-files:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.content-panel__dropzone {
+  flex: none;
+  margin: 8px 10px 10px;
+  padding: 14px;
+  border: 1.5px dashed rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  transition: border-color var(--base) var(--ease),
+              background-color var(--base) var(--ease),
+              color var(--base) var(--ease);
+}
+
+.content-panel__dropzone.is-active {
+  border-color: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--fg);
+}
+
+.content-panel__results::-webkit-scrollbar { width: 8px; }
+.content-panel__results::-webkit-scrollbar-track { background: transparent; }
+.content-panel__results::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+.content-panel__results::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
 
 /* ------------------------------------------------------------ bottom group */
 
@@ -421,12 +939,211 @@ html, body {
               border-color var(--base) var(--ease);
 }
 
-.version__chevron { width: 15px; height: 15px; }
-.version:hover {
+.version__chevron {
+  width: 15px;
+  height: 15px;
+  transition: transform var(--base) var(--ease);
+}
+
+.version:hover,
+.version[aria-expanded="true"] {
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.32);
 }
+
+.version[aria-expanded="true"] .version__chevron { transform: rotate(180deg); }
+
 .version:active { transform: scale(0.98); }
+
+/* Only a positioning context for the menu -- the button inside keeps its own
+   size, this just gives ``bottom: 100%`` something to open upward from. */
+.version-wrap { position: relative; }
+
+/* Same floating-panel treatment as .settings-panel: no card sits on this
+   screen normally, but a list of choices needs somewhere to live, and a menu
+   is the honest way to hold one. Opens upward, clear of Play, rather than
+   down over it.
+
+   Fixed-height flex column rather than growing to fit: 100+ releases would
+   otherwise stretch the panel off the top of the window. The search box
+   stays put in its own row; only .version-menu__list scrolls. */
+.version-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 12px);
+  min-width: 300px;
+  max-height: min(58vh, 460px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 10, 10, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 14px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+
+.version-menu[hidden] { display: none; }
+
+.version-menu__search-row {
+  flex: none;
+  padding: 8px 8px 6px;
+}
+
+.version-menu__search {
+  width: 100%;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  outline: none;
+  transition: background-color var(--base) var(--ease), border-color var(--base) var(--ease);
+}
+
+.version-menu__search::placeholder { color: var(--muted); }
+
+.version-menu__search:focus {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.32);
+}
+
+.version-menu__list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 6px 6px;
+}
+
+/* This list is the one place on the whole screen more than a screenful of
+   content can sit, so unlike everywhere else here, its scrollbar is allowed
+   to be visible -- just kept thin and quiet. */
+.version-menu__list::-webkit-scrollbar,
+.settings-panel__scroll::-webkit-scrollbar { width: 8px; }
+.version-menu__list::-webkit-scrollbar-track,
+.settings-panel__scroll::-webkit-scrollbar-track { background: transparent; }
+.version-menu__list::-webkit-scrollbar-thumb,
+.settings-panel__scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+.version-menu__list::-webkit-scrollbar-thumb:hover,
+.settings-panel__scroll::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
+
+.version-menu__empty {
+  padding: 22px 12px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.version-menu__group-label {
+  padding: 8px 12px 4px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.version-menu__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px;
+  background: none;
+  border: 0;
+  border-radius: 9px;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--base) var(--ease);
+}
+
+.version-menu__option:hover { background-color: rgba(255, 255, 255, 0.08); }
+
+.version-menu__option-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.version-menu__option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Hollow until selected -- a filled dot reads as "on" before the user has
+   chosen anything, which the very first render of this menu shouldn't say. */
+.version-menu__check {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--blue-lift);
+  opacity: 0;
+  transition: opacity var(--base) var(--ease);
+}
+
+.version-menu__option[aria-selected="true"] .version-menu__check { opacity: 1; }
+
+/* The one badge on the screen, and it earns the exception the same way Play
+   does: it is an install action, and blue is reserved for exactly that. */
+.version-menu__badge {
+  flex: none;
+  padding: 6px 12px;
+  border-radius: 999px;
+  background: var(--blue);
+  color: var(--fg);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  transition: background-color var(--base) var(--ease);
+}
+
+.version-menu__option:hover .version-menu__badge { background: var(--blue-lift); }
+
+.version-menu__option[data-state="installing"] .version-menu__badge,
+.version-menu__option[data-state="installed"] .version-menu__badge {
+  display: none;
+}
+
+.version-menu__progress {
+  width: 100%;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.version-menu__progress[hidden] { display: none; }
+
+.version-menu__progress-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: var(--blue-lift);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 120ms linear;
+}
 
 /* -------------------------------------------------------------- the status */
 
@@ -434,6 +1151,55 @@ html, body {
    edge, no panel behind them. Centred under Play as part of .bottom-group
    rather than pinned to the left -- pinned left, it was the only thing on
    the screen with nothing answering it on the right. */
+/* Progress bar, status line and the standing facts, stacked tight. They are
+   one flex child of .bottom-group so the generous gap under Play applies
+   once, above the whole group, rather than between each of these. */
+.foot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+/* The bar reports work in flight and is simply absent at rest, rather than
+   sitting empty as a permanent trough under Play. Green because progress is
+   state, and state is the one thing green is for here. */
+.job {
+  width: clamp(260px, 30vw, 420px);
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.14);
+  overflow: hidden;
+}
+
+.job[hidden] { display: none; }
+
+.job__fill {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: var(--green);
+  transform: scaleX(0);
+  transform-origin: left center;
+  /* transform, not width: scaling keeps every tick off the layout path. */
+  transition: transform 120ms linear;
+}
+
+/* Holds its line whether or not there is anything to say, so nothing below
+   it moves when a job starts or finishes. */
+.job-status {
+  min-height: 15px;
+  max-width: min(70vw, 720px);
+  text-align: center;
+  font-size: 11.5px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  color: var(--muted);
+}
+
+.job-status[data-tone="error"] { color: #ff9c8f; }   /* 6.4:1 on the scrimmed base */
+
 .status {
   display: flex;
   align-items: center;
@@ -482,6 +1248,13 @@ html, body {
   border-radius: 50%;
   background: var(--green);
   box-shadow: 0 0 8px rgba(92, 184, 92, 0.55);
+}
+
+/* Signed out is an absence, not a fault, so the dot goes quiet rather than
+   red -- red here would read as something having gone wrong. */
+.dot[data-state="off"] {
+  background: var(--muted-dim);
+  box-shadow: none;
 }
 
 /* ---------------------------------------------------------- the dropzone */

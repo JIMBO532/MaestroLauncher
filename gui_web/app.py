@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
 import io
 import json
+import logging
+import logging.handlers
 import os
 import re
 import sys
@@ -47,7 +50,7 @@ import webview
 from PIL import Image, UnidentifiedImageError
 
 from core import __version__ as APP_VERSION
-from core import auth, imports, installer, launch, mods
+from core import auth, imports, installer, launch, mods, singleton
 from core.auth import Account, AuthError, LoginCancelled, LoginRequired
 from core.installer import InstallError, Progress
 from core.launch import LaunchError
@@ -107,6 +110,30 @@ def data_dir() -> Path:
 
 def custom_background_path() -> Path:
     return data_dir() / "background.jpg"
+
+
+def _configure_logging() -> logging.Logger:
+    """The launcher's own log, separate from the per-game logs core.launch
+    writes under the game directory.
+
+    Those only exist once a game process actually spawns. A Play press that
+    fails earlier -- install check, sign-in check, building the launch
+    command -- used to leave nothing behind at all. This is what a future
+    occurrence of that gets to point at instead.
+    """
+    logger = logging.getLogger("maestro")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    handler = logging.handlers.RotatingFileHandler(
+        data_dir() / "launcher.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+LOG = _configure_logging()
 
 
 def _compress_to_jpeg(raw: bytes) -> bytes:
@@ -345,14 +372,17 @@ class Api:
 
     def _status(self, text: str) -> None:
         """Say what is happening. Stays up until something replaces it."""
+        LOG.info(text)
         self._push("job", "onStatus", text)
 
     def _result(self, text: str) -> None:
         """Report a finished job. Clears itself after a few seconds."""
+        LOG.info(text)
         self._push("job", "onResult", text)
 
     def _failed(self, text: str) -> None:
         """Report a problem. Stays up until the next action."""
+        LOG.error(text)
         self._push("job", "onError", text)
 
     def _reporter(self) -> Callable[[Progress], None]:
@@ -638,14 +668,22 @@ class Api:
         files happen to be on disk already is not a decision worth making
         anyone take.
         """
+        # This entry is logged unconditionally, before any of the checks
+        # below, so a press that produces no visible result at all still
+        # proves the call reached Python and shows exactly which check (if
+        # any) turned it away.
+        LOG.info("play() called: version=%r variant=%r memory_mb=%r", version, variant, memory_mb)
         if not version:
+            LOG.warning("play() refused: no version selected.")
             return {"ok": False, "error": "Pick a version first."}
         if self._account is None or not self._account.access_token:
+            LOG.warning("play() refused: not signed in (account=%r).", self._account)
             return {
                 "ok": False,
                 "error": "Sign in first -- Minecraft will not start without an account.",
             }
         if not self._claim():
+            LOG.warning("play() refused: another job is already running.")
             return {"ok": False, "error": "Something else is still running."}
         threading.Thread(
             target=self._play_worker,
@@ -656,6 +694,9 @@ class Api:
         return {"ok": True}
 
     def _play_worker(self, version: str, variant: str, memory_mb: int) -> None:
+        LOG.info(
+            "Play worker started: version=%s variant=%s memory_mb=%s", version, variant, memory_mb
+        )
         account = self._account
         directory = installer.default_directory()
         report = self._reporter()
@@ -677,6 +718,17 @@ class Api:
             for note in installer.link_shared_data(game_directory, directory):
                 self._status(note)
 
+            # Logged (not shown as status) because this is the exact call that
+            # either produces a game log or doesn't -- the detail a bare
+            # exception message below would otherwise lose.
+            LOG.info(
+                "Constructing launch command: profile=%s directory=%s game_directory=%s "
+                "memory_mb=%s",
+                profile_id,
+                directory,
+                game_directory,
+                memory_mb,
+            )
             game = launch.launch(
                 profile_id,
                 directory,
@@ -687,10 +739,12 @@ class Api:
                 game_directory=game_directory,
             )
         except (InstallError, ModError, LaunchError) as exc:
+            LOG.exception("Play failed for %s/%s", version, variant)
             self._failed(f"Could not start the game: {exc}")
             self._release()
             return
         except Exception as exc:  # noqa: BLE001 -- the page must never see a traceback
+            LOG.exception("Play failed unexpectedly for %s/%s", version, variant)
             self._failed(f"Could not start the game: {exc}")
             self._release()
             return
@@ -775,6 +829,7 @@ class Api:
         if variant == "optimized":
             profile_id = installer.optimized_profile_id(version)
             if installer.is_installed(profile_id, directory):
+                self._status(f"{profile_id} is already installed.")
                 return profile_id
 
             self._status(f"Installing Minecraft {version} and Fabric...")
@@ -804,6 +859,7 @@ class Api:
 
         existing = _installed_fabric_profile(version, directory)
         if existing is not None:
+            self._status(f"{existing} is already installed.")
             return existing
 
         self._status(f"Installing Minecraft {version} with Fabric and Sodium...")
@@ -1110,6 +1166,15 @@ def create_window() -> "webview.Window":
 
 
 def main() -> int:
+    if not singleton.acquire():
+        LOG.warning("Refusing to start: another MaestroLauncher instance is already running.")
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "MaestroLauncher is already running.",
+            WINDOW_TITLE,
+            0x40,  # MB_ICONINFORMATION
+        )
+        return 0
     create_window()
     webview.start()
     return 0

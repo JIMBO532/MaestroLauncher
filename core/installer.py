@@ -390,6 +390,40 @@ def _make_directory_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
+def _acquire_link_lock(shared: Path):
+    """Exclusive lock scoped to one shared-data directory's linking.
+
+    ``link_shared_data`` reads a reparse point, then maybe unlinks and
+    recreates it -- a check-then-act sequence that is not safe under
+    concurrent callers. Two launches racing (two threads in one process, or
+    two MaestroLauncher processes pointed at the same .minecraft) can both
+    see "not linked yet" and both act on it. The in-process busy lock in
+    gui_web/app.py cannot help here -- it says nothing about a second
+    process -- so this has to be a real lock this function owns itself.
+
+    A lock file next to the shared data, not a ``threading.Lock``: a
+    ``Lock`` only ever protects threads inside this one process.
+    """
+    shared.mkdir(parents=True, exist_ok=True)
+    handle = open(shared / ".link.lock", "a+b")
+    if os.name == "nt":
+        import msvcrt
+
+        # LK_LOCK retries for ~10s before raising -- ample margin for a
+        # section that only ever touches the filesystem, never the network.
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    return handle
+
+
+def _release_link_lock(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    handle.close()
+
+
 def _merge_into(source: Path, target: Path) -> list[str]:
     """Move source's entries into target without overwriting. Returns collisions.
 
@@ -426,81 +460,103 @@ def link_shared_data(instance: Path | str, directory: Path | str) -> list[str]:
     Safe to call before every launch: an instance already linked is left alone,
     so this is how a newly created instance and a long-standing one end up in the
     same state.
+
+    Safe to call concurrently, too -- from two threads or two separate
+    MaestroLauncher processes pointed at the same .minecraft. The whole body
+    runs under a lock scoped to this ``.minecraft``'s shared-data directory
+    (see ``_acquire_link_lock``), and creating something that turns out to
+    already be there -- the other side of the same race -- is treated as
+    success, not failure.
     """
     instance_path = Path(instance).expanduser()
     shared = shared_data_directory(directory)
     notes: list[str] = []
 
     instance_path.mkdir(parents=True, exist_ok=True)
-    shared.mkdir(parents=True, exist_ok=True)
 
-    for name in SHARED_DIRECTORIES:
-        target = shared / name
-        target.mkdir(parents=True, exist_ok=True)
-        link = instance_path / name
+    lock = _acquire_link_lock(shared)
+    try:
+        for name in SHARED_DIRECTORIES:
+            target = shared / name
+            target.mkdir(parents=True, exist_ok=True)
+            link = instance_path / name
 
-        if _is_link_to(link, target):
-            continue
-
-        if link.is_dir() and not os.path.isjunction(str(link)) and not link.is_symlink():
-            # A real folder already here, possibly with worlds in it.
-            collisions = _merge_into(link, target)
-            moved = not collisions
-            try:
-                link.rmdir()
-            except OSError:
-                # Not empty, so something stayed behind. Leave it exactly as it
-                # is rather than deleting anything, and say so.
-                notes.append(
-                    f"{link} still holds {', '.join(collisions) or 'files'} that "
-                    f"could not be merged into {target} (same name already there); "
-                    "it is not shared until you move them yourself"
-                )
+            if _is_link_to(link, target):
                 continue
-            if moved and collisions == []:
-                pass
-        elif link.exists() or link.is_symlink():
-            # A stale link somewhere else, or a file where a folder should be.
-            try:
-                if os.path.isjunction(str(link)) or link.is_symlink():
-                    link.unlink()
-                else:
-                    notes.append(f"{link} is a file, so {name} could not be shared")
+
+            if link.is_dir() and not os.path.isjunction(str(link)) and not link.is_symlink():
+                # A real folder already here, possibly with worlds in it.
+                collisions = _merge_into(link, target)
+                moved = not collisions
+                try:
+                    link.rmdir()
+                except OSError:
+                    # Not empty, so something stayed behind. Leave it exactly as
+                    # it is rather than deleting anything, and say so.
+                    notes.append(
+                        f"{link} still holds {', '.join(collisions) or 'files'} that "
+                        f"could not be merged into {target} (same name already "
+                        "there); it is not shared until you move them yourself"
+                    )
                     continue
+                if moved and collisions == []:
+                    pass
+            elif link.exists() or link.is_symlink():
+                # A stale link somewhere else, or a file where a folder should be.
+                try:
+                    if os.path.isjunction(str(link)) or link.is_symlink():
+                        link.unlink()
+                    else:
+                        notes.append(f"{link} is a file, so {name} could not be shared")
+                        continue
+                except OSError as exc:
+                    notes.append(f"Could not replace {link}: {exc}")
+                    continue
+
+            try:
+                _make_directory_link(link, target)
             except OSError as exc:
-                notes.append(f"Could not replace {link}: {exc}")
-                continue
+                # Someone else -- another thread, another process, the lock
+                # above only helps against callers that also take it -- may
+                # have created the exact same link between our check above
+                # and this attempt. That is the outcome we wanted; only a
+                # link to something else is a real problem.
+                if not _is_link_to(link, target):
+                    notes.append(f"Could not share {name}: {exc}")
 
-        try:
-            _make_directory_link(link, target)
-        except OSError as exc:
-            notes.append(f"Could not share {name}: {exc}")
+        for name in SHARED_FILES:
+            target = shared / name
+            link = instance_path / name
 
-    for name in SHARED_FILES:
-        target = shared / name
-        link = instance_path / name
+            try:
+                if link.exists() and target.exists() and link.samefile(target):
+                    continue
+            except OSError:
+                pass
 
-        try:
-            if link.exists() and target.exists() and link.samefile(target):
-                continue
-        except OSError:
-            pass
+            try:
+                if link.is_file() and not target.exists():
+                    # First instance to be linked donates its settings to everyone.
+                    shutil.move(str(link), str(target))
+                elif link.exists():
+                    link.unlink()
 
-        try:
-            if link.is_file() and not target.exists():
-                # First instance to be linked donates its settings to everyone.
-                shutil.move(str(link), str(target))
-            elif link.exists():
-                link.unlink()
+                if not target.exists():
+                    # The game writes this on first run; the link has to exist
+                    # before then or the game simply makes its own and shares
+                    # nothing.
+                    target.touch()
 
-            if not target.exists():
-                # The game writes this on first run; the link has to exist before
-                # then or the game simply makes its own and shares nothing.
-                target.touch()
-
-            os.link(target, link)
-        except OSError as exc:
-            notes.append(f"Could not share {name}: {exc}")
+                os.link(target, link)
+            except OSError as exc:
+                try:
+                    already_shared = link.samefile(target)
+                except OSError:
+                    already_shared = False
+                if not already_shared:
+                    notes.append(f"Could not share {name}: {exc}")
+    finally:
+        _release_link_lock(lock)
 
     return notes
 

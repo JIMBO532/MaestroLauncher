@@ -27,6 +27,7 @@ import binascii
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -146,6 +147,28 @@ RESULT_DWELL_MS = 6000
 # per interval, with the last one always delivered.
 PROGRESS_INTERVAL_S = 0.1
 
+# core.launch.RunningGame.wait() returning 0 is not a success signal -- the
+# game exits 0 even when it never created a window, a fact this launcher
+# already knew and forgot the moment Play grew a real implementation. It
+# reported the process as "running" the instant it spawned, which is also
+# true one line before a crash. scripts/test_launch.py verifies a real
+# launch by reading the log instead, so this reuses its definition of
+# "reached the main menu" rather than inventing a second one.
+#
+# The sound engine and the GUI texture atlas are both built while the main
+# menu is constructed, so either arriving in the log is enough on its own.
+MENU_MARKERS = ("Sound engine started", "OpenAL initialized", "textures/atlas")
+
+# Generous on purpose: assets are already on disk by the time Play calls
+# this (installing happens first), but a cold JVM, shader compilation or a
+# slow machine can still take real time to get from spawn to menu.
+PLAY_MENU_TIMEOUT_S = 90.0
+
+# Minecraft writes this exact line, split across two "#@!@#" markers, when it
+# crashes during startup -- the path after it is the crash report to point
+# someone at instead of a bare "it didn't start".
+_CRASH_REPORT_RE = re.compile(r"Crash report saved to:\s*#@!@#\s*(.+)")
+
 
 # The Azure application this launcher signs in as.
 #
@@ -183,6 +206,15 @@ def _client_id() -> Optional[str]:
         if found:
             return found
     return CLIENT_ID or None
+
+
+def _read_log(path: Path) -> str:
+    """The game's log so far. Empty if it has not been created yet -- a race
+    at the very start of a launch, not a reason to blow up watching it."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
 
 
 def _installed_fabric_profile(version: str, directory: Path) -> Optional[str]:
@@ -664,13 +696,67 @@ class Api:
             return
 
         self._game = game
-        self._push(
-            "job",
-            "onPlayStarted",
-            {"profile": profile_id, "pid": game.pid, "logPath": str(game.log_path)},
-        )
-        self._result(f"Minecraft {profile_id} is running (pid {game.pid}).")
+        self._status(f"Waiting for {profile_id} to reach the main menu...")
+        outcome, detail = self._await_game_start(game)
+
+        if outcome == "menu":
+            self._push(
+                "job",
+                "onPlayStarted",
+                {"profile": profile_id, "pid": game.pid, "logPath": str(game.log_path)},
+            )
+            self._result(f"Minecraft {profile_id} is running (pid {game.pid}).")
+        elif outcome == "crashed":
+            where = f" Crash report: {detail}" if detail else " Check the log."
+            self._failed(f"Minecraft {profile_id} crashed on startup.{where}")
+        elif outcome == "exited":
+            self._failed(
+                f"Minecraft {profile_id} exited before reaching the main menu "
+                f"(exit code {detail}). Log: {game.log_path}"
+            )
+        else:  # "timeout" -- still running, genuinely unknown either way
+            self._status(
+                f"Minecraft {profile_id} (pid {game.pid}) is taking a while to start. "
+                f"Log: {game.log_path}"
+            )
         self._release()
+
+    def _await_game_start(self, game: launch.RunningGame) -> tuple[str, Optional[str]]:
+        """Wait for the log to say the game actually got somewhere.
+
+        Returns ``("menu", None)``, ``("crashed", <report path or None>)``,
+        ``("exited", <exit code as str>)`` or ``("timeout", None)``. Reading
+        the log rather than trusting the exit code is the whole point --
+        see the comment on MENU_MARKERS above.
+        """
+        deadline = time.monotonic() + PLAY_MENU_TIMEOUT_S
+        while time.monotonic() < deadline:
+            text = _read_log(game.log_path)
+
+            if any(marker in text for marker in MENU_MARKERS):
+                return "menu", None
+
+            match = _CRASH_REPORT_RE.search(text)
+            if match:
+                return "crashed", match.group(1).strip()
+
+            if not game.is_running():
+                # The crash line can land a beat after the process handle
+                # already reports gone; one more read before calling it a
+                # bare exit avoids blaming a plain exit on what was actually
+                # a crash.
+                time.sleep(0.5)
+                text = _read_log(game.log_path)
+                match = _CRASH_REPORT_RE.search(text)
+                if match:
+                    return "crashed", match.group(1).strip()
+                if any(marker in text for marker in MENU_MARKERS):
+                    return "menu", None
+                return "exited", str(game.process.poll())
+
+            time.sleep(1.0)
+
+        return "timeout", None
 
     def _ensure_profile(
         self,

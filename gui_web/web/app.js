@@ -813,9 +813,7 @@
       accountToggle,
       searchButton,
       searchInput,
-      addFilesButton,
-      aboutUpdateLink,
-      aboutCheckButton
+      addFilesButton
     ];
     Array.prototype.forEach.call(
       contentPanel.querySelectorAll(".content-panel__type, .content-panel__result-install"),
@@ -943,16 +941,7 @@
       // been superseded and this job's own reporting takes the line.
       if (busy) releaseStatus();
       setBusy(busy);
-      if (!busy) {
-        clearProgress();
-        // A failed update download ends the job like anything else, but
-        // "Downloading..." would otherwise be stuck on the button forever
-        // -- a successful one instead closes the whole window, so there is
-        // nothing here left to reset.
-        if (!aboutUpdate.hidden) {
-          aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
-        }
-      }
+      if (!busy) clearProgress();
     },
     onStatus: function (text) {
       setStatus(text);
@@ -1021,17 +1010,12 @@
   var aboutCheckButton = document.getElementById("about-check-update");
   var aboutLoaded = false;
   var latestUpdateUrl = null;
-  var latestDownloadUrl = null;
 
   function showUpdateAvailable(payload) {
     latestUpdateUrl = payload.url;
-    latestDownloadUrl = payload.downloadUrl || null;
     aboutBadge.hidden = false;
     aboutUpdate.hidden = false;
     aboutUpdateText.textContent = "Version " + payload.version + " is available.";
-    // Only a release with no installer attached falls back to sending
-    // someone to the page to get it themselves.
-    aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
   }
 
   function openAboutPanel() {
@@ -1069,21 +1053,8 @@
 
   aboutUpdateLink.addEventListener("click", function (event) {
     event.stopPropagation();
-    if (!hasBridge()) return;
-    if (latestDownloadUrl) {
-      // Progress and any failure come back through the same job channel
-      // as everything else (onStatus/onProgress/onError below) -- a
-      // success closes the window instead of reporting one.
-      aboutUpdateLink.textContent = "Downloading…";
-      window.pywebview.api.download_and_install_update(latestDownloadUrl).then(function (result) {
-        if (result && !result.ok && result.error) {
-          holdStatus(result.error, "error");
-          aboutUpdateLink.textContent = "Download update";
-        }
-      });
-    } else if (latestUpdateUrl) {
-      window.pywebview.api.open_release_page(latestUpdateUrl);
-    }
+    if (!hasBridge() || !latestUpdateUrl) return;
+    window.pywebview.api.open_release_page(latestUpdateUrl);
   });
 
   aboutCheckButton.addEventListener("click", function (event) {

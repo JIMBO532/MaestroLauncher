@@ -31,7 +31,6 @@ import logging
 import logging.handlers
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -1208,85 +1207,21 @@ class Api:
         self._push(
             "update",
             "onAvailable",
-            {
-                "version": info.latest_version,
-                "url": info.url,
-                "downloadUrl": info.download_url,
-            },
+            {"version": info.latest_version, "url": info.url},
         )
 
     def open_release_page(self, url: str) -> dict:
-        """Open a release page in the system browser.
-
-        The fallback for a release with no installer attached -- ordinarily
-        the update button downloads it directly and never needs this.
-        Restricted to github.com so this can only ever open what our own
-        update check handed back, never an arbitrary page.
+        """Open the release page in the system browser. This is the whole
+        update flow -- no download, no install, no restart -- the user
+        does the rest from there, same as getting the installer the first
+        time. Restricted to github.com so this can only ever open what our
+        own update check handed back, never an arbitrary page.
         """
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https" or parsed.hostname != "github.com":
             return {"ok": False, "error": "Refusing to open a non-GitHub link."}
         webbrowser.open(url)
         return {"ok": True}
-
-    def download_and_install_update(self, url: str) -> dict:
-        """Download the release installer and hand off to it directly --
-        the button does not send anyone to a web page to find and download
-        it themselves.
-
-        Restricted to github.com for the same reason ``open_release_page``
-        is: this can only ever fetch what our own update check handed
-        back, never an arbitrary URL.
-        """
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname != "github.com":
-            return {"ok": False, "error": "Refusing to download from a non-GitHub URL."}
-        if not self._claim():
-            return {"ok": False, "error": "Something else is still running."}
-        threading.Thread(
-            target=self._download_and_install_update_worker,
-            args=(url,),
-            daemon=True,
-            name="maestro-update-download",
-        ).start()
-        return {"ok": True}
-
-    def _download_and_install_update_worker(self, url: str) -> None:
-        report = self._reporter()
-        destination = data_dir() / "updates" / update.INSTALLER_ASSET_NAME
-
-        try:
-            path = update.download_installer(url, destination, on_progress=report)
-        except update.UpdateError as exc:
-            LOG.exception("Update download failed")
-            self._failed(f"Could not download the update: {exc}")
-            self._release()
-            return
-        except Exception as exc:  # noqa: BLE001 -- the page must never see a traceback
-            LOG.exception("Update download failed unexpectedly")
-            self._failed(f"Could not download the update: {exc}")
-            self._release()
-            return
-
-        self._status("Installing the update...")
-        try:
-            # /VERYSILENT: no wizard -- someone who clicked "update" already
-            # said yes. CloseApplications/RestartApplications in the .iss
-            # (not a flag here) is what lets this replace a running exe and
-            # bring the new one back up once it is done.
-            subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
-        except OSError as exc:
-            LOG.exception("Could not launch the downloaded installer")
-            self._failed(f"Downloaded the update but could not start it: {exc}")
-            self._release()
-            return
-
-        LOG.info("Update installer launched from %s; closing for the handoff.", path)
-        self._release()
-        # Get out of the installer's way rather than race it: it is about
-        # to replace this exact process's own exe.
-        if self._window is not None:
-            self._window.destroy()
 
     def _push(self, channel: str, event: str, payload) -> None:
         """Call ``window.__maestro.<channel>.<event>(payload)`` in the page.

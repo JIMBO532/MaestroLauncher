@@ -673,6 +673,10 @@
       // leaves the panel signed out rather than launching a browser nobody
       // asked for.
       window.pywebview.api.restore_account();
+      // A courtesy check, not a job: nothing here shows unless there is
+      // genuinely a newer build, and it fails silently otherwise -- see
+      // onAvailable below.
+      window.pywebview.api.check_for_update();
     } else {
       versionEmpty.textContent = "Version data requires the app window, not a plain browser preview.";
     }
@@ -809,7 +813,9 @@
       accountToggle,
       searchButton,
       searchInput,
-      addFilesButton
+      addFilesButton,
+      aboutUpdateLink,
+      aboutCheckButton
     ];
     Array.prototype.forEach.call(
       contentPanel.querySelectorAll(".content-panel__type, .content-panel__result-install"),
@@ -894,10 +900,24 @@
   /* -------------------------------------------------------------- play -- */
 
   var playButton = document.getElementById("play-button");
+  var playState = "idle"; // idle | launching | playing
+  var trackedGamePid = null;
+
+  function setPlayState(state) {
+    playState = state;
+    playButton.textContent =
+      state === "launching" ? "LAUNCHING..." : state === "playing" ? "PLAYING NOW" : "PLAY";
+  }
 
   playButton.addEventListener("click", function () {
     if (!hasBridge()) {
       holdStatus("Launching needs the app window, not a plain browser preview.", "error");
+      return;
+    }
+    if (playState === "playing") {
+      window.pywebview.api.focus_game().then(function (result) {
+        if (result && !result.ok && result.error) holdStatus(result.error, "error");
+      });
       return;
     }
     if (!currentSelection) {
@@ -923,7 +943,16 @@
       // been superseded and this job's own reporting takes the line.
       if (busy) releaseStatus();
       setBusy(busy);
-      if (!busy) clearProgress();
+      if (!busy) {
+        clearProgress();
+        // A failed update download ends the job like anything else, but
+        // "Downloading..." would otherwise be stuck on the button forever
+        // -- a successful one instead closes the whole window, so there is
+        // nothing here left to reset.
+        if (!aboutUpdate.hidden) {
+          aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
+        }
+      }
     },
     onStatus: function (text) {
       setStatus(text);
@@ -947,6 +976,26 @@
     }
   };
 
+  window.__maestro.play = {
+    // A launch that supersedes whatever the button was tracking before --
+    // always wins, the same way a fresh press of Play always would.
+    onLaunching: function (payload) {
+      trackedGamePid = payload.pid;
+      setPlayState("launching");
+    },
+    // These two only ever describe the launch the button is currently
+    // tracking: a background watcher for an earlier, already-superseded
+    // game reporting in later must not undo the current state.
+    onPlaying: function (payload) {
+      if (payload.pid !== trackedGamePid) return;
+      setPlayState("playing");
+    },
+    onExited: function (payload) {
+      if (payload.pid !== trackedGamePid) return;
+      setPlayState("idle");
+    }
+  };
+
   window.__maestro.account = {
     onRestoring: function (payload) {
       accountLabel.textContent = payload.username + "…";
@@ -963,9 +1012,27 @@
   /* ------------------------------------------------------------- about -- */
 
   var aboutToggle = document.getElementById("about-toggle");
+  var aboutBadge = document.getElementById("about-badge");
   var aboutPanel = document.getElementById("about-panel");
   var aboutVersion = document.getElementById("about-version");
+  var aboutUpdate = document.getElementById("about-update");
+  var aboutUpdateText = document.getElementById("about-update-text");
+  var aboutUpdateLink = document.getElementById("about-update-link");
+  var aboutCheckButton = document.getElementById("about-check-update");
   var aboutLoaded = false;
+  var latestUpdateUrl = null;
+  var latestDownloadUrl = null;
+
+  function showUpdateAvailable(payload) {
+    latestUpdateUrl = payload.url;
+    latestDownloadUrl = payload.downloadUrl || null;
+    aboutBadge.hidden = false;
+    aboutUpdate.hidden = false;
+    aboutUpdateText.textContent = "Version " + payload.version + " is available.";
+    // Only a release with no installer attached falls back to sending
+    // someone to the page to get it themselves.
+    aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
+  }
 
   function openAboutPanel() {
     aboutPanel.hidden = false;
@@ -999,6 +1066,56 @@
       closeAboutPanel();
     }
   });
+
+  aboutUpdateLink.addEventListener("click", function (event) {
+    event.stopPropagation();
+    if (!hasBridge()) return;
+    if (latestDownloadUrl) {
+      // Progress and any failure come back through the same job channel
+      // as everything else (onStatus/onProgress/onError below) -- a
+      // success closes the window instead of reporting one.
+      aboutUpdateLink.textContent = "Downloading…";
+      window.pywebview.api.download_and_install_update(latestDownloadUrl).then(function (result) {
+        if (result && !result.ok && result.error) {
+          holdStatus(result.error, "error");
+          aboutUpdateLink.textContent = "Download update";
+        }
+      });
+    } else if (latestUpdateUrl) {
+      window.pywebview.api.open_release_page(latestUpdateUrl);
+    }
+  });
+
+  aboutCheckButton.addEventListener("click", function (event) {
+    event.stopPropagation();
+    if (!hasBridge()) return;
+    aboutCheckButton.disabled = true;
+    var previousText = aboutCheckButton.textContent;
+    aboutCheckButton.textContent = "Checking…";
+    // check_for_update() only ever speaks up through onAvailable below --
+    // silence is success (already current) as much as it is failure, on
+    // purpose (see core/update.py) -- so a press needs its own feedback
+    // here or "checking" would just hang forever either way. 4s is a guess
+    // at how long the GitHub round trip takes, not a guarantee: a genuine
+    // onAvailable arriving later still updates the panel correctly, this
+    // just means the button's own "up to date" message was too hasty on an
+    // unusually slow connection.
+    window.setTimeout(function () {
+      aboutCheckButton.disabled = false;
+      aboutCheckButton.textContent = aboutUpdate.hidden ? "You're up to date" : previousText;
+      window.setTimeout(function () {
+        aboutCheckButton.textContent = previousText;
+      }, 2500);
+    }, 4000);
+    window.pywebview.api.check_for_update();
+  });
+
+  window.__maestro = window.__maestro || {};
+  window.__maestro.update = {
+    onAvailable: function (payload) {
+      showUpdateAvailable(payload);
+    }
+  };
 
   /* ----------------------------------------------------------- content -- */
 

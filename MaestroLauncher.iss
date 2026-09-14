@@ -40,6 +40,16 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
+; The in-app "Check for updates" button downloads this same installer and
+; runs it silently over a running MaestroLauncher.exe. Without these two,
+; Setup would just fail to overwrite a file that is in use. With them, Inno
+; uses Windows Restart Manager to close the running instance for the file
+; copy and bring it back up afterward -- the same thing it would do for any
+; other app that happens to be open during a manual install.
+CloseApplications=yes
+CloseApplicationsFilter={#AppExeName}
+RestartApplications=yes
+
 ; The Mojang notice goes here rather than in LicenseFile: the licence page is
 ; the MIT terms for this launcher's own source, which is a different thing
 ; from "this is not a Mojang product", and burying the second inside the

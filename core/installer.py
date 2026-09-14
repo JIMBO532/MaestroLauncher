@@ -451,6 +451,77 @@ def _merge_into(source: Path, target: Path) -> list[str]:
     return collisions
 
 
+def _migrate_root_content(directory: Path, shared: Path) -> list[str]:
+    """Fold whatever the traditional root-level folders already hold into
+    the shared copy, the first time this .minecraft gets a shared-data
+    directory at all.
+
+    Someone who played vanilla -- or used any other launcher -- against this
+    same .minecraft before ever opening MaestroLauncher has real resource
+    packs, worlds and shader packs sitting at ``directory/resourcepacks``,
+    ``directory/saves`` and so on: the paths Minecraft has always used.
+    Once per-version instances take over, that root is never ``--gameDir``
+    again, so leaving this where it is would make it quietly unreachable --
+    not deleted, just never seen by the game again. This is the same merge
+    ``_merge_into`` already does for a populated *instance* folder, aimed at
+    the root instead; cheap and a no-op once everything has moved across,
+    so it is safe to run before every launch rather than only the first.
+
+    ``mods`` is deliberately not handled here: it is not a shared folder
+    (see ``instance_directory``'s docstring) precisely because jars only
+    suit one game version, and a root ``mods`` folder inherited from
+    whatever was last played cannot be assumed compatible with whatever is
+    about to be installed. Moving it in unasked would risk reintroducing the
+    exact "two versions' jars in one folder" failure the per-instance split
+    exists to prevent. It is left alone and just mentioned, so existing jars
+    are not silently lost -- they are exactly where they always were.
+    """
+    notes: list[str] = []
+
+    for name in SHARED_DIRECTORIES:
+        root_folder = directory / name
+        if (
+            not root_folder.is_dir()
+            or os.path.isjunction(str(root_folder))
+            or root_folder.is_symlink()
+        ):
+            continue  # nothing there, or this is already our own junction
+
+        target = shared / name
+        target.mkdir(parents=True, exist_ok=True)
+        collisions = _merge_into(root_folder, target)
+        if collisions:
+            notes.append(
+                f"{root_folder} still holds {', '.join(collisions)} that could not "
+                f"be shared (same name already in {target}); move them in yourself "
+                "if you want them shared across versions"
+            )
+
+    root_options = directory / "options.txt"
+    shared_options = shared / "options.txt"
+    if root_options.is_file() and not shared_options.exists():
+        # The same "first one in donates its settings" rule the per-instance
+        # options.txt already follows, aimed at the root's copy instead.
+        try:
+            shutil.move(str(root_options), str(shared_options))
+        except OSError:
+            pass
+
+    root_mods = directory / "mods"
+    try:
+        has_mods = root_mods.is_dir() and any(root_mods.iterdir())
+    except OSError:
+        has_mods = False
+    if has_mods:
+        notes.append(
+            f"{root_mods} has mods in it from before -- left untouched, since a "
+            "shared mods folder is what let one version's jars break another. "
+            "Add anything still needed to the version it belongs to instead."
+        )
+
+    return notes
+
+
 def link_shared_data(instance: Path | str, directory: Path | str) -> list[str]:
     """Point an instance's shared folders at the one copy everyone uses.
 
@@ -476,6 +547,14 @@ def link_shared_data(instance: Path | str, directory: Path | str) -> list[str]:
 
     lock = _acquire_link_lock(shared)
     try:
+        # Before this instance gets its own junctions, fold in whatever the
+        # traditional root-level folders already hold -- content from before
+        # this .minecraft ever had a shared-data directory at all. Otherwise
+        # a new instance's junction points at an empty shared folder while
+        # someone's real resource packs and worlds sit at the root, never
+        # seen by the game again.
+        notes.extend(_migrate_root_content(Path(directory).expanduser(), shared))
+
         for name in SHARED_DIRECTORIES:
             target = shared / name
             target.mkdir(parents=True, exist_ok=True)

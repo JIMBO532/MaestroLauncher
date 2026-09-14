@@ -325,6 +325,7 @@ html, body {
    without trying each one first. 44px was the icon alone; the button now
    has to be measured as a whole, and it clears 44x44 with room over. */
 .rail__item {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -598,6 +599,50 @@ html, body {
   line-height: 1.5;
   color: var(--muted);
 }
+
+/* State only, same rule as everywhere else -- an update being available is
+   exactly the kind of fact --green exists for, never a button fill. */
+.about-panel__update {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--green);
+}
+
+.about-panel__update-link {
+  display: block;
+  margin-top: 2px;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.about-panel__check {
+  margin-top: 12px;
+  width: 100%;
+}
+
+/* A small dot on the rail icon itself, so there is something to notice
+   before anyone has a reason to open About -- the same idea as an unread
+   badge, kept to the one state worth surfacing unasked. Positioned against
+   .rail__item, which this relies on being position: relative (below). */
+.rail__item-badge {
+  position: absolute;
+  top: 6px;
+  right: 12px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 0 2px rgba(10, 10, 10, 0.92);
+}
+
+.rail__item-badge[hidden] { display: none; }
 
 /* ---------------------------------------------------------- content panel */
 

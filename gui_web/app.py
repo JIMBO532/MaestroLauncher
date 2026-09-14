@@ -31,9 +31,12 @@ import logging
 import logging.handlers
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import webbrowser
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -50,7 +53,7 @@ import webview
 from PIL import Image, UnidentifiedImageError
 
 from core import __version__ as APP_VERSION
-from core import auth, imports, installer, launch, mods, singleton
+from core import auth, imports, installer, launch, mods, singleton, update
 from core.auth import Account, AuthError, LoginCancelled, LoginRequired
 from core.installer import InstallError, Progress
 from core.launch import LaunchError
@@ -750,6 +753,7 @@ class Api:
             return
 
         self._game = game
+        self._push("play", "onLaunching", {"profile": profile_id, "pid": game.pid})
         self._status(f"Waiting for {profile_id} to reach the main menu...")
         outcome, detail = self._await_game_start(game)
 
@@ -760,30 +764,107 @@ class Api:
                 {"profile": profile_id, "pid": game.pid, "logPath": str(game.log_path)},
             )
             self._result(f"Minecraft {profile_id} is running (pid {game.pid}).")
+            self._push("play", "onPlaying", {"profile": profile_id, "pid": game.pid})
+            self._watch_until_exit(game, profile_id)
         elif outcome == "crashed":
             where = f" Crash report: {detail}" if detail else " Check the log."
             self._failed(f"Minecraft {profile_id} crashed on startup.{where}")
+            self._push("play", "onExited", {"profile": profile_id, "pid": game.pid})
         elif outcome == "exited":
             self._failed(
                 f"Minecraft {profile_id} exited before reaching the main menu "
                 f"(exit code {detail}). Log: {game.log_path}"
             )
+            self._push("play", "onExited", {"profile": profile_id, "pid": game.pid})
         else:  # "timeout" -- still running, genuinely unknown either way
             self._status(
                 f"Minecraft {profile_id} (pid {game.pid}) is taking a while to start. "
                 f"Log: {game.log_path}"
             )
+            # The job itself gives up here (the busy lock releases below like
+            # any other finished job), but the Play button still needs an
+            # answer eventually -- keep reading the log in the background,
+            # unbounded this time, purely to resolve that.
+            self._watch_after_timeout(game, profile_id)
         self._release()
 
-    def _await_game_start(self, game: launch.RunningGame) -> tuple[str, Optional[str]]:
+    def _watch_after_timeout(self, game: launch.RunningGame, profile_id: str) -> None:
+        """Background continuation of _await_game_start() past its own
+        deadline, for the Play button's benefit only -- no job status, no
+        result/error line, since the job already reported itself done."""
+
+        def run() -> None:
+            outcome, _detail = self._await_game_start(game, timeout_s=None)
+            if outcome == "menu":
+                self._push("play", "onPlaying", {"profile": profile_id, "pid": game.pid})
+                self._watch_until_exit(game, profile_id)
+            else:  # "crashed" or "exited" -- either way, not running any more
+                self._push("play", "onExited", {"profile": profile_id, "pid": game.pid})
+
+        threading.Thread(target=run, daemon=True, name="maestro-play-watch").start()
+
+    def _watch_until_exit(self, game: launch.RunningGame, profile_id: str) -> None:
+        """Once a launch has reached the main menu, this is the only thing
+        left to track: tell the Play button when the game actually closes."""
+
+        def run() -> None:
+            while game.is_running():
+                time.sleep(2.0)
+            self._push("play", "onExited", {"profile": profile_id, "pid": game.pid})
+
+        threading.Thread(target=run, daemon=True, name="maestro-play-watch").start()
+
+    def focus_game(self) -> dict:
+        """Bring the running game's window to the front, best-effort.
+
+        Windows normally refuses to let a background process steal focus,
+        but this only ever runs from a click inside our own window, which
+        the OS already treats as the foreground process -- exactly the case
+        SetForegroundWindow is allowed to act on, no extra tricks needed.
+        """
+        game = self._game
+        if game is None or not game.is_running():
+            return {"ok": False, "error": "Minecraft is not running."}
+
+        user32 = ctypes.windll.user32
+        target_pid = game.pid
+        hwnds: list[int] = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
+                return True
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == target_pid:
+                hwnds.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if not hwnds:
+            return {"ok": False, "error": "Could not find the game window."}
+
+        SW_RESTORE = 9
+        user32.ShowWindow(hwnds[0], SW_RESTORE)
+        user32.SetForegroundWindow(hwnds[0])
+        return {"ok": True}
+
+    def _await_game_start(
+        self, game: launch.RunningGame, timeout_s: Optional[float] = PLAY_MENU_TIMEOUT_S
+    ) -> tuple[str, Optional[str]]:
         """Wait for the log to say the game actually got somewhere.
 
         Returns ``("menu", None)``, ``("crashed", <report path or None>)``,
-        ``("exited", <exit code as str>)`` or ``("timeout", None)``. Reading
-        the log rather than trusting the exit code is the whole point --
-        see the comment on MENU_MARKERS above.
+        ``("exited", <exit code as str>)`` or, only when ``timeout_s`` is not
+        ``None``, ``("timeout", None)``. Reading the log rather than trusting
+        the exit code is the whole point -- see the comment on MENU_MARKERS
+        above.
+
+        ``timeout_s=None`` waits as long as the process runs -- used to keep
+        tracking a launch for the Play button's sake after the bounded job
+        status wait above has already given up on it.
         """
-        deadline = time.monotonic() + PLAY_MENU_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else float("inf")
         while time.monotonic() < deadline:
             text = _read_log(game.log_path)
 
@@ -1098,6 +1179,114 @@ class Api:
 
     def get_about_info(self) -> dict:
         return {"ok": True, "appName": WINDOW_TITLE, "version": APP_VERSION}
+
+    # -- update check ----------------------------------------------------------
+    #
+    # A courtesy notice, not a job: it never touches the busy lock, so it
+    # cannot be blocked by (or block) anything else running, and a slow or
+    # failed check has nothing to show for it rather than an error anyone
+    # has to deal with. See core/update.py for why it can never raise.
+
+    def check_for_update(self) -> dict:
+        """Kick off a background check. The page hears back through
+        window.__maestro.update.onAvailable, or not at all -- silence means
+        already up to date or the check could not complete, and those are
+        deliberately indistinguishable to the caller.
+        """
+        threading.Thread(
+            target=self._check_for_update_worker,
+            daemon=True,
+            name="maestro-update-check",
+        ).start()
+        return {"ok": True}
+
+    def _check_for_update_worker(self) -> None:
+        info = update.check_for_update()
+        if info is None:
+            return
+        LOG.info("Update available: %s -> %s", info.current_version, info.latest_version)
+        self._push(
+            "update",
+            "onAvailable",
+            {
+                "version": info.latest_version,
+                "url": info.url,
+                "downloadUrl": info.download_url,
+            },
+        )
+
+    def open_release_page(self, url: str) -> dict:
+        """Open a release page in the system browser.
+
+        The fallback for a release with no installer attached -- ordinarily
+        the update button downloads it directly and never needs this.
+        Restricted to github.com so this can only ever open what our own
+        update check handed back, never an arbitrary page.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return {"ok": False, "error": "Refusing to open a non-GitHub link."}
+        webbrowser.open(url)
+        return {"ok": True}
+
+    def download_and_install_update(self, url: str) -> dict:
+        """Download the release installer and hand off to it directly --
+        the button does not send anyone to a web page to find and download
+        it themselves.
+
+        Restricted to github.com for the same reason ``open_release_page``
+        is: this can only ever fetch what our own update check handed
+        back, never an arbitrary URL.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return {"ok": False, "error": "Refusing to download from a non-GitHub URL."}
+        if not self._claim():
+            return {"ok": False, "error": "Something else is still running."}
+        threading.Thread(
+            target=self._download_and_install_update_worker,
+            args=(url,),
+            daemon=True,
+            name="maestro-update-download",
+        ).start()
+        return {"ok": True}
+
+    def _download_and_install_update_worker(self, url: str) -> None:
+        report = self._reporter()
+        destination = data_dir() / "updates" / update.INSTALLER_ASSET_NAME
+
+        try:
+            path = update.download_installer(url, destination, on_progress=report)
+        except update.UpdateError as exc:
+            LOG.exception("Update download failed")
+            self._failed(f"Could not download the update: {exc}")
+            self._release()
+            return
+        except Exception as exc:  # noqa: BLE001 -- the page must never see a traceback
+            LOG.exception("Update download failed unexpectedly")
+            self._failed(f"Could not download the update: {exc}")
+            self._release()
+            return
+
+        self._status("Installing the update...")
+        try:
+            # /VERYSILENT: no wizard -- someone who clicked "update" already
+            # said yes. CloseApplications/RestartApplications in the .iss
+            # (not a flag here) is what lets this replace a running exe and
+            # bring the new one back up once it is done.
+            subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
+        except OSError as exc:
+            LOG.exception("Could not launch the downloaded installer")
+            self._failed(f"Downloaded the update but could not start it: {exc}")
+            self._release()
+            return
+
+        LOG.info("Update installer launched from %s; closing for the handoff.", path)
+        self._release()
+        # Get out of the installer's way rather than race it: it is about
+        # to replace this exact process's own exe.
+        if self._window is not None:
+            self._window.destroy()
 
     def _push(self, channel: str, event: str, payload) -> None:
         """Call ``window.__maestro.<channel>.<event>(payload)`` in the page.

@@ -6,4 +6,4 @@ Modrinth User-Agent -- imports it from here, and scripts/test_gui.py fails if a
 copy of the number turns up hardcoded anywhere else.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"

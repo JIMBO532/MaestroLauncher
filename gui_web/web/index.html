@@ -88,6 +88,7 @@
         <line x1="12" y1="7.6" x2="12.01" y2="7.6"></line>
       </svg>
       <span class="rail__item-label">About</span>
+      <span class="rail__item-badge" id="about-badge" hidden></span>
     </button>
   </nav>
 
@@ -97,6 +98,13 @@
   <div class="about-panel" id="about-panel" role="dialog" aria-label="About" hidden>
     <div class="about-panel__name">MaestroLauncher</div>
     <div class="about-panel__version" id="about-version">Version &hellip;</div>
+    <div class="about-panel__update" id="about-update" hidden>
+      <span id="about-update-text"></span>
+      <button class="about-panel__update-link" id="about-update-link" type="button">View release</button>
+    </div>
+    <button class="settings-panel__mini-button about-panel__check" id="about-check-update" type="button">
+      Check for updates
+    </button>
     <p class="about-panel__notice">Not an official Minecraft product. Not approved by or associated with Mojang or Microsoft.</p>
   </div>
 

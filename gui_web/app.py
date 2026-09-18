@@ -1207,21 +1207,75 @@ class Api:
         self._push(
             "update",
             "onAvailable",
-            {"version": info.latest_version, "url": info.url},
+            {
+                "version": info.latest_version,
+                "url": info.url,
+                "downloadUrl": info.download_url,
+            },
         )
 
     def open_release_page(self, url: str) -> dict:
-        """Open the release page in the system browser. This is the whole
-        update flow -- no download, no install, no restart -- the user
-        does the rest from there, same as getting the installer the first
-        time. Restricted to github.com so this can only ever open what our
-        own update check handed back, never an arbitrary page.
+        """Open the release page in the system browser.
+
+        The fallback for a release with no installer attached -- ordinarily
+        the update button fetches it directly and never needs this.
+        Restricted to github.com so this can only ever open what our own
+        update check handed back, never an arbitrary page.
         """
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https" or parsed.hostname != "github.com":
             return {"ok": False, "error": "Refusing to open a non-GitHub link."}
         webbrowser.open(url)
         return {"ok": True}
+
+    def download_update(self, url: str) -> dict:
+        """Download the release installer -- nothing more.
+
+        Lands in the user's own Downloads folder, same place a browser
+        download would, and is never run, closed around, or restarted for
+        them: that stays a deliberate, separate action they take themselves
+        by double-clicking it, exactly like installing the first time.
+        Restricted to github.com for the same reason ``open_release_page``
+        is: this can only ever fetch what our own update check handed
+        back, never an arbitrary URL.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname != "github.com":
+            return {"ok": False, "error": "Refusing to download from a non-GitHub URL."}
+        if not self._claim():
+            return {"ok": False, "error": "Something else is still running."}
+        threading.Thread(
+            target=self._download_update_worker,
+            args=(url,),
+            daemon=True,
+            name="maestro-update-download",
+        ).start()
+        return {"ok": True}
+
+    def _download_update_worker(self, url: str) -> None:
+        report = self._reporter()
+        destination = Path.home() / "Downloads" / update.INSTALLER_ASSET_NAME
+
+        try:
+            path = update.download_installer(url, destination, on_progress=report)
+        except update.UpdateError as exc:
+            LOG.exception("Update download failed")
+            self._failed(f"Could not download the update: {exc}")
+            self._release()
+            return
+        except Exception as exc:  # noqa: BLE001 -- the page must never see a traceback
+            LOG.exception("Update download failed unexpectedly")
+            self._failed(f"Could not download the update: {exc}")
+            self._release()
+            return
+
+        LOG.info("Update downloaded to %s", path)
+        try:
+            os.startfile(str(path.parent))  # noqa: S606 -- opening a folder, Windows-only build
+        except OSError:
+            pass  # The download still succeeded; just could not open Explorer to show it.
+        self._result(f"Downloaded to {path} -- run it to finish updating.")
+        self._release()
 
     def _push(self, channel: str, event: str, payload) -> None:
         """Call ``window.__maestro.<channel>.<event>(payload)`` in the page.

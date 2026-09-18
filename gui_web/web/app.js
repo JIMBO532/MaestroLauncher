@@ -813,7 +813,8 @@
       accountToggle,
       searchButton,
       searchInput,
-      addFilesButton
+      addFilesButton,
+      aboutUpdateLink
     ];
     Array.prototype.forEach.call(
       contentPanel.querySelectorAll(".content-panel__type, .content-panel__result-install"),
@@ -1010,12 +1011,17 @@
   var aboutCheckButton = document.getElementById("about-check-update");
   var aboutLoaded = false;
   var latestUpdateUrl = null;
+  var latestDownloadUrl = null;
 
   function showUpdateAvailable(payload) {
     latestUpdateUrl = payload.url;
+    latestDownloadUrl = payload.downloadUrl || null;
     aboutBadge.hidden = false;
     aboutUpdate.hidden = false;
     aboutUpdateText.textContent = "Version " + payload.version + " is available.";
+    // Only a release with no installer attached falls back to sending
+    // someone to the page to get it themselves.
+    aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
   }
 
   function openAboutPanel() {
@@ -1053,8 +1059,18 @@
 
   aboutUpdateLink.addEventListener("click", function (event) {
     event.stopPropagation();
-    if (!hasBridge() || !latestUpdateUrl) return;
-    window.pywebview.api.open_release_page(latestUpdateUrl);
+    if (!hasBridge()) return;
+    if (latestDownloadUrl) {
+      // Progress and the final "downloaded to ..." message come back
+      // through the same job channel as everything else (onProgress/
+      // onResult/onError below). This only ever fetches the file --
+      // nothing here runs it or touches the running app.
+      window.pywebview.api.download_update(latestDownloadUrl).then(function (result) {
+        if (result && !result.ok && result.error) holdStatus(result.error, "error");
+      });
+    } else if (latestUpdateUrl) {
+      window.pywebview.api.open_release_page(latestUpdateUrl);
+    }
   });
 
   aboutCheckButton.addEventListener("click", function (event) {

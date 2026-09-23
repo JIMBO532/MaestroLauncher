@@ -61,8 +61,9 @@ echo   launcher\MaestroLauncher.exe
 echo   launcher\MaestroLauncherSetup.exe
 echo   launcher\MaestroLauncherSetup.exe.sha256
 echo.
-echo Release with both assets:
-echo   gh release create v!APPVERSION! launcher\MaestroLauncherSetup.exe launcher\MaestroLauncherSetup.exe.sha256
+echo Releases are built by GitHub Actions (.github\workflows\build.yml), not
+echo from here -- push the tag and it builds and attaches both files:
+echo   git tag v!APPVERSION! ^&^& git push origin v!APPVERSION!
 exit /b 0
 
 :failed

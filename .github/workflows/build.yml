@@ -1,0 +1,98 @@
+# Builds the installer and its .sha256 on GitHub's Windows runners.
+#
+# Pushing a tag vX.Y.Z builds it and attaches both files to that release,
+# creating the release if it does not exist yet. Running it by hand
+# (workflow_dispatch) only builds and keeps the files as a run artifact.
+#
+# Everything a release ships comes from here, so a release can always be
+# traced to a public commit and a public build log -- which is what code
+# signing through the SignPath Foundation requires. build.bat is the one
+# build script, shared with local builds, so the two cannot drift apart.
+
+name: Build installer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt pyinstaller==6.22.2
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Check the tag matches core.__version__
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = python installer/app_version.py
+          if ("v$version" -ne $env:TAG) {
+            throw "Tag $env:TAG does not match core.__version__ ($version). Bump core/__init__.py first."
+          }
+
+      - name: Test
+        run: python scripts/test_update.py
+
+      - name: Build
+        shell: cmd
+        run: build.bat
+
+      # When signing is added, it goes between Build and here -- and the
+      # .sha256 has to be regenerated afterwards, since signing changes the
+      # file the launcher will verify.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MaestroLauncherSetup
+          path: |
+            launcher/MaestroLauncherSetup.exe
+            launcher/MaestroLauncherSetup.exe.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MaestroLauncherSetup
+          path: dist
+
+      - name: Verify the checksum
+        working-directory: dist
+        run: sha256sum -c MaestroLauncherSetup.exe.sha256
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/MaestroLauncherSetup.exe dist/MaestroLauncherSetup.exe.sha256 --clobber
+          else
+            gh release create "$TAG" dist/MaestroLauncherSetup.exe dist/MaestroLauncherSetup.exe.sha256 \
+              --verify-tag --title "MaestroLauncher ${TAG#v}" --generate-notes
+          fi

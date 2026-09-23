@@ -677,6 +677,17 @@
       // genuinely a newer build, and it fails silently otherwise -- see
       // onAvailable below.
       window.pywebview.api.check_for_update();
+      // The installer reopens the launcher whether or not it succeeded;
+      // this is where the reopened copy says which.
+      window.pywebview.api.take_update_outcome().then(function (result) {
+        var outcome = result && result.outcome;
+        if (!outcome) return;
+        if (outcome.succeeded) {
+          flashStatus("Updated to " + outcome.version + ".");
+        } else {
+          showUpdateFailed(outcome.message, outcome.url);
+        }
+      });
     } else {
       versionEmpty.textContent = "Version data requires the app window, not a plain browser preview.";
     }
@@ -1011,17 +1022,32 @@
   var aboutCheckButton = document.getElementById("about-check-update");
   var aboutLoaded = false;
   var latestUpdateUrl = null;
-  var latestDownloadUrl = null;
+  var latestUpdateVersion = null;
+  var updateInstallable = false;
 
   function showUpdateAvailable(payload) {
     latestUpdateUrl = payload.url;
-    latestDownloadUrl = payload.downloadUrl || null;
+    latestUpdateVersion = payload.version;
+    updateInstallable = !!payload.installable;
     aboutBadge.hidden = false;
     aboutUpdate.hidden = false;
+    aboutUpdate.removeAttribute("data-tone");
     aboutUpdateText.textContent = "Version " + payload.version + " is available.";
-    // Only a release with no installer attached falls back to sending
-    // someone to the page to get it themselves.
-    aboutUpdateLink.textContent = latestDownloadUrl ? "Download update" : "View release";
+    // A release without a published checksum is never installed from here.
+    aboutUpdateLink.textContent = updateInstallable ? "Update now" : "View release";
+  }
+
+  // Once an install has failed, the only offer left is the release page.
+  function showUpdateFailed(message, url) {
+    if (url) latestUpdateUrl = url;
+    updateInstallable = false;
+    aboutBadge.hidden = false;
+    aboutUpdate.hidden = false;
+    aboutUpdate.setAttribute("data-tone", "error");
+    aboutUpdateText.textContent = message;
+    aboutUpdateLink.textContent = "Download it from the release page";
+    holdStatus(message, "error");
+    openAboutPanel();
   }
 
   function openAboutPanel() {
@@ -1060,13 +1086,12 @@
   aboutUpdateLink.addEventListener("click", function (event) {
     event.stopPropagation();
     if (!hasBridge()) return;
-    if (latestDownloadUrl) {
-      // Progress and the final "downloaded to ..." message come back
-      // through the same job channel as everything else (onProgress/
-      // onResult/onError below). This only ever fetches the file --
-      // nothing here runs it or touches the running app.
-      window.pywebview.api.download_update(latestDownloadUrl).then(function (result) {
-        if (result && !result.ok && result.error) holdStatus(result.error, "error");
+    if (updateInstallable && latestUpdateVersion) {
+      // install_update asks for confirmation natively, then reports
+      // progress through the job channel and failure through onFailed. On
+      // success the window closes and the installer reopens it.
+      window.pywebview.api.install_update(latestUpdateVersion).then(function (result) {
+        if (result && !result.ok && result.error) showUpdateFailed(result.error, latestUpdateUrl);
       });
     } else if (latestUpdateUrl) {
       window.pywebview.api.open_release_page(latestUpdateUrl);
@@ -1100,7 +1125,13 @@
   window.__maestro = window.__maestro || {};
   window.__maestro.update = {
     onAvailable: function (payload) {
+      // A failure notice outranks a later re-check's "available" -- the
+      // one-click path just failed, so don't offer it again this session.
+      if (aboutUpdate.getAttribute("data-tone") === "error") return;
       showUpdateAvailable(payload);
+    },
+    onFailed: function (payload) {
+      showUpdateFailed(payload.message, payload.url);
     }
   };
 

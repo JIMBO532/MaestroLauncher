@@ -608,6 +608,8 @@ html, body {
   color: var(--green);
 }
 
+.about-panel__update[data-tone="error"] { color: #ff9c8f; }
+
 .about-panel__update-link {
   display: block;
   margin-top: 2px;

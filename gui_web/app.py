@@ -352,6 +352,9 @@ class Api:
         # parallel install over the top of the first.
         self._busy = False
         self._busy_lock = threading.Lock()
+        # The page only ever names a version; what gets downloaded and run
+        # comes from here, never from anything the page passes in.
+        self._update_info: Optional[update.UpdateInfo] = None
 
     def bind(self, window: "webview.Window") -> None:
         self._window = window
@@ -1203,22 +1206,22 @@ class Api:
         info = update.check_for_update()
         if info is None:
             return
-        LOG.info("Update available: %s -> %s", info.current_version, info.latest_version)
+        self._update_info = info
+        LOG.info(
+            "Update available: %s -> %s (one-click install %s)",
+            info.current_version,
+            info.latest_version,
+            "available" if info.installable else "unavailable: no installer+checksum assets",
+        )
         self._push(
             "update",
             "onAvailable",
-            {
-                "version": info.latest_version,
-                "url": info.url,
-                "downloadUrl": info.download_url,
-            },
+            {"version": info.latest_version, "url": info.url, "installable": info.installable},
         )
 
     def open_release_page(self, url: str) -> dict:
         """Open the release page in the system browser.
 
-        The fallback for a release with no installer attached -- ordinarily
-        the update button fetches it directly and never needs this.
         Restricted to github.com so this can only ever open what our own
         update check handed back, never an arbitrary page.
         """
@@ -1228,54 +1231,94 @@ class Api:
         webbrowser.open(url)
         return {"ok": True}
 
-    def download_update(self, url: str) -> dict:
-        """Download the release installer -- nothing more.
+    def install_update(self, version: str) -> dict:
+        """Confirm, then download, verify, and silently install ``version``.
 
-        Lands in the user's own Downloads folder, same place a browser
-        download would, and is never run, closed around, or restarted for
-        them: that stays a deliberate, separate action they take themselves
-        by double-clicking it, exactly like installing the first time.
-        Restricted to github.com for the same reason ``open_release_page``
-        is: this can only ever fetch what our own update check handed
-        back, never an arbitrary URL.
+        Only ever reached from the Update button. ``version`` must match
+        what our own check found, so a stale page cannot install something
+        other than what it showed.
         """
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname != "github.com":
-            return {"ok": False, "error": "Refusing to download from a non-GitHub URL."}
+        info = self._update_info
+        if info is None or info.latest_version != version:
+            return {"ok": False, "error": "That update is no longer available -- check again."}
+        if not info.installable:
+            return {"ok": False, "error": "This release can't be installed from here."}
+        if self._window is None:
+            return {"ok": False, "error": "No window to confirm the update in."}
+
+        size = f" ({info.download_size / 1_048_576:.1f} MB)" if info.download_size else ""
+        confirmed = self._window.create_confirmation_dialog(
+            "Update MaestroLauncher",
+            f"Install MaestroLauncher {info.latest_version}? You have {info.current_version}.\n\n"
+            f"The installer{size} will be downloaded from GitHub and checked against its "
+            "published SHA-256 before it runs. MaestroLauncher will close while it "
+            "installs and reopen when it's done. A running game is not affected.",
+        )
+        if not confirmed:
+            return {"ok": False, "cancelled": True}
         if not self._claim():
             return {"ok": False, "error": "Something else is still running."}
         threading.Thread(
-            target=self._download_update_worker,
-            args=(url,),
+            target=self._install_update_worker,
+            args=(info,),
             daemon=True,
-            name="maestro-update-download",
+            name="maestro-update-install",
         ).start()
         return {"ok": True}
 
-    def _download_update_worker(self, url: str) -> None:
-        report = self._reporter()
-        destination = Path.home() / "Downloads" / update.INSTALLER_ASSET_NAME
-
+    def _install_update_worker(self, info: update.UpdateInfo) -> None:
+        workdir = data_dir() / "updates"
         try:
-            path = update.download_installer(url, destination, on_progress=report)
+            workdir.mkdir(parents=True, exist_ok=True)
+            self._status(f"Fetching the checksum for {info.latest_version}...")
+            expected = update.fetch_expected_sha256(info.checksum_url)
+            path = update.download_installer(
+                info.download_url,
+                workdir / update.INSTALLER_ASSET_NAME,
+                on_progress=self._reporter(),
+            )
+            self._status(f"Verifying and starting the {info.latest_version} installer...")
+            update.run_installer(
+                info, path, expected, workdir=workdir, wait_pids=update.launcher_pids()
+            )
         except update.UpdateError as exc:
-            LOG.exception("Update download failed")
-            self._failed(f"Could not download the update: {exc}")
-            self._release()
+            LOG.exception("Update to %s failed", info.latest_version)
+            self._update_failed(str(exc), info.url)
             return
         except Exception as exc:  # noqa: BLE001 -- the page must never see a traceback
-            LOG.exception("Update download failed unexpectedly")
-            self._failed(f"Could not download the update: {exc}")
-            self._release()
+            LOG.exception("Update to %s failed unexpectedly", info.latest_version)
+            self._update_failed(f"The update failed: {exc}", info.url)
             return
 
-        LOG.info("Update downloaded to %s", path)
-        try:
-            os.startfile(str(path.parent))  # noqa: S606 -- opening a folder, Windows-only build
-        except OSError:
-            pass  # The download still succeeded; just could not open Explorer to show it.
-        self._result(f"Downloaded to {path} -- run it to finish updating.")
+        LOG.info("Installer for %s is running; closing so it can replace the exe.", info.latest_version)
+        self._status(f"Installing {info.latest_version} -- MaestroLauncher will reopen when it's done.")
         self._release()
+        if self._window is not None:
+            self._window.destroy()
+
+    def _update_failed(self, message: str, release_url: str) -> None:
+        self._failed(message)
+        self._push("update", "onFailed", {"message": message, "url": release_url})
+        self._release()
+
+    def take_update_outcome(self) -> dict:
+        """Report, once, how the install started before the last restart
+        went -- the installer relaunches us whether it succeeded or not."""
+        outcome = update.take_install_outcome(data_dir() / "updates")
+        if outcome is None:
+            return {"ok": True, "outcome": None}
+        if outcome.succeeded:
+            LOG.info("Updated to %s", outcome.target_version)
+            return {"ok": True, "outcome": {"succeeded": True, "version": outcome.target_version}}
+        message = (
+            f"The update to {outcome.target_version} did not install. "
+            f"Details are in {outcome.log_path}."
+        )
+        LOG.error(message)
+        return {
+            "ok": True,
+            "outcome": {"succeeded": False, "message": message, "url": outcome.release_url},
+        }
 
     def _push(self, channel: str, event: str, payload) -> None:
         """Call ``window.__maestro.<channel>.<event>(payload)`` in the page.

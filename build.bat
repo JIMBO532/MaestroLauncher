@@ -51,10 +51,18 @@ if not defined ISCC (
 
 "!ISCC!" /DAppVersion=!APPVERSION! MaestroLauncher.iss || goto :failed
 
+REM Upload this with the installer: without it the in-app Update button falls
+REM back to linking the release page instead of installing.
+python installer\write_checksum.py || goto :failed
+
 echo.
 echo === done
 echo   launcher\MaestroLauncher.exe
 echo   launcher\MaestroLauncherSetup.exe
+echo   launcher\MaestroLauncherSetup.exe.sha256
+echo.
+echo Release with both assets:
+echo   gh release create v!APPVERSION! launcher\MaestroLauncherSetup.exe launcher\MaestroLauncherSetup.exe.sha256
 exit /b 0
 
 :failed

@@ -23,9 +23,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -60,7 +60,7 @@ jobs:
       # When signing is added, it goes between Build and here -- and the
       # .sha256 has to be regenerated afterwards, since signing changes the
       # file the launcher will verify.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: MaestroLauncherSetup
           path: |
@@ -75,7 +75,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: MaestroLauncherSetup
           path: dist

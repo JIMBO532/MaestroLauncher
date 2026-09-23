@@ -1277,7 +1277,9 @@ class Api:
                 workdir / update.INSTALLER_ASSET_NAME,
                 on_progress=self._reporter(),
             )
-            self._status(f"Verifying and starting the {info.latest_version} installer...")
+            self._status(
+                f"Starting the {info.latest_version} installer -- Windows may take a moment to check it..."
+            )
             update.run_installer(
                 info, path, expected, workdir=workdir, wait_pids=update.launcher_pids()
             )
@@ -1310,10 +1312,16 @@ class Api:
         if outcome.succeeded:
             LOG.info("Updated to %s", outcome.target_version)
             return {"ok": True, "outcome": {"succeeded": True, "version": outcome.target_version}}
-        message = (
-            f"The update to {outcome.target_version} did not install. "
-            f"Details are in {outcome.log_path}."
-        )
+        if outcome.log_path and Path(outcome.log_path).is_file():
+            message = (
+                f"The update to {outcome.target_version} did not install. "
+                f"Details are in {outcome.log_path}."
+            )
+        else:
+            message = (
+                f"The update to {outcome.target_version} did not install: the installer never "
+                "started. Smart App Control or antivirus most likely blocked it."
+            )
         LOG.error(message)
         return {
             "ok": True,

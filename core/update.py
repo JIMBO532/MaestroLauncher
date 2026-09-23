@@ -52,10 +52,14 @@ DOWNLOAD_TIMEOUT = (10.0, 60.0)
 CHUNK_SIZE = 1 << 16
 USER_AGENT = f"MaestroLauncher/{__version__} (update check)"
 
-# How long a freshly started installer gets to fail before we trust it is
-# running. Smart App Control refuses at CreateProcess, but antivirus often
-# lets the process start and kills it a moment later.
-LAUNCH_GRACE_SECONDS = 5.0
+# The installer runs in two stages: the Setup.exe we start, and a setup.tmp
+# it unpacks into %TEMP% and runs. Smart App Control can block that second
+# stage after a reputation lookup that takes several seconds, by which
+# point the first stage has long since "started fine". So the launcher does
+# not close until the second stage writes READY_FILE (MaestroLauncher.iss,
+# InitializeSetup) -- and gives up, staying open, if that never happens.
+READY_TIMEOUT_SECONDS = 60.0
+READY_FILE = "installer-ready"
 PENDING_MARKER = "pending-install.json"
 
 _SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
@@ -320,14 +324,15 @@ def run_installer(
     *,
     workdir: Path | str,
     wait_pids: Sequence[int],
-    grace: float = LAUNCH_GRACE_SECONDS,
+    timeout: float = READY_TIMEOUT_SECONDS,
 ) -> None:
     """Verify ``installer`` and start it silently.
 
-    Returns once the installer has survived ``grace`` seconds, at which
-    point it is waiting for ``wait_pids`` to exit -- the caller should now
-    close. Raises ``IntegrityError`` (file deleted, nothing run) on a hash
-    mismatch and ``InstallerBlocked`` if it could not start or died at once.
+    Returns only once the installer's second stage reports it is running,
+    at which point it is waiting for ``wait_pids`` to exit -- the caller
+    should now close. Raises ``IntegrityError`` (file deleted, nothing run)
+    on a hash mismatch, and ``InstallerBlocked`` if it could not start,
+    exited, or never reported in -- the caller must stay open for both.
     """
     installer = Path(installer)
     workdir = Path(workdir)
@@ -343,6 +348,8 @@ def run_installer(
         )
 
     log_path = workdir / "install.log"
+    ready = workdir / READY_FILE
+    ready.unlink(missing_ok=True)
     marker = workdir / PENDING_MARKER
     marker.write_text(
         json.dumps(
@@ -362,6 +369,7 @@ def run_installer(
         "/NORESTART",
         f"/LOG={log_path}",
         "/RELAUNCH=1",
+        f"/READYFILE={ready}",
     ]
     args += [f"/WAITPID{index}={pid}" for index, pid in enumerate(wait_pids[:2], start=1)]
 
@@ -371,16 +379,29 @@ def run_installer(
         marker.unlink(missing_ok=True)
         raise InstallerBlocked(_blocked_message(exc)) from exc
 
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + timeout
+    while not ready.exists():
         code = process.poll()
         if code is not None:
             marker.unlink(missing_ok=True)
             raise InstallerBlocked(
-                f"The update installer stopped right after starting (exit code {code}). "
-                "Smart App Control or antivirus may have blocked it."
+                f"Windows stopped the update installer before it could run (exit code {code}). "
+                "Smart App Control or antivirus most likely blocked it."
+            )
+        if time.monotonic() >= deadline:
+            # Stuck -- typically the first stage sitting on an error box
+            # after its second stage was blocked. It is ours and it failed.
+            try:
+                process.kill()
+            except OSError:
+                pass
+            marker.unlink(missing_ok=True)
+            raise InstallerBlocked(
+                f"The update installer did not get going within {timeout:.0f} seconds, so it "
+                "was stopped. Smart App Control or antivirus most likely blocked it."
             )
         time.sleep(0.1)
+    ready.unlink(missing_ok=True)
 
 
 def take_install_outcome(workdir: Path | str) -> Optional[InstallOutcome]:

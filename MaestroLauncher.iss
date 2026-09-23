@@ -23,6 +23,7 @@
 #define AppName "MaestroLauncher"
 #define AppPublisher "Dimitris"
 #define AppExeName "MaestroLauncher.exe"
+#define ReleasesUrl "https://github.com/JIMBO532/MaestroLauncher/releases/latest"
 
 [Setup]
 ; Never reuse this GUID for another program: it is the identity Windows uses
@@ -126,6 +127,19 @@ begin
   CloseHandle(Handle);
 end;
 
+{ This code only runs in Setup's second stage (the setup.tmp it unpacks),
+  which is what Smart App Control can block after the first stage has
+  already started. The launcher stays open until this file appears. }
+function InitializeSetup(): Boolean;
+var
+  ReadyFile: String;
+begin
+  ReadyFile := ExpandConstant('{param:READYFILE|}');
+  if ReadyFile <> '' then
+    SaveStringToFile(ReadyFile, 'ready', False);
+  Result := True;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   LauncherExited := WaitForPid('WAITPID1') and WaitForPid('WAITPID2');
@@ -135,14 +149,27 @@ end;
 procedure DeinitializeSetup();
 var
   ResultCode: Integer;
+  Started: Boolean;
 begin
   if (ExpandConstant('{param:RELAUNCH|0}') <> '1') or not LauncherExited then
     Exit;
+  Started := False;
+  ResultCode := 0;
   try
     { Success or failure alike: the reopened launcher reads the marker the
       old one left and says which it was. }
-    Exec(ExpandConstant('{app}\{#AppExeName}'), '', ExpandConstant('{app}'),
+    Started := Exec(ExpandConstant('{app}\{#AppExeName}'), '', ExpandConstant('{app}'),
       SW_SHOWNORMAL, ewNoWait, ResultCode);
   except
   end;
+  if Started then
+    Exit;
+  { Nothing else is left running to report this, so say it here. MsgBox,
+    unlike SuppressibleMsgBox, shows even under /SUPPRESSMSGBOXES. }
+  if MsgBox('MaestroLauncher could not be reopened after updating: ' +
+      SysErrorMessage(ResultCode) + #13#10#13#10 +
+      'Smart App Control or antivirus may have blocked it. ' +
+      'Open the release page to download it yourself?',
+      mbError, MB_YESNO) = IDYES then
+    ShellExec('open', '{#ReleasesUrl}', '', '', SW_SHOWNORMAL, ewNoWait, ResultCode);
 end;

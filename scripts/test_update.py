@@ -85,9 +85,17 @@ def test_checksum_parsing():
 class FakeProcess:
     def __init__(self, exit_code):
         self.exit_code = exit_code
+        self.killed = False
 
     def poll(self):
         return self.exit_code
+
+    def kill(self):
+        self.killed = True
+
+
+def ready_path(args) -> Path:
+    return Path(next(a for a in args if a.startswith("/READYFILE=")).split("=", 1)[1])
 
 
 def make_installer(workdir: Path) -> tuple[Path, str]:
@@ -151,10 +159,30 @@ def test_killed_right_after_start():
         exc = expect(
             update.InstallerBlocked,
             lambda: update.run_installer(
-                info(), path, digest, workdir=workdir, wait_pids=[1], grace=0.3
+                info(), path, digest, workdir=workdir, wait_pids=[1], timeout=5
             ),
         )
         assert "exit code 1" in str(exc), exc
+        assert not (workdir / update.PENDING_MARKER).exists()
+
+
+def test_second_stage_never_reports_in():
+    """The 1.1.0 -> 1.1.1 failure: Setup.exe starts fine, Smart App Control
+    blocks the setup.tmp it unpacks, nothing ever writes the ready file.
+    The launcher must not close -- it has to stop the stub and say so."""
+    stuck = FakeProcess(exit_code=None)
+    update._spawn = lambda args: stuck
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp)
+        path, digest = make_installer(workdir)
+        exc = expect(
+            update.InstallerBlocked,
+            lambda: update.run_installer(
+                info(), path, digest, workdir=workdir, wait_pids=[1], timeout=0.5
+            ),
+        )
+        assert "Smart App Control" in str(exc), exc
+        assert stuck.killed, "stuck installer was left running"
         assert not (workdir / update.PENDING_MARKER).exists()
 
 
@@ -163,6 +191,7 @@ def test_running_installer_gets_the_right_arguments():
 
     def spawn(args):
         spawned.append(args)
+        ready_path(args).write_text("ready")
         return FakeProcess(exit_code=None)
 
     update._spawn = spawn
@@ -170,12 +199,13 @@ def test_running_installer_gets_the_right_arguments():
         workdir = Path(tmp)
         path, digest = make_installer(workdir)
         update.run_installer(
-            info(), path, digest.upper(), workdir=workdir, wait_pids=[111, 222], grace=0.2
+            info(), path, digest.upper(), workdir=workdir, wait_pids=[111, 222], timeout=5
         )
         args = spawned[0]
         assert args[0] == str(path)
         for flag in ("/VERYSILENT", "/SUPPRESSMSGBOXES", "/RELAUNCH=1", "/WAITPID1=111", "/WAITPID2=222"):
             assert flag in args, (flag, args)
+        assert not ready_path(args).exists(), "ready file not cleaned up"
         marker = json.loads((workdir / update.PENDING_MARKER).read_text())
         assert marker["target_version"] == NEWER[1:]
 
